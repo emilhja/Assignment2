@@ -1,24 +1,25 @@
-BLOCKED_COMMANDS = [
-    "rm",
-    "rmdir",
-    "sudo",
-    "docker",
-    "docker-compose",
-    "apt",
-    "apt-get",
-    "apk",
-    "dnf",
-    "yum",
-    "shutdown",
-    "reboot",
-    "poweroff",
-]
+# commands the agent is not allowed to run
+BLOCKED_REASONS = {
+    "rm": "rm is not allowed",
+    "rmdir": "rmdir is not allowed",
+    "sudo": "sudo not allowed",
+    "docker": "docker commands aren't allowed here",
+    "docker-compose": "docker commands aren't allowed here",
+    "apt": "package managers are blocked",
+    "apt-get": "package managers are blocked",
+    "apk": "package managers are blocked",
+    "dnf": "package managers are blocked",
+    "yum": "package managers are blocked",
+    "shutdown": "shutdown/reboot not allowed",
+    "reboot": "shutdown/reboot not allowed",
+    "poweroff": "poweroff is not allowed",
+}
 
 def safety_check(command):
     pieces = command.replace("\n", ";").split(";")
 
-    for piece in pieces:
-        pipe_parts = piece.split("|")
+    for part in pieces:
+        pipe_parts = part.split("|")
         for pipe_part in pipe_parts:
             and_parts = pipe_part.split("&")
             for and_part in and_parts:
@@ -26,28 +27,12 @@ def safety_check(command):
                 if not words:
                     continue
 
-                command_name = words[0].lower()
-                if command_name not in BLOCKED_COMMANDS:
-                    continue
+                cmd = words[0].lower()
+                reason = BLOCKED_REASONS.get(cmd)
+                if reason:
+                    return False, f"Blocked: {reason}"
 
-                if command_name in {"rm", "rmdir"}:
-                    reason = f"I will not run {command_name} from this agent."
-                elif command_name == "sudo":
-                    reason = "I cannot use sudo from here."
-                elif command_name in {"docker", "docker-compose"}:
-                    reason = "Docker needs to be run on the host machine."
-                elif command_name in {"apt", "apt-get", "apk", "dnf", "yum"}:
-                    reason = "I cannot run package managers from here."
-                else:
-                    reason = f"I will not run {command_name} from this agent."
-
-                return False, f"Blocked by safety check: {reason}"
     return True, None
-
-
-def is_command_safe(command):
-    allowed, _reason = safety_check(command)
-    return allowed
 
 
 def confirm_command(command):

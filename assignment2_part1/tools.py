@@ -2,45 +2,40 @@ import shutil
 import subprocess
 
 MAX_OUTPUT_CHARS = 4000
-COMMAND_TIMEOUT_SECONDS = 10
-BASH_NOT_FOUND_MESSAGE = "I could not find bash. Install Git Bash or WSL, or add bash to PATH."
-
-
-def _truncate(text, limit=MAX_OUTPUT_CHARS):
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "\n... [output truncated]"
 
 
 def run_bash(command):
     bash_path = shutil.which("bash")
     if bash_path is None:
-        return BASH_NOT_FOUND_MESSAGE
+        return "bash not found in PATH"
 
+    # run it and grab whatever comes out
     try:
         completed = subprocess.run(
             [bash_path, "-lc", command],
             shell=False,
             capture_output=True,
             text=True,
-            timeout=COMMAND_TIMEOUT_SECONDS,
+            timeout=10,
         )
     except FileNotFoundError:
-        return BASH_NOT_FOUND_MESSAGE
+        return "bash not found in PATH"
     except subprocess.TimeoutExpired:
-        return f"I stopped the command after {COMMAND_TIMEOUT_SECONDS} seconds."
+        return "command timed out (10s limit)"
 
     if completed.stdout:
-        output = completed.stdout.strip()
+        out = completed.stdout.strip()
     elif completed.stderr:
-        output = completed.stderr.strip()
+        out = completed.stderr.strip()
     else:
-        output = ""
+        out = ""
 
-    if not output:
-        output = "(no output)"
+    if not out:
+        out = "(no output)"
 
     if completed.returncode != 0:
-        output = f"Command exited with code {completed.returncode}.\n{output}"
+        out = f"Command exited with code {completed.returncode}.\n{out}"
 
-    return _truncate(output)
+    if len(out) > MAX_OUTPUT_CHARS:
+        out = out[:MAX_OUTPUT_CHARS] + "\n... [output truncated]"
+    return out

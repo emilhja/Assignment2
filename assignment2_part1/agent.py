@@ -5,9 +5,7 @@ from parser import parse_response
 from safety import confirm_command, safety_check
 from tools import run_bash
 
-# Stop after a few model replies so the agent cannot loop forever.
 MAX_STEPS = 5
-DEBUG_ENV_VAR = "AGENT_DEBUG"
 
 SYSTEM_PROMPT = """You are a minimal ReAct-style software engineering assistant.
 
@@ -48,43 +46,36 @@ Observation rules:
 """
 
 
-def _debug_enabled():
-    value = os.getenv(DEBUG_ENV_VAR, "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def run_task(user_task):
-    debug = _debug_enabled()
+    debug = os.getenv("AGENT_DEBUG", "").strip() == "1"
 
-    messages = [
+    msgs = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_task},
     ]
 
-    # Ask the model for the next step: one Bash command or a final answer.
     for step in range(1, MAX_STEPS + 1):
         if debug:
             print(f"\n--- Step {step} ---")
-        raw_response = complete_chat(messages)
+        resp = complete_chat(msgs)
         if debug:
             print("\nAssistant raw response:")
-            print(raw_response)
+            print(resp)
 
-        messages.append({"role": "assistant", "content": raw_response})
-        parsed = parse_response(raw_response)
+        msgs.append({"role": "assistant", "content": resp})
+        result = parse_response(resp)
 
-        if parsed.kind == "final":
+        if result.kind == "final":
             print("\nFinal answer:")
-            print(parsed.answer)
+            print(result.answer)
             return
 
-        if parsed.kind == "action" and parsed.action == "bash":
-            command = parsed.command
+        if result.kind == "action" and result.action == "bash":
+            command = result.command
             if not command:
-                messages.append({"role": "user", "content": "Observation: Missing command."})
+                msgs.append({"role": "user", "content": "Observation: Missing command."})
                 continue
 
-            # Check dangerous commands before asking the user; blocked commands never run.
             allowed, reason = safety_check(command)
             if not allowed:
                 observation = reason or "Blocked by safety check."
@@ -97,36 +88,31 @@ def run_task(user_task):
                 print("\nObservation:")
                 print(observation)
 
-            messages.append({"role": "user", "content": f"Observation: {observation}"})
+            msgs.append({"role": "user", "content": f"Observation: {observation}"})
             continue
 
-        # Tell the model what was wrong, then let the loop ask it again.
         guidance = (
-            "Your previous response was invalid.\n\n"
-            "You must now respond with exactly one of these formats:\n\n"
+            "That response isn't valid. You need to use one of these formats:\n\n"
             "Thought: ...\nAction: bash\nCommand: ...\n\n"
-            "or:\n"
+            "or:\n\n"
             "Thought: ...\nFinal Answer: ...\n\n"
-            "Do not omit Thought.\n"
-            "Use Action: bash and Command: ... when requesting a command.\n"
-            "Do not use code fences.\n"
-            "Do not invent observations."
+            "No markdown, no code blocks. Start with Thought."
         )
-        if parsed.error:
-            guidance += f"\nParser error: {parsed.error}"
+        if result.error:
+            guidance += f"\nParser error: {result.error}"
         if debug:
             print("\nParser guidance:")
             print(guidance)
-        messages.append({"role": "user", "content": guidance})
+        msgs.append({"role": "user", "content": guidance})
 
-    print("\nStopped: reached the max step limit without a final answer.")
+    print(f"\nStopped after {MAX_STEPS} steps, no final answer.")
 
 
 def main():
     print("Assignment 2 Part 1 Minimal ReAct Agent")
     print("Enter a task, or type 'exit' or 'quit' to stop.")
 
-    # Keep asking for new tasks until the user exits or presses Ctrl+C/Ctrl+D.
+    # keep asking until the user exits
     while True:
         try:
             user_task = input("\nInput to: HAL 9000 > ").strip()
