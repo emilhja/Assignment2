@@ -1,0 +1,12 @@
+services:
+  agent:
+    build: .
+    env_file:
+      - .env
+    stdin_open: true
+    tty: true
+    working_dir: /app
+    volumes:
+      - ./workspace:/workspace
+    cpus: "1.0"
+    mem_limit: 512m
