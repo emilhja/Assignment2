@@ -1,13 +1,9 @@
-"""Block unsafe goals or shell commands and ask before running allowed ones."""
-
-from __future__ import annotations
-
 import re
 
 
 # Check the user's plain-English request before any shell command exists.
 # Example: "delete everything" is blocked before the model can turn it into rm -rf.
-FORBIDDEN_INTENT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+FORBIDDEN_INTENT_PATTERNS = [
     (
         re.compile(r"(?i)\b(delete|remove)\s+everything\b"),
         "destructive bulk deletion is not allowed.",
@@ -44,7 +40,7 @@ FORBIDDEN_INTENT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 
 # Check the actual shell command after the model writes it.
 # Example: "rm -rf ." is blocked even if the original request sounded harmless.
-DANGEROUS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+DANGEROUS_PATTERNS = [
     (re.compile(r"(?i)\b(Action|Command|Final Answer|Observation)\s*:"), "protocol tokens are blocked inside commands."),
     (re.compile(r"(?i)(^|[\s;|&])rm(\s|$)"), "rm commands are blocked."),
     (re.compile(r"(?i)(^|[\s;|&])rmdir(\s|$)"), "rmdir commands are blocked."),
@@ -79,7 +75,7 @@ DANGEROUS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
-def intent_refusal(user_task: str) -> str | None:
+def intent_refusal(user_task):
     """Return a refusal reason if the user's request is not allowed."""
 
     # Refuse tasks that would delete broadly or need host-only tools like Docker.
@@ -89,7 +85,7 @@ def intent_refusal(user_task: str) -> str | None:
     return None
 
 
-def safety_check(command: str) -> tuple[bool, str | None]:
+def safety_check(command):
     """Return whether the command matches any blocked command pattern."""
 
     # Scan the full command text for blocked tools, tokens, and shell patterns.
@@ -99,7 +95,7 @@ def safety_check(command: str) -> tuple[bool, str | None]:
     return True, None
 
 
-def is_command_safe(command: str) -> bool:
+def is_command_safe(command):
     """Return True when safety_check allows the command."""
 
     # Some callers only need True or False, not the refusal reason.
@@ -107,7 +103,7 @@ def is_command_safe(command: str) -> bool:
     return allowed
 
 
-def confirm_command(command: str) -> bool:
+def confirm_command(command):
     """Show the command and ask the user to approve it."""
 
     # Pressing Enter should mean no; only y or yes approves the command.

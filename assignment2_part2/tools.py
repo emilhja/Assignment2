@@ -1,7 +1,3 @@
-"""Local tool implementations for the minimal agent."""
-
-from __future__ import annotations
-
 import shutil
 import subprocess
 

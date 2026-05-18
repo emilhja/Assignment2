@@ -1,64 +1,79 @@
-import re
-from dataclasses import dataclass
-
-
-@dataclass
 class ParsedResponse:
-    kind: str
-    action: str | None = None
-    command: str | None = None
-    answer: str | None = None
-    error: str | None = None
+    def __init__(self, kind, action=None, command=None, answer=None, error=None):
+        self.kind = kind
+        self.action = action
+        self.command = command
+        self.answer = answer
+        self.error = error
 
 
-def parse_response(text: str) -> ParsedResponse:
+def parse_response(text):
     stripped = text.strip()
-    # A valid reply must start with Thought: and include text after it.
-    if not re.match(r"(?is)^Thought:\s*\S+", stripped):
+    lines = stripped.splitlines()
+
+    if not lines:
+        return ParsedResponse(kind="invalid", error="Response was empty.")
+
+    first_line = lines[0].strip()
+    if not first_line.startswith("Thought:") or not first_line[len("Thought:") :].strip():
         return ParsedResponse(kind="invalid", error="Response must begin with non-empty 'Thought:'.")
 
-    # The reply can give a final answer or request a command, but not both.
-    has_final = re.search(r"(?im)^\s*Final Answer:", stripped) is not None
-    has_action = re.search(r"(?im)^\s*Action:", stripped) is not None
+    has_final = False
+    has_action = False
+    final_line_number = None
+    action_line_number = None
+    command_line_number = None
+
+    for line_number, line in enumerate(lines):
+        clean_line = line.strip()
+        if clean_line.startswith("Final Answer:"):
+            has_final = True
+            if final_line_number is None:
+                final_line_number = line_number
+        if clean_line.startswith("Action:"):
+            has_action = True
+            if action_line_number is None:
+                action_line_number = line_number
+        if clean_line.startswith("Command:") and command_line_number is None:
+            command_line_number = line_number
+
     if has_final and has_action:
         return ParsedResponse(
             kind="invalid",
             error="Use either 'Final Answer:' or 'Action: bash', not both.",
         )
 
-    # Final Answer: must include actual answer text.
-    final_match = re.search(r"(?is)^\s*Final Answer:\s*(.*)", stripped, flags=re.MULTILINE)
-    if final_match:
-        answer = final_match.group(1).strip()
+    if final_line_number is not None:
+        final_line = lines[final_line_number].strip()
+        answer_parts = [final_line[len("Final Answer:") :].strip()]
+        answer_parts.extend(lines[final_line_number + 1 :])
+        answer = "\n".join(answer_parts).strip()
         if answer:
             return ParsedResponse(kind="final", answer=answer)
         return ParsedResponse(kind="invalid", error="Final Answer was present but empty.")
 
-    # Action: must only say bash; the shell command belongs on Command:.
-    action_line_match = re.search(r"(?im)^\s*Action:\s*(.*)$", stripped)
-    if action_line_match and action_line_match.group(1).strip() != "bash":
-        return ParsedResponse(
-            kind="invalid",
-            error="Action line must be exactly 'Action: bash'. Put the command on the Command line.",
-        )
-
-    # If there is no final answer, the reply must request Action: bash.
-    action_match = re.search(r"(?im)^\s*Action:\s*bash\s*$", stripped)
-    if not action_match:
+    if action_line_number is None:
         return ParsedResponse(
             kind="invalid",
             error="Expected either 'Final Answer:' or 'Action: bash' with 'Command: ...'.",
         )
 
-    command_match = re.search(r"(?im)^\s*Command:\s*(.*)$", stripped)
-    if not command_match:
+    action_line = lines[action_line_number].strip()
+    action_name = action_line[len("Action:") :].strip()
+    if action_name != "bash":
+        return ParsedResponse(
+            kind="invalid",
+            error="Action line must be exactly 'Action: bash'. Put the command on the Command line.",
+        )
+
+    if command_line_number is None:
         return ParsedResponse(kind="invalid", error="Action was bash but no Command was found.")
 
-    command = command_match.group(1).strip()
+    command_line = lines[command_line_number].strip()
+    command = command_line[len("Command:") :].strip()
     if not command:
         return ParsedResponse(kind="invalid", error="Command was present but empty.")
     if len(command) >= 2 and command[0] == command[-1] and command[0] in {"'", '"'}:
-        # Do not accept one quoted command string; commands should be raw shell text.
         return ParsedResponse(
             kind="invalid",
             error="Command must not be wrapped as one quoted shell string.",

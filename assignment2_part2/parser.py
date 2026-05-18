@@ -1,25 +1,16 @@
-"""Parser for the simple Thought/Action/Command/Final Answer format."""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
 import re
 
 
-@dataclass(frozen=True)
 class ParsedResponse:
-    """Structured result from one assistant message."""
+    def __init__(self, kind, action=None, command=None, answer=None, error=None):
+        self.kind = kind
+        self.action = action
+        self.command = command
+        self.answer = answer
+        self.error = error
 
-    kind: str
-    action: str | None = None
-    command: str | None = None
-    answer: str | None = None
-    error: str | None = None
 
-
-def parse_response(text: str) -> ParsedResponse:
-    """Turn assistant text into a final answer, Bash command, or error."""
-
+def parse_response(text):
     stripped = text.strip()
     # A valid reply must start with Thought: and include text after it.
     if not re.match(r"(?is)^Thought:\s*\S+", stripped):

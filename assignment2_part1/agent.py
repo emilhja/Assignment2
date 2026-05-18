@@ -48,12 +48,12 @@ Observation rules:
 """
 
 
-def _debug_enabled() -> bool:
+def _debug_enabled():
     value = os.getenv(DEBUG_ENV_VAR, "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def run_task(user_task: str) -> None:
+def run_task(user_task):
     debug = _debug_enabled()
 
     messages = [
@@ -79,15 +79,19 @@ def run_task(user_task: str) -> None:
             return
 
         if parsed.kind == "action" and parsed.action == "bash":
-            assert parsed.command is not None
+            command = parsed.command
+            if not command:
+                messages.append({"role": "user", "content": "Observation: Missing command."})
+                continue
+
             # Check dangerous commands before asking the user; blocked commands never run.
-            allowed, reason = safety_check(parsed.command)
+            allowed, reason = safety_check(command)
             if not allowed:
                 observation = reason or "Blocked by safety check."
-            elif not confirm_command(parsed.command):
+            elif not confirm_command(command):
                 observation = "Command denied by user; it was not executed."
             else:
-                observation = run_bash(parsed.command)
+                observation = run_bash(command)
 
             if debug:
                 print("\nObservation:")
@@ -104,8 +108,7 @@ def run_task(user_task: str) -> None:
             "or:\n"
             "Thought: ...\nFinal Answer: ...\n\n"
             "Do not omit Thought.\n"
-            "Do not omit Action: bash when requesting a command.\n"
-            "Do not put the command on the Action line.\n"
+            "Use Action: bash and Command: ... when requesting a command.\n"
             "Do not use code fences.\n"
             "Do not invent observations."
         )
@@ -119,7 +122,7 @@ def run_task(user_task: str) -> None:
     print("\nStopped: reached the max step limit without a final answer.")
 
 
-def main() -> None:
+def main():
     print("Assignment 2 Part 1 Minimal ReAct Agent")
     print("Enter a task, or type 'exit' or 'quit' to stop.")
 

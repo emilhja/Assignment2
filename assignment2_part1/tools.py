@@ -8,13 +8,13 @@ BASH_NOT_FOUND_MESSAGE = (
 )
 
 
-def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
+def _truncate(text, limit=MAX_OUTPUT_CHARS):
     if len(text) <= limit:
         return text
     return text[:limit] + "\n... [output truncated]"
 
 
-def run_bash(command: str) -> str:
+def run_bash(command):
     bash_path = shutil.which("bash")
     if bash_path is None:
         return BASH_NOT_FOUND_MESSAGE

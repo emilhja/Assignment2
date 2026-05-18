@@ -1,7 +1,3 @@
-"""Interactive CLI for Assignment 2 Part 2: a safer ReAct-style agent."""
-
-from __future__ import annotations
-
 import os
 
 from llm_client import complete_chat
