@@ -4,9 +4,7 @@ import subprocess
 # Limit returned command output so very large results do not overwhelm the agent.
 MAX_OUTPUT_CHARS = 4000
 COMMAND_TIMEOUT_SECONDS = 10
-BASH_NOT_FOUND_MESSAGE = (
-    "bash executable was not found. Install Git Bash, WSL, or make bash available in PATH."
-)
+BASH_NOT_FOUND_MESSAGE = "I could not find bash. Install Git Bash or WSL, or add bash to PATH."
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
@@ -38,24 +36,32 @@ def run_bash(command: str) -> str:
         return BASH_NOT_FOUND_MESSAGE
     except subprocess.TimeoutExpired as exc:
         # If the command printed text before timing out, return that text too.
-        partial_output = "".join(
-            part or "" for part in (exc.stdout, exc.stderr) if isinstance(part, str)
-        )
+        if isinstance(exc.stdout, str) and exc.stdout:
+            partial_output = exc.stdout.strip()
+        elif isinstance(exc.stderr, str) and exc.stderr:
+            partial_output = exc.stderr.strip()
+        else:
+            partial_output = ""
+
         if partial_output:
             return _truncate(
-                f"Command timed out after {COMMAND_TIMEOUT_SECONDS} seconds.\n{partial_output}"
+                f"I stopped the command after {COMMAND_TIMEOUT_SECONDS} seconds.\n{partial_output}"
             )
-        return f"Command timed out after {COMMAND_TIMEOUT_SECONDS} seconds."
+        return f"I stopped the command after {COMMAND_TIMEOUT_SECONDS} seconds."
 
-    output = "".join(
-        part for part in (completed.stdout, completed.stderr) if part
-    ).strip()
+    if completed.stdout:
+        output = completed.stdout.strip()
+    elif completed.stderr:
+        output = completed.stderr.strip()
+    else:
+        output = ""
+
     if not output:
         # Some commands succeed without printing anything; return a clear message.
         output = "(no output)"
 
     if completed.returncode != 0:
         # Non-zero return codes mean failure; include the code with the output.
-        output = f"Return code: {completed.returncode}\n{output}"
+        output = f"Command exited with code {completed.returncode}.\n{output}"
 
     return _truncate(output)

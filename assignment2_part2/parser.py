@@ -14,7 +14,7 @@ def parse_response(text):
     stripped = text.strip()
     # A valid reply must start with Thought: and include text after it.
     if not re.match(r"(?is)^Thought:\s*\S+", stripped):
-        return ParsedResponse(kind="invalid", error="Response must begin with non-empty 'Thought:'.")
+        return ParsedResponse(kind="invalid", error="I need a real Thought: line at the top.")
 
     # The reply can give a final answer or request a command, but not both.
     has_final = re.search(r"(?im)^\s*Final Answer:", stripped) is not None
@@ -31,7 +31,7 @@ def parse_response(text):
         answer = final_match.group(1).strip()
         if answer:
             return ParsedResponse(kind="final", answer=answer)
-        return ParsedResponse(kind="invalid", error="Final Answer was present but empty.")
+        return ParsedResponse(kind="invalid", error="Final Answer is there, but it is blank")
 
     # Action: must only say bash; the shell command belongs on Command:.
     action_line_match = re.search(r"(?im)^\s*Action:\s*(.*)$", stripped)
@@ -55,7 +55,7 @@ def parse_response(text):
 
     command = command_match.group(1).strip()
     if not command:
-        return ParsedResponse(kind="invalid", error="Command was present but empty.")
+        return ParsedResponse(kind="invalid", error="Command: is there, but there is no command after it")
     if len(command) >= 2 and command[0] == command[-1] and command[0] in {"'", '"'}:
         # Do not accept one quoted command string; commands should be raw shell text.
         return ParsedResponse(

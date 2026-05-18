@@ -89,7 +89,7 @@ def run_task(user_task):
             if not allowed:
                 observation = reason or "Blocked by safety check."
             elif not confirm_command(command):
-                observation = "Command denied by user; it was not executed."
+                observation = "The command was denied, so I did not run it"
             else:
                 observation = run_bash(command)
 

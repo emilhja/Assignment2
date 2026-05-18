@@ -14,20 +14,7 @@ BLOCKED_COMMANDS = [
     "poweroff",
 ]
 
-
-def _reason_for(command_name):
-    if command_name in {"rm", "rmdir"}:
-        return f"{command_name} commands are blocked."
-    if command_name == "sudo":
-        return "sudo commands are blocked."
-    if command_name in {"docker", "docker-compose"}:
-        return "Docker commands must be run on the host."
-    if command_name in {"apt", "apt-get", "apk", "dnf", "yum"}:
-        return "package manager commands are blocked."
-    return f"{command_name} commands are blocked."
-
-
-def _command_starts(command):
+def safety_check(command):
     pieces = command.replace("\n", ";").split(";")
 
     for piece in pieces:
@@ -36,14 +23,25 @@ def _command_starts(command):
             and_parts = pipe_part.split("&")
             for and_part in and_parts:
                 words = and_part.strip().split()
-                if words:
-                    yield words[0].lower()
+                if not words:
+                    continue
 
+                command_name = words[0].lower()
+                if command_name not in BLOCKED_COMMANDS:
+                    continue
 
-def safety_check(command):
-    for command_name in _command_starts(command):
-        if command_name in BLOCKED_COMMANDS:
-            return False, f"Blocked by safety check: {_reason_for(command_name)}"
+                if command_name in {"rm", "rmdir"}:
+                    reason = f"I will not run {command_name} from this agent."
+                elif command_name == "sudo":
+                    reason = "I cannot use sudo from here."
+                elif command_name in {"docker", "docker-compose"}:
+                    reason = "Docker needs to be run on the host machine."
+                elif command_name in {"apt", "apt-get", "apk", "dnf", "yum"}:
+                    reason = "I cannot run package managers from here."
+                else:
+                    reason = f"I will not run {command_name} from this agent."
+
+                return False, f"Blocked by safety check: {reason}"
     return True, None
 
 

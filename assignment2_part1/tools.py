@@ -3,9 +3,7 @@ import subprocess
 
 MAX_OUTPUT_CHARS = 4000
 COMMAND_TIMEOUT_SECONDS = 10
-BASH_NOT_FOUND_MESSAGE = (
-    "bash executable was not found. Install Git Bash, WSL, or make bash available in PATH."
-)
+BASH_NOT_FOUND_MESSAGE = "I could not find bash. Install Git Bash or WSL, or add bash to PATH."
 
 
 def _truncate(text, limit=MAX_OUTPUT_CHARS):
@@ -30,15 +28,19 @@ def run_bash(command):
     except FileNotFoundError:
         return BASH_NOT_FOUND_MESSAGE
     except subprocess.TimeoutExpired:
-        return f"Command timed out after {COMMAND_TIMEOUT_SECONDS} seconds."
+        return f"I stopped the command after {COMMAND_TIMEOUT_SECONDS} seconds."
 
-    output = "".join(
-        part for part in (completed.stdout, completed.stderr) if part
-    ).strip()
+    if completed.stdout:
+        output = completed.stdout.strip()
+    elif completed.stderr:
+        output = completed.stderr.strip()
+    else:
+        output = ""
+
     if not output:
         output = "(no output)"
 
     if completed.returncode != 0:
-        output = f"Return code: {completed.returncode}\n{output}"
+        output = f"Command exited with code {completed.returncode}.\n{output}"
 
     return _truncate(output)

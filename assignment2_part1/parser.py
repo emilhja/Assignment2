@@ -12,11 +12,11 @@ def parse_response(text):
     lines = stripped.splitlines()
 
     if not lines:
-        return ParsedResponse(kind="invalid", error="Response was empty.")
+        return ParsedResponse(kind="invalid", error="The model sent back nothing.")
 
     first_line = lines[0].strip()
     if not first_line.startswith("Thought:") or not first_line[len("Thought:") :].strip():
-        return ParsedResponse(kind="invalid", error="Response must begin with non-empty 'Thought:'.")
+        return ParsedResponse(kind="invalid", error="I need a real Thought: line at the top.")
 
     has_final = False
     has_action = False
@@ -50,7 +50,7 @@ def parse_response(text):
         answer = "\n".join(answer_parts).strip()
         if answer:
             return ParsedResponse(kind="final", answer=answer)
-        return ParsedResponse(kind="invalid", error="Final Answer was present but empty.")
+        return ParsedResponse(kind="invalid", error="Final Answer is there, but it is blank")
 
     if action_line_number is None:
         return ParsedResponse(
@@ -72,7 +72,7 @@ def parse_response(text):
     command_line = lines[command_line_number].strip()
     command = command_line[len("Command:") :].strip()
     if not command:
-        return ParsedResponse(kind="invalid", error="Command was present but empty.")
+        return ParsedResponse(kind="invalid", error="Command: is there, but there is no command after it")
     if len(command) >= 2 and command[0] == command[-1] and command[0] in {"'", '"'}:
         return ParsedResponse(
             kind="invalid",

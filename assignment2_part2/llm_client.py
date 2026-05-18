@@ -35,12 +35,12 @@ def _provider_order():
     if unknown:
         valid = ", ".join(sorted(PROVIDERS))
         raise RuntimeError(
-            f"Unknown provider(s) in LLM_PROVIDER_ORDER: {', '.join(unknown)}. "
-            f"Valid providers: {valid}."
+            f"I do not know this LLM provider: {', '.join(unknown)}. "
+            f"Use one of these: {valid}"
         )
 
     if not order:
-        raise RuntimeError("LLM_PROVIDER_ORDER does not contain any providers.")
+        raise RuntimeError("LLM_PROVIDER_ORDER is empty")
 
     return order
 
@@ -58,7 +58,7 @@ def complete_chat(messages):
     for provider_name in _provider_order():
         config = PROVIDERS[provider_name]
         if not os.getenv(config["api_key_env"]):
-            errors.append(f"{provider_name}: {config['api_key_env']} is not set")
+            errors.append(f"{provider_name}: missing {config['api_key_env']}")
             continue
 
         client = _client_for_provider(config)
@@ -76,5 +76,5 @@ def complete_chat(messages):
         content = response.choices[0].message.content
         return content or ""
 
-    detail = "; ".join(errors) if errors else "no providers were attempted"
-    raise RuntimeError(f"No configured LLM provider succeeded ({detail}).")
+    detail = "; ".join(errors) if errors else "no providers were tried"
+    raise RuntimeError(f"I could not get a reply from any LLM provider ({detail})")

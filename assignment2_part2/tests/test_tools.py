@@ -15,7 +15,7 @@ def test_run_bash_timeout(monkeypatch):
 
     output = tools.run_bash("sleep 1")
 
-    assert output == "Command timed out after 0.01 seconds."
+    assert output == "I stopped the command after 0.01 seconds."
 
 
 def test_run_bash_truncates_long_output():

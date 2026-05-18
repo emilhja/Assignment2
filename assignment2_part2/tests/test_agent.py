@@ -13,7 +13,7 @@ def test_intent_refusal_happens_before_llm(monkeypatch, capsys):
 
     output = capsys.readouterr().out
     assert "Final answer:" in output
-    assert "destructive bulk deletion is not allowed" in output
+    assert "I cannot help delete everything" in output
 
 
 def test_blocked_command_stops_without_retry(monkeypatch, capsys):
@@ -37,7 +37,7 @@ def test_blocked_command_stops_without_retry(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert calls == 1
     assert "Final answer:" in output
-    assert "docker commands must be run on the host" in output
+    assert "Run Docker on the host machine instead" in output
 
 
 def test_pwd_observation_becomes_final_answer(monkeypatch, capsys):

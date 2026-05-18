@@ -13,7 +13,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 def _groq_client():
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        raise RuntimeError("GROQ_API_KEY is not set.")
+        raise RuntimeError("Set GROQ_API_KEY in .env before running the agent")
 
     return OpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
 
