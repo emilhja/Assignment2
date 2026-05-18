@@ -44,7 +44,9 @@ def run_bash(command: str) -> str:
         # If the command printed text before timing out, return that text too.
         partial_output = "".join(
             part or "" for part in (exc.stdout, exc.stderr) if isinstance(part, str)
-        )
+        ).strip()
+        if "fatal error in forked process" in partial_output or "child_copy:" in partial_output:
+            partial_output = ""
         if partial_output:
             return _truncate(
                 f"Command timed out after {COMMAND_TIMEOUT_SECONDS} seconds.\n{partial_output}"

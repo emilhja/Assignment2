@@ -1,7 +1,3 @@
-"""Interactive CLI for Assignment 2 Part 1: a minimal ReAct-style agent."""
-
-from __future__ import annotations
-
 import os
 
 from llm_client import complete_chat
@@ -53,18 +49,14 @@ Observation rules:
 
 
 def _debug_enabled() -> bool:
-    """Return True when AGENT_DEBUG asks the agent to print extra details."""
-
     value = os.getenv(DEBUG_ENV_VAR, "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def run_task(user_task: str) -> None:
-    """Handle one user task from the first prompt to the final answer."""
-
     debug = _debug_enabled()
 
-    messages: list[dict[str, str]] = [
+    messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_task},
     ]
