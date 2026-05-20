@@ -50,6 +50,24 @@ def test_run_bash_executes_from_workspace(tmp_path, monkeypatch):
 
     assert tools.run_bash("pwd") == "ok"
     assert seen["kwargs"]["cwd"] == tmp_path.resolve()
+    # bash must be invoked without profile/rc sourcing
+    assert seen["args"][0] == ["bash", "--noprofile", "--norc", "-c", "pwd"]
+    # subprocess env must not carry provider API keys or secrets
+    env = seen["kwargs"]["env"]
+    assert "GROQ_API_KEY" not in env
+    assert "OPENAI_API_KEY" not in env
+    assert "PATH" in env
+
+
+def test_run_bash_subprocess_env_strips_api_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("GROQ_API_KEY", "leak-me-if-you-can")
+    monkeypatch.setenv("OPENAI_API_KEY", "another-secret")
+
+    output = tools.run_bash("echo done")
+
+    assert "leak-me-if-you-can" not in output
+    assert "another-secret" not in output
 
 
 def test_run_bash_blocks_dangerous_command_before_subprocess(monkeypatch):

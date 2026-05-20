@@ -59,6 +59,22 @@ def _resolve_workspace_path(path_text: str) -> Path:
     return candidate
 
 
+def _bash_subprocess_env(root: Path) -> dict:
+    """Return a minimal environment for the bash subprocess (no provider keys)."""
+
+    return {
+        "PATH": os.environ.get(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        ),
+        "HOME": str(root),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        "TERM": "dumb",
+        "PWD": str(root),
+    }
+
+
 def run_bash(command: str) -> str:
     """Run one Bash command and return the text the agent should see."""
 
@@ -73,13 +89,18 @@ def run_bash(command: str) -> str:
     try:
         root = workspace_root()
         root.mkdir(parents=True, exist_ok=True)
+        # --noprofile --norc stops ~/.bash_profile and ~/.bashrc from running
+        # before the command, so the subprocess sees only the env we hand it.
+        # The minimal env intentionally omits API keys and provider secrets so
+        # a leak attempt like `echo $GROQ_API_KEY` finds nothing to print.
         completed = subprocess.run(
-            [bash_path, "-lc", command],
+            [bash_path, "--noprofile", "--norc", "-c", command],
             shell=False,
             cwd=root,
             capture_output=True,
             text=True,
             timeout=COMMAND_TIMEOUT_SECONDS,
+            env=_bash_subprocess_env(root),
         )
     except FileNotFoundError:
         return BASH_NOT_FOUND_MESSAGE
