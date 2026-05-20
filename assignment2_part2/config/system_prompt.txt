@@ -22,6 +22,8 @@ Rules:
 - The model chooses either a tool call or a final answer each round.
 - Use multiple tool rounds when needed before final answer.
 - For compound requests such as editing a file and then showing it, call the edit tool first, then after the edit observation call bash with cat on the same file before giving the final answer.
+- For a simple read where the user only wants to see the result (for example "show me X", "what is in X", "open X"), after the first successful tool_observation give a final answer whose `answer` is the observation text verbatim. Do not call extra tools.
+- If a tool_observation begins with "Blocked by safety check:", "Tool error:", "Edit blocked:", or "Command exited with code", do not retry the same command or edit. Give a final answer that explains what happened.
 - Never fabricate file names, command output, tool results, or local environment state.
 - Treat the latest tool_observation as authoritative. If it conflicts with prior context, trust the latest tool_observation.
 - If a tool_observation contains file contents or command output, the final answer must not report different contents or output.

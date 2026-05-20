@@ -23,44 +23,12 @@ def test_intent_refusal_happens_before_llm(monkeypatch, capsys, tmp_path):
     assert "I cannot help delete everything" in output
 
 
-def test_blocked_command_stops_without_retry(monkeypatch, capsys, tmp_path):
+def test_invalid_bash_args_observation_returns_to_model(monkeypatch, capsys, tmp_path):
     _set_session_db(monkeypatch, tmp_path)
-    calls = 0
+    observations_seen = []
 
-    def fake_complete_chat(_messages):
-        nonlocal calls
-        calls += 1
-        return json.dumps(
-            {
-                "type": "tool_call",
-                "tool": "bash",
-                "args": {"command": "docker compose ps"},
-                "reason": "inspect containers",
-            }
-        )
-
-    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
-    monkeypatch.setattr(
-        agent,
-        "confirm_command",
-        lambda _command: pytest.fail("blocked commands should not ask for confirmation"),
-    )
-
-    agent.run_task("Check containers")
-
-    output = capsys.readouterr().out
-    assert calls == 1
-    assert "Final answer:" in output
-    assert "Run Docker on the host machine instead" in output
-
-
-def test_invalid_bash_args_report_tool_error(monkeypatch, capsys, tmp_path):
-    _set_session_db(monkeypatch, tmp_path)
-
-    monkeypatch.setattr(
-        agent,
-        "complete_chat",
-        lambda _messages: json.dumps(
+    responses = [
+        json.dumps(
             {
                 "type": "tool_call",
                 "tool": "bash",
@@ -68,7 +36,15 @@ def test_invalid_bash_args_report_tool_error(monkeypatch, capsys, tmp_path):
                 "reason": "bad call",
             }
         ),
-    )
+        json.dumps({"type": "final", "answer": "I cannot run an empty command."}),
+    ]
+
+    def fake_complete_chat(messages):
+        if len(messages) >= 4:
+            observations_seen.append(messages[-1]["content"])
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
     monkeypatch.setattr(
         agent,
         "confirm_command",
@@ -78,7 +54,8 @@ def test_invalid_bash_args_report_tool_error(monkeypatch, capsys, tmp_path):
     agent.run_task("Inspect something")
 
     output = capsys.readouterr().out
-    assert "Tool error: bash requires a non-empty string command." in output
+    assert "Final answer:\nI cannot run an empty command." in output
+    assert any("Tool error: bash requires a non-empty string command." in obs for obs in observations_seen)
 
 
 def test_multiple_tool_rounds_before_final(monkeypatch, capsys, tmp_path):
@@ -119,77 +96,23 @@ def test_multiple_tool_rounds_before_final(monkeypatch, capsys, tmp_path):
     assert responses == []
 
 
-def test_simple_read_answers_from_observation(monkeypatch, capsys, tmp_path):
+def test_model_drives_edit_then_show(monkeypatch, capsys, tmp_path):
     _set_session_db(monkeypatch, tmp_path)
-    calls = 0
+    tool_calls = []
+    confirmed_commands = []
 
-    def fake_complete_chat(_messages):
-        nonlocal calls
-        calls += 1
-        if calls > 1:
-            raise AssertionError("simple read should not need a second model call")
-        return json.dumps(
-            {
-                "type": "tool_call",
-                "tool": "bash",
-                "args": {"command": "cat demo.txt"},
-                "reason": "read file",
-            }
-        )
-
-    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
-    monkeypatch.setattr(agent, "confirm_command", lambda _command: True)
-    monkeypatch.setattr(agent, "run_tool", lambda _tool, _args: "status: done")
-
-    answer = agent.run_task("what does the file contain")
-
-    output = capsys.readouterr().out
-    assert answer == "status: done"
-    assert "Final answer:\nstatus: done" in output
-    assert calls == 1
-
-
-def test_open_file_answers_from_cat_observation(monkeypatch, capsys, tmp_path):
-    _set_session_db(monkeypatch, tmp_path)
-    calls = 0
-
-    def fake_complete_chat(_messages):
-        nonlocal calls
-        calls += 1
-        if calls > 1:
-            raise AssertionError("open file should not need a second model call")
-        return json.dumps(
-            {
-                "type": "tool_call",
-                "tool": "bash",
-                "args": {"command": "cat /workspace/demo.txt"},
-                "reason": "open file",
-            }
-        )
-
-    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
-    monkeypatch.setattr(agent, "confirm_command", lambda _command: True)
-    monkeypatch.setattr(agent, "run_tool", lambda _tool, _args: "status: done")
-
-    answer = agent.run_task("open demo.txt")
-
-    output = capsys.readouterr().out
-    assert answer == "status: done"
-    assert "Final answer:\nstatus: done" in output
-    assert calls == 1
-
-
-def test_follow_up_about_bad_file_content_answers_from_cat_observation(
-    monkeypatch, capsys, tmp_path
-):
-    _set_session_db(monkeypatch, tmp_path)
     responses = [
         json.dumps(
             {
                 "type": "tool_call",
-                "tool": "bash",
-                "args": {"command": "grep hello /workspace/demo.txt"},
-                "reason": "check for hello",
+                "tool": "replace_text",
+                "args": {
+                    "path": "/workspace/demo.txt",
+                    "old_text": "draft",
+                    "new_text": "done",
+                    "all_occurrences": False,
+                },
+                "reason": "perform the edit",
             }
         ),
         json.dumps(
@@ -197,147 +120,22 @@ def test_follow_up_about_bad_file_content_answers_from_cat_observation(
                 "type": "tool_call",
                 "tool": "bash",
                 "args": {"command": "cat /workspace/demo.txt"},
-                "reason": "verify file content",
+                "reason": "show the result",
             }
         ),
+        json.dumps({"type": "final", "answer": "status: done"}),
     ]
 
     def fake_complete_chat(_messages):
         return responses.pop(0)
 
-    def fake_run_tool(_tool, args):
-        if args["command"].startswith("grep "):
-            return "Command exited with code 1.\n(no output)"
-        return "status: done"
-
-    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
-    monkeypatch.setattr(agent, "confirm_command", lambda _command: True)
-    monkeypatch.setattr(agent, "run_tool", fake_run_tool)
-
-    answer = agent.run_task("so where did hello world ! come from?")
-
-    output = capsys.readouterr().out
-    assert answer == "status: done"
-    assert "Final answer:\nstatus: done" in output
-    assert responses == []
-
-
-def test_edit_result_answers_from_observation(monkeypatch, capsys, tmp_path):
-    _set_session_db(monkeypatch, tmp_path)
-    calls = 0
-
-    def fake_complete_chat(_messages):
-        nonlocal calls
-        calls += 1
-        if calls > 1:
-            raise AssertionError("edit result should not be retried through the model")
-        return json.dumps(
-            {
-                "type": "tool_call",
-                "tool": "replace_text",
-                "args": {
-                    "path": "/workspace/demo.txt",
-                    "old_text": "world",
-                    "new_text": "Emil",
-                    "all_occurrences": False,
-                },
-            }
-        )
-
-    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
-    monkeypatch.setattr(
-        agent,
-        "run_tool",
-        lambda _tool, _args: "Edit blocked: old_text was not found in the file.",
-    )
-
-    answer = agent.run_task('can you change the text "world" in demo.txt to "Emil"')
-
-    output = capsys.readouterr().out
-    assert answer == "Edit blocked: old_text was not found in the file."
-    assert "Final answer:\nEdit blocked: old_text was not found in the file." in output
-    assert calls == 1
-
-
-def test_edit_and_show_runs_second_read_tool(monkeypatch, capsys, tmp_path):
-    _set_session_db(monkeypatch, tmp_path)
-    tool_calls = []
-    confirmed_commands = []
-
-    def fake_complete_chat(_messages):
-        return json.dumps(
-            {
-                "type": "tool_call",
-                "tool": "replace_text",
-                "args": {
-                    "path": "/workspace/demo.txt",
-                    "old_text": "done",
-                    "new_text": "draft",
-                    "all_occurrences": False,
-                },
-            }
-        )
-
     def fake_run_tool(tool, args):
         tool_calls.append((tool, args.copy()))
         if tool == "replace_text":
             return "Replaced 1 occurrence(s) in /workspace/demo.txt."
-        if tool == "bash" and args["command"] == "cat /workspace/demo.txt":
-            return "status: draft"
-        raise AssertionError(f"unexpected tool call: {tool} {args}")
-
-    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
-    monkeypatch.setattr(agent, "run_tool", fake_run_tool)
-    monkeypatch.setattr(
-        agent,
-        "confirm_command",
-        lambda command: confirmed_commands.append(command) or True,
-    )
-
-    answer = agent.run_task(
-        'change the text "done" in /workspace/demo.txt to "draft" and then show it'
-    )
-
-    output = capsys.readouterr().out
-    assert answer == "status: draft"
-    assert "Final answer:\nstatus: draft" in output
-    assert tool_calls == [
-        (
-            "replace_text",
-            {
-                "path": "/workspace/demo.txt",
-                "old_text": "done",
-                "new_text": "draft",
-                "all_occurrences": False,
-            },
-        ),
-        ("bash", {"command": "cat /workspace/demo.txt"}),
-    ]
-    assert confirmed_commands == ["cat /workspace/demo.txt"]
-
-
-def test_edit_and_show_bypasses_mistaken_bash_read(monkeypatch, capsys, tmp_path):
-    _set_session_db(monkeypatch, tmp_path)
-    tool_calls = []
-    confirmed_commands = []
-
-    def fake_complete_chat(_messages):
-        return json.dumps(
-            {
-                "type": "tool_call",
-                "tool": "bash",
-                "args": {"command": "cat /workspace/demo.txt"},
-                "reason": "mistaken read before edit",
-            }
-        )
-
-    def fake_run_tool(tool, args):
-        tool_calls.append((tool, args.copy()))
-        if tool == "replace_text":
-            return "Replaced 1 occurrence(s) in /workspace/demo.txt."
-        if tool == "bash" and args["command"] == "cat /workspace/demo.txt":
+        if tool == "bash":
             return "status: done"
-        raise AssertionError(f"unexpected tool call: {tool} {args}")
+        raise AssertionError(f"unexpected tool: {tool}")
 
     monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
     monkeypatch.setattr(agent, "run_tool", fake_run_tool)
@@ -348,7 +146,7 @@ def test_edit_and_show_bypasses_mistaken_bash_read(monkeypatch, capsys, tmp_path
     )
 
     answer = agent.run_task(
-        'change the text "draft" in /workspace/demo.txt to "done" and then show it'
+        'change "draft" to "done" in /workspace/demo.txt and then show it'
     )
 
     output = capsys.readouterr().out
@@ -367,101 +165,7 @@ def test_edit_and_show_bypasses_mistaken_bash_read(monkeypatch, capsys, tmp_path
         ("bash", {"command": "cat /workspace/demo.txt"}),
     ]
     assert confirmed_commands == ["cat /workspace/demo.txt"]
-
-
-def test_all_file_contents_after_ls_runs_content_command(monkeypatch, capsys, tmp_path):
-    _set_session_db(monkeypatch, tmp_path)
-    tool_calls = []
-    confirmed_commands = []
-
-    def fake_complete_chat(_messages):
-        return json.dumps(
-            {
-                "type": "tool_call",
-                "tool": "bash",
-                "args": {"command": "ls -la /workspace"},
-                "reason": "partial listing",
-            }
-        )
-
-    def fake_run_tool(tool, args):
-        tool_calls.append((tool, args.copy()))
-        if args["command"] == "ls -la /workspace":
-            return "demo.txt"
-        if args["command"].startswith("find /workspace -maxdepth 1 -type f"):
-            return "/workspace/demo.txt\nstatus: done"
-        raise AssertionError(f"unexpected tool call: {tool} {args}")
-
-    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
-    monkeypatch.setattr(agent, "run_tool", fake_run_tool)
-    monkeypatch.setattr(
-        agent,
-        "confirm_command",
-        lambda command: confirmed_commands.append(command) or True,
-    )
-
-    answer = agent.run_task("list all files in workspace and then open each")
-
-    output = capsys.readouterr().out
-    assert answer == "/workspace/demo.txt\nstatus: done"
-    assert "Final answer:\n/workspace/demo.txt\nstatus: done" in output
-    assert tool_calls[0] == ("bash", {"command": "ls -la /workspace"})
-    assert tool_calls[1][0] == "bash"
-    assert tool_calls[1][1]["command"].startswith(
-        "find /workspace -maxdepth 1 -type f"
-    )
-    assert confirmed_commands == [
-        "ls -la /workspace",
-        agent._workspace_file_contents_command(),
-    ]
-
-
-def test_blocked_edit_and_show_does_not_read_file(monkeypatch, capsys, tmp_path):
-    _set_session_db(monkeypatch, tmp_path)
-    tool_calls = []
-
-    def fake_complete_chat(_messages):
-        return json.dumps(
-            {
-                "type": "tool_call",
-                "tool": "replace_text",
-                "args": {
-                    "path": "/workspace/demo.txt",
-                    "old_text": "missing",
-                    "new_text": "draft",
-                    "all_occurrences": False,
-                },
-            }
-        )
-
-    def fake_run_tool(tool, args):
-        tool_calls.append((tool, args.copy()))
-        return "Edit blocked: old_text was not found in the file."
-
-    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
-    monkeypatch.setattr(agent, "run_tool", fake_run_tool)
-    monkeypatch.setattr(
-        agent,
-        "confirm_command",
-        lambda _command: pytest.fail("blocked edit should not trigger cat"),
-    )
-
-    answer = agent.run_task("change missing to draft and then show it")
-
-    output = capsys.readouterr().out
-    assert answer == "Edit blocked: old_text was not found in the file."
-    assert "Final answer:\nEdit blocked: old_text was not found in the file." in output
-    assert tool_calls == [
-        (
-            "replace_text",
-            {
-                "path": "/workspace/demo.txt",
-                "old_text": "missing",
-                "new_text": "draft",
-                "all_occurrences": False,
-            },
-        )
-    ]
+    assert responses == []
 
 
 def test_prior_context_is_sent_to_llm(monkeypatch, capsys, tmp_path):
@@ -568,8 +272,9 @@ def test_internal_trace_can_be_enabled(monkeypatch, capsys, tmp_path):
     assert "Final answer:\n4" in output
 
 
-def test_exit_command_accepts_common_quit_typo():
-    assert agent.is_exit_command("wuit")
+def test_exit_command_recognizes_standard_quits():
+    assert agent.is_exit_command("exit")
+    assert agent.is_exit_command("quit")
     assert agent.is_exit_command(" q ")
     assert not agent.is_exit_command("quit deleting files")
 
