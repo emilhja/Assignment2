@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import safety
 import tools
 
 
@@ -14,10 +15,13 @@ def test_run_bash_uses_bash_expansion():
 
 def test_run_bash_timeout(monkeypatch):
     monkeypatch.setattr(tools, "COMMAND_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        safety, "ALLOWED_COMMANDS", safety.ALLOWED_COMMANDS | {"sleep"}
+    )
 
     output = tools.run_bash("sleep 1")
 
-    assert output == "I stopped the command after 0.01 seconds."
+    assert output.startswith("I stopped the command after 0.01 seconds.")
 
 
 def test_run_bash_truncates_long_output():

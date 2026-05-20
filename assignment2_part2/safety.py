@@ -1,6 +1,31 @@
 import re
 
 
+# Read-only commands the agent is allowed to run. Anything not on this list is
+# blocked by the allowlist layer before the blocklist below even runs.
+ALLOWED_COMMANDS = frozenset(
+    {
+        "ls",
+        "cat",
+        "grep",
+        "head",
+        "tail",
+        "wc",
+        "find",
+        "pwd",
+        "echo",
+        "printf",
+        "sort",
+        "uniq",
+        "cut",
+        "awk",
+        "sed",
+        "true",
+        "false",
+    }
+)
+
+
 # Check the user's plain-English request before any shell command exists.
 # Example: "delete everything" is blocked before the model can turn it into rm -rf.
 FORBIDDEN_INTENT_PATTERNS = [
@@ -88,7 +113,34 @@ DANGEROUS_PATTERNS = [
     (re.compile(r"(?is)\bcurl\b.+\|\s*bash\b"), "I will not pipe curl into bash."),
     (re.compile(r"(?is)\bwget\b.+\|\s*bash\b"), "I will not pipe wget into bash."),
     (re.compile(r":\(\)\s*\{\s*:\|:&\s*\};:"), "That looks like a fork bomb"),
+    (re.compile(r"\$\("), "I will not run command substitution."),
+    (re.compile(r"`"), "I will not run backtick command substitution."),
+    (re.compile(r"<\("), "I will not run input process substitution."),
+    (re.compile(r">\("), "I will not run output process substitution."),
+    (re.compile(r"(^|\s)\d?>>?(\s|$)"), "I will not run shell redirection."),
+    (re.compile(r"(?i)(^|[\s;|&])sed\s+-[a-z]*i\b"), "I will not run sed in-place edits."),
 ]
+
+
+# Segments separated by ; | & (the agent only inspects the first token of each).
+_SEGMENT_SPLIT = re.compile(r"[;|&]+")
+_FIRST_TOKEN = re.compile(r"\S+")
+
+
+def command_allowlist_check(command):
+    """Reject commands whose first token in any segment is not on the allowlist."""
+
+    for segment in _SEGMENT_SPLIT.split(command):
+        stripped = segment.strip()
+        if not stripped:
+            continue
+        match = _FIRST_TOKEN.search(stripped)
+        if not match:
+            continue
+        first = match.group(0)
+        if first not in ALLOWED_COMMANDS:
+            return False, f"command '{first}' is not on the allowlist"
+    return True, None
 
 
 def intent_refusal(user_task):
@@ -102,9 +154,14 @@ def intent_refusal(user_task):
 
 
 def safety_check(command):
-    """Return whether the command matches any blocked command pattern."""
+    """Return whether the command passes the allowlist and blocklist layers."""
 
-    # Scan the full command text for blocked tools, tokens, and shell patterns.
+    # Layer 1: default-deny. Only commands on ALLOWED_COMMANDS may run.
+    allowed, reason = command_allowlist_check(command)
+    if not allowed:
+        return False, f"Blocked by safety check: {reason}"
+
+    # Layer 2: scan the full command text for blocked tools, tokens, and patterns.
     for pattern, reason in DANGEROUS_PATTERNS:
         if pattern.search(command):
             return False, f"Blocked by safety check: {reason}"
