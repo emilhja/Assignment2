@@ -85,9 +85,10 @@ python -m pytest
 
 ## Tools
 
-`bash` runs one local Bash command through `bash -lc` after safety checks and
-manual `y/N` approval. Output is truncated to 4000 characters and commands time
-out after 10 seconds.
+`bash` runs one local Bash command through `bash --noprofile --norc -c` with a
+minimal subprocess environment (no API keys, no provider secrets) after the
+allowlist + blocklist safety check and manual `y/N` approval. Output is
+truncated to 4000 characters and commands time out after 10 seconds.
 
 `edit_section` edits one file inside the configured workspace. It replaces one
 exact `old_text` match with `new_text`, and refuses missing, repeated, or
@@ -96,6 +97,24 @@ outside-workspace edits.
 `replace_text` edits one file inside the configured workspace. It replaces one
 exact match by default, or every exact match when `all_occurrences` is true.
 Repeated text is refused unless the caller explicitly asks for every match.
+
+## Safety
+
+The bash tool passes commands through two layers in `safety.py`:
+
+1. **Allowlist (default-deny):** the first token of every `; | &` segment must
+   be one of a small set of read-only commands (`ls`, `cat`, `grep`, `head`,
+   `tail`, `wc`, `find`, `pwd`, `echo`, `printf`, `sort`, `uniq`, `cut`, `awk`,
+   `sed`, `true`, `false`). Anything else — including `curl`, `wget`, `nc`,
+   `python`, `node` — is rejected before the blocklist runs.
+2. **Blocklist:** regex patterns reject command substitution (`$(...)`,
+   backticks), process substitution (`<(...)`, `>(...)`), shell redirection
+   (`>`, `>>`, `2>`), in-place `sed -i`, recursive permission changes, and
+   references to `.env`, `/data`, `/proc/self/environ`, and credential
+   environment variables.
+
+The bash subprocess receives an explicit minimal environment (`PATH`, `HOME`,
+`LANG`, `LC_ALL`, `TERM`, `PWD`) — provider API keys are not inherited.
 
 ## Session History
 
@@ -113,6 +132,8 @@ docker compose run --rm agent
 ```
 
 The Compose setup mounts `./workspace` to `/workspace` for user-task files and
-`./data` to `/data` for session history. It runs as a non-root user, starts bash
-commands from the workspace, blocks Docker commands inside the agent, and blocks
-commands that expose `.env`, `/data`, or process environment values.
+`./data` to `/data` for session history. It runs as a non-root user with a
+read-only root filesystem (`/tmp` is a 64 MB tmpfs), drops all Linux
+capabilities, blocks privilege escalation, and limits the container to 100
+PIDs and 512 MB RAM. Inside the agent the bash allowlist plus blocklist still
+gate every command.

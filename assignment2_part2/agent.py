@@ -215,6 +215,7 @@ def main() -> None:
                     recent_context.append(f"User: {user_task}\nAssistant: {answer}")
                     recent_context = recent_context[-MAX_CONTEXT_TURNS:]
             except Exception as exc:
+                store.record("system", "error", repr(exc))
                 print(f"\nError: {exc}")
     finally:
         store.close()

@@ -207,5 +207,5 @@ python -m pytest assignment2_part2
 Expected result:
 
 ```text
-45 passed
+70 passed
 ```
