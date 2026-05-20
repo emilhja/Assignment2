@@ -5,3 +5,5 @@ __pycache__/
 .gitignore
 workspace/*
 !workspace/.gitkeep
+data/*
+!data/.gitkeep

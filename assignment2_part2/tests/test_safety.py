@@ -57,6 +57,21 @@ def test_blocks_broad_reads_and_searches():
     assert not is_command_safe("grep -R /")
 
 
+def test_blocks_internal_data_and_secret_exposure():
+    assert not is_command_safe("cat /data/session_history.sqlite3")
+    assert not is_command_safe("ls -la /data")
+    assert not is_command_safe("cat /app/.env")
+    assert not is_command_safe("sed -n '1,20p' .env.example")
+    assert not is_command_safe("cat /proc/self/environ")
+    assert not is_command_safe("env")
+    assert not is_command_safe("printenv")
+    assert not is_command_safe("export")
+    assert not is_command_safe("set")
+    assert not is_command_safe("python -c 'import os; print(os.environ)'")
+    assert not is_command_safe("node -e \"console.log(process.env)\"")
+    assert not is_command_safe("echo $GROQ_API_KEY")
+
+
 def test_blocks_plain_delete_commands():
     assert not is_command_safe("rm /workspace/demo.txt")
     assert not is_command_safe("rmdir /workspace")

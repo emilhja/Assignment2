@@ -1,3 +1,26 @@
+import re
+
+
+# Plain-English requests the agent should refuse before asking the model.
+FORBIDDEN_INTENT_PATTERNS = [
+    (
+        re.compile(r"(?i)\b(delete|remove)\s+(the\s+)?whole\s+(folder|directory)\b"),
+        "Deleting a whole folder is not allowed.",
+    ),
+    (
+        re.compile(r"(?i)\b(delete|remove)\s+everything\b"),
+        "Deleting everything is not allowed.",
+    ),
+    (
+        re.compile(r"(?i)\b(delete|remove)\s+all\s+(files|folders|directories)?\b"),
+        "Broad deletion is not allowed.",
+    ),
+    (
+        re.compile(r"(?i)\bwipe\b"),
+        "Wiping files is not allowed.",
+    ),
+]
+
 # commands the agent is not allowed to run
 BLOCKED_REASONS = {
     "rm": "rm is not allowed",
@@ -14,6 +37,14 @@ BLOCKED_REASONS = {
     "reboot": "shutdown/reboot not allowed",
     "poweroff": "poweroff is not allowed",
 }
+
+
+def intent_refusal(user_task):
+    for pattern, reason in FORBIDDEN_INTENT_PATTERNS:
+        if pattern.search(user_task):
+            return reason
+    return None
+
 
 def safety_check(command):
     pieces = command.replace("\n", ";").split(";")
@@ -33,6 +64,11 @@ def safety_check(command):
                     return False, f"Blocked: {reason}"
 
     return True, None
+
+
+def is_command_safe(command):
+    allowed, _reason = safety_check(command)
+    return allowed
 
 
 def confirm_command(command):

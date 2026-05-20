@@ -35,17 +35,12 @@ def test_command_output_is_returned_as_observation(monkeypatch, capsys):
     assert "Final answer:\n/app" in output
 
 
-def test_blocked_command_is_not_executed_and_becomes_observation(monkeypatch, capsys):
-    calls = []
-
-    def fake_complete_chat(messages):
-        calls.append(messages)
-        if len(calls) == 1:
-            return "Thought: I will remove files.\nAction: bash\nCommand: rm -rf /workspace"
-        assert messages[-1]["content"].startswith("Observation: Blocked by safety check:")
-        return "Thought: The command was blocked.\nFinal Answer: I cannot run that command."
-
-    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
+def test_broad_delete_intent_is_refused_before_model_call(monkeypatch, capsys):
+    monkeypatch.setattr(
+        agent,
+        "complete_chat",
+        lambda _messages: pytest.fail("broad delete intent should not call the model"),
+    )
     monkeypatch.setattr(
         agent,
         "confirm_command",
@@ -60,8 +55,29 @@ def test_blocked_command_is_not_executed_and_becomes_observation(monkeypatch, ca
     agent.run_task("Delete everything in /workspace")
 
     output = capsys.readouterr().out
-    assert len(calls) == 2
-    assert "Final answer:\nI cannot run that command." in output
+    assert "Final answer:\nI cannot do that. Deleting everything is not allowed." in output
+
+
+def test_blocked_model_command_gets_immediate_feedback(monkeypatch, capsys):
+    def fake_complete_chat(_messages):
+        return "Thought: I will remove files.\nAction: bash\nCommand: rm -rf /workspace"
+
+    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
+    monkeypatch.setattr(
+        agent,
+        "confirm_command",
+        lambda _command: pytest.fail("blocked commands should not ask for confirmation"),
+    )
+    monkeypatch.setattr(
+        agent,
+        "run_bash",
+        lambda _command: pytest.fail("blocked commands should not execute"),
+    )
+
+    agent.run_task("Clean up /workspace")
+
+    output = capsys.readouterr().out
+    assert "Final answer:\nI cannot run that command. Blocked:" in output
 
 
 def test_internal_trace_is_hidden_by_default(monkeypatch, capsys):

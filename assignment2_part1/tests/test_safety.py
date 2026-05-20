@@ -1,9 +1,14 @@
-from safety import is_command_safe
+from safety import intent_refusal, is_command_safe
 
 
 def test_blocks_delete_commands():
     assert not is_command_safe("rm -rf /workspace")
     assert not is_command_safe("rmdir /workspace")
+
+
+def test_refuses_broad_delete_intents():
+    assert intent_refusal("delete the whole folder")
+    assert intent_refusal("can you delete all files")
 
 
 def test_blocks_host_level_commands():

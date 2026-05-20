@@ -70,4 +70,7 @@ def parse_response(text):
     if not command:
         return ParsedResponse(kind="invalid", error="Command is empty")
 
+    if len(command) >= 2 and command[0] == command[-1] and command[0] in {"'", '"'}:
+        return ParsedResponse(kind="invalid", error="Command should not be fully quoted")
+
     return ParsedResponse(kind="action", action="bash", command=command)

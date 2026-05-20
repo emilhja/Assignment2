@@ -6,7 +6,10 @@ services:
     stdin_open: true
     tty: true
     working_dir: /app
+    environment:
+      AGENT_SESSION_DB: /data/session_history.sqlite3
     volumes:
       - ./workspace:/workspace
+      - ./data:/data
     cpus: "1.0"
     mem_limit: 512m

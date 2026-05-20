@@ -1,66 +1,55 @@
-import re
+import json
 
 
 class ParsedResponse:
-    def __init__(self, kind, action=None, command=None, answer=None, error=None):
+    def __init__(self, kind, tool=None, args=None, answer=None, reason=None, error=None):
         self.kind = kind
-        self.action = action
-        self.command = command
+        self.tool = tool
+        self.args = args or {}
         self.answer = answer
+        self.reason = reason
         self.error = error
 
 
-def parse_response(text):
+def parse_response(text, allowed_tools=None):
+    """Parse one structured model reply into a final answer or tool call."""
+
     stripped = text.strip()
-    # A valid reply must start with Thought: and include text after it.
-    if not re.match(r"(?is)^Thought:\s*\S+", stripped):
-        return ParsedResponse(kind="invalid", error="I need a real Thought: line at the top.")
+    if not stripped:
+        return ParsedResponse(kind="invalid", error="The reply was empty.")
 
-    # The reply can give a final answer or request a command, but not both.
-    has_final = re.search(r"(?im)^\s*Final Answer:", stripped) is not None
-    has_action = re.search(r"(?im)^\s*Action:", stripped) is not None
-    if has_final and has_action:
-        return ParsedResponse(
-            kind="invalid",
-            error="Use either 'Final Answer:' or 'Action: bash', not both.",
-        )
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        return ParsedResponse(kind="invalid", error=f"The reply was not valid JSON: {exc.msg}.")
 
-    # Final Answer: must include actual answer text.
-    final_match = re.search(r"(?is)^\s*Final Answer:\s*(.*)", stripped, flags=re.MULTILINE)
-    if final_match:
-        answer = final_match.group(1).strip()
-        if answer:
-            return ParsedResponse(kind="final", answer=answer)
-        return ParsedResponse(kind="invalid", error="Final Answer is there, but it is blank")
+    if not isinstance(payload, dict):
+        return ParsedResponse(kind="invalid", error="The JSON reply must be an object.")
 
-    # Action: must only say bash; the shell command belongs on Command:.
-    action_line_match = re.search(r"(?im)^\s*Action:\s*(.*)$", stripped)
-    if action_line_match and action_line_match.group(1).strip() != "bash":
-        return ParsedResponse(
-            kind="invalid",
-            error="Action line must be exactly 'Action: bash'. Put the command on the Command line.",
-        )
+    response_type = payload.get("type")
+    if response_type == "final":
+        if "tool" in payload or "args" in payload:
+            return ParsedResponse(kind="invalid", error="A final answer must not include tool fields.")
+        answer = payload.get("answer")
+        if not isinstance(answer, str) or not answer.strip():
+            return ParsedResponse(kind="invalid", error="Final replies need a non-empty string answer.")
+        return ParsedResponse(kind="final", answer=answer.strip())
 
-    # If there is no final answer, the reply must request Action: bash.
-    action_match = re.search(r"(?im)^\s*Action:\s*bash\s*$", stripped)
-    if not action_match:
-        return ParsedResponse(
-            kind="invalid",
-            error="Expected either 'Final Answer:' or 'Action: bash' with 'Command: ...'.",
-        )
+    if response_type == "tool_call":
+        if "answer" in payload:
+            return ParsedResponse(kind="invalid", error="A tool call must not include an answer field.")
+        tool = payload.get("tool")
+        if not isinstance(tool, str) or not tool.strip():
+            return ParsedResponse(kind="invalid", error="Tool calls need a non-empty string tool name.")
+        tool = tool.strip()
+        if allowed_tools is not None and tool not in allowed_tools:
+            return ParsedResponse(kind="invalid", error=f"Unknown tool: {tool}.")
+        args = payload.get("args")
+        if not isinstance(args, dict):
+            return ParsedResponse(kind="invalid", error="Tool calls need an args object.")
+        reason = payload.get("reason", "")
+        if reason is not None and not isinstance(reason, str):
+            return ParsedResponse(kind="invalid", error="Tool call reason must be a string when present.")
+        return ParsedResponse(kind="tool_call", tool=tool, args=args, reason=(reason or "").strip())
 
-    command_match = re.search(r"(?im)^\s*Command:\s*(.*)$", stripped)
-    if not command_match:
-        return ParsedResponse(kind="invalid", error="Action was bash but no Command was found.")
-
-    command = command_match.group(1).strip()
-    if not command:
-        return ParsedResponse(kind="invalid", error="Command: is there, but there is no command after it")
-    if len(command) >= 2 and command[0] == command[-1] and command[0] in {"'", '"'}:
-        # Do not accept one quoted command string; commands should be raw shell text.
-        return ParsedResponse(
-            kind="invalid",
-            error="Command must not be wrapped as one quoted shell string.",
-        )
-
-    return ParsedResponse(kind="action", action="bash", command=command)
+    return ParsedResponse(kind="invalid", error="JSON field 'type' must be either 'final' or 'tool_call'.")

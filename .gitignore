@@ -33,3 +33,6 @@ Thumbs.db
 # Agent workspace output (keep directory via .gitkeep)
 **/workspace/*
 !**/workspace/.gitkeep
+
+# Local agent session logs
+*.sqlite3

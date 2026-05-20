@@ -2,12 +2,14 @@ import shutil
 import subprocess
 
 MAX_OUTPUT_CHARS = 4000
+COMMAND_TIMEOUT_SECONDS = 10
+BASH_NOT_FOUND_MESSAGE = "bash not found in PATH"
 
 
 def run_bash(command):
     bash_path = shutil.which("bash")
     if bash_path is None:
-        return "bash not found in PATH"
+        return BASH_NOT_FOUND_MESSAGE
 
     # run it and grab whatever comes out
     try:
@@ -16,12 +18,12 @@ def run_bash(command):
             shell=False,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=COMMAND_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
-        return "bash not found in PATH"
+        return BASH_NOT_FOUND_MESSAGE
     except subprocess.TimeoutExpired:
-        return "command timed out (10s limit)"
+        return f"I stopped the command after {COMMAND_TIMEOUT_SECONDS} seconds."
 
     if completed.stdout:
         out = completed.stdout.strip()

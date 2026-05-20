@@ -2,7 +2,7 @@ import os
 
 from llm_client import complete_chat
 from parser import parse_response
-from safety import confirm_command, safety_check
+from safety import confirm_command, intent_refusal, safety_check
 from tools import run_bash
 
 MAX_STEPS = 5
@@ -33,6 +33,7 @@ Tool rules:
 - Never fabricate file names, command output, or local system state.
 - Prefer safe, narrow commands such as pwd, ls, cat, head, sed, and wc.
 - Do not request destructive commands, sudo, package managers, Docker commands, shutdown, or reboot.
+- Refuse goals that require broad deletion, overwriting, reformatting, shutdown, or reboot.
 
 Workspace rules:
 - The agent code may run from /app.
@@ -48,6 +49,12 @@ Observation rules:
 
 def run_task(user_task):
     debug = os.getenv("AGENT_DEBUG", "").strip() == "1"
+
+    refusal_reason = intent_refusal(user_task)
+    if refusal_reason:
+        print("\nFinal answer:")
+        print(f"I cannot do that. {refusal_reason}")
+        return
 
     msgs = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -79,6 +86,12 @@ def run_task(user_task):
             allowed, reason = safety_check(command)
             if not allowed:
                 observation = reason or "Blocked by safety check."
+                if debug:
+                    print("\nObservation:")
+                    print(observation)
+                print("\nFinal answer:")
+                print(f"I cannot run that command. {observation}")
+                return
             elif not confirm_command(command):
                 observation = "The command was denied, so I did not run it"
             else:
