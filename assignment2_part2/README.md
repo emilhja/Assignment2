@@ -22,7 +22,7 @@ or:
 - `agent.py` - interactive CLI, multi-round loop, context handling, and tool dispatch
 - `config/system_prompt.txt` - configurable system prompt and tool contract
 - `parser.py` - JSON response validation
-- `tools.py` - bounded bash tool, workspace file editors, and tool registry
+- `tools.py` - bounded bash tool, workspace file creation/editors, and tool registry
 - `safety.py` - forbidden intent checks, command blocklist, and manual bash approval
 - `session_store.py` - SQLite session event log
 - `llm_client.py` - OpenAI-compatible provider wrapper
@@ -90,13 +90,23 @@ minimal subprocess environment (no API keys, no provider secrets) after the
 allowlist + blocklist safety check and manual `y/N` approval. Output is
 truncated to 4000 characters and commands time out after 10 seconds.
 
+`create_file` creates one file inside the configured workspace without shell
+redirection. It refuses outside-workspace paths and existing files unless
+`overwrite` is explicitly true.
+
 `edit_section` edits one file inside the configured workspace. It replaces one
-exact `old_text` match with `new_text`, and refuses missing, repeated, or
-outside-workspace edits.
+exact whole-line `old_text` section with `new_text`, including indentation, and
+refuses missing, repeated, partial-line, or outside-workspace edits.
 
 `replace_text` edits one file inside the configured workspace. It replaces one
-exact match by default, or every exact match when `all_occurrences` is true.
-Repeated text is refused unless the caller explicitly asks for every match.
+exact whole-line match by default, or every exact whole-line match when
+`all_occurrences` is true. Repeated text is refused unless the caller
+explicitly asks for every match.
+
+After a successful `create_file`, `edit_section`, or `replace_text` call, the agent runtime
+automatically runs the full Part 2 pytest suite before returning a final
+answer. From the repository root it uses `python -m pytest assignment2_part2 -q`;
+from the packaged Part 2 app root it uses `python -m pytest -q`.
 
 ## Safety
 
@@ -104,14 +114,17 @@ The bash tool passes commands through two layers in `safety.py`:
 
 1. **Allowlist (default-deny):** the first token of every `; | &` segment must
    be one of a small set of read-only commands (`ls`, `cat`, `grep`, `head`,
-   `tail`, `wc`, `find`, `pwd`, `echo`, `printf`, `sort`, `uniq`, `cut`, `awk`,
-   `sed`, `true`, `false`). Anything else — including `curl`, `wget`, `nc`,
+   `tail`, `wc`, `find`, `pwd`, `echo`, `printf`, `sort`, `uniq`, `cut`,
+   `true`, `false`). Anything else — including `curl`, `wget`, `nc`,
    `python`, `node` — is rejected before the blocklist runs.
 2. **Blocklist:** regex patterns reject command substitution (`$(...)`,
    backticks), process substitution (`<(...)`, `>(...)`), shell redirection
    (`>`, `>>`, `2>`), in-place `sed -i`, recursive permission changes, and
    references to `.env`, `/data`, `/proc/self/environ`, and credential
    environment variables.
+3. **Path argument check:** read commands that accept file paths reject
+   wildcard paths, `..`, and absolute paths outside `/workspace`. `find -exec`
+   and related execution modes are also rejected.
 
 The bash subprocess receives an explicit minimal environment (`PATH`, `HOME`,
 `LANG`, `LC_ALL`, `TERM`, `PWD`) — provider API keys are not inherited.

@@ -139,6 +139,7 @@ def test_model_drives_edit_then_show(monkeypatch, capsys, tmp_path):
 
     monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
     monkeypatch.setattr(agent, "run_tool", fake_run_tool)
+    monkeypatch.setattr(agent, "_run_post_edit_tests", lambda: "70 passed in 1.0s")
     monkeypatch.setattr(
         agent,
         "confirm_command",
@@ -165,6 +166,360 @@ def test_model_drives_edit_then_show(monkeypatch, capsys, tmp_path):
         ("bash", {"command": "cat /workspace/demo.txt"}),
     ]
     assert confirmed_commands == ["cat /workspace/demo.txt"]
+    assert responses == []
+
+
+def test_successful_edit_runs_post_edit_tests_before_final(monkeypatch, capsys, tmp_path):
+    _set_session_db(monkeypatch, tmp_path)
+    post_edit_tests = []
+    messages_seen = []
+    responses = [
+        json.dumps(
+            {
+                "type": "tool_call",
+                "tool": "edit_section",
+                "args": {
+                    "path": "/workspace/demo.py",
+                    "old_text": "    return result\n",
+                    "new_text": "    return int(result)\n",
+                },
+                "reason": "perform the edit",
+            }
+        ),
+        json.dumps({"type": "final", "answer": "Edited and tests passed."}),
+    ]
+
+    def fake_complete_chat(messages):
+        messages_seen.append([message.copy() for message in messages])
+        return responses.pop(0)
+
+    def fake_run_tool(tool, _args):
+        assert tool == "edit_section"
+        return "Edited one section in /workspace/demo.py."
+
+    def fake_post_edit_tests():
+        post_edit_tests.append(agent.POST_EDIT_TEST_COMMAND)
+        return "70 passed in 1.0s"
+
+    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
+    monkeypatch.setattr(agent, "run_tool", fake_run_tool)
+    monkeypatch.setattr(agent, "_run_post_edit_tests", fake_post_edit_tests)
+
+    answer = agent.run_task("Make the safe edit")
+
+    output = capsys.readouterr().out
+    assert answer == "Edited and tests passed."
+    assert "Final answer:\nEdited and tests passed." in output
+    assert post_edit_tests == [agent.POST_EDIT_TEST_COMMAND]
+    assert "70 passed in 1.0s" in messages_seen[-1][-1]["content"]
+    assert responses == []
+
+
+def test_successful_create_file_runs_post_edit_tests_before_final(monkeypatch, capsys, tmp_path):
+    _set_session_db(monkeypatch, tmp_path)
+    post_edit_tests = []
+    messages_seen = []
+    responses = [
+        json.dumps(
+            {
+                "type": "tool_call",
+                "tool": "create_file",
+                "args": {
+                    "path": "/workspace/hello.txt",
+                    "content": "Hello world!",
+                },
+                "reason": "create the file",
+            }
+        ),
+        json.dumps({"type": "final", "answer": "Created hello.txt."}),
+    ]
+
+    def fake_complete_chat(messages):
+        messages_seen.append([message.copy() for message in messages])
+        return responses.pop(0)
+
+    def fake_run_tool(tool, _args):
+        assert tool == "create_file"
+        return "Created file in /workspace/hello.txt."
+
+    def fake_post_edit_tests():
+        post_edit_tests.append(agent.POST_EDIT_TEST_COMMAND)
+        return "77 passed in 1.0s"
+
+    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
+    monkeypatch.setattr(agent, "run_tool", fake_run_tool)
+    monkeypatch.setattr(agent, "_run_post_edit_tests", fake_post_edit_tests)
+
+    answer = agent.run_task("Create /workspace/hello.txt with Hello world!")
+
+    output = capsys.readouterr().out
+    assert answer == "Created hello.txt."
+    assert "Final answer:\nCreated hello.txt." in output
+    assert post_edit_tests == [agent.POST_EDIT_TEST_COMMAND]
+    assert "77 passed in 1.0s" in messages_seen[-1][-1]["content"]
+    assert responses == []
+
+
+def test_create_and_execute_request_does_not_claim_script_ran(monkeypatch, capsys, tmp_path):
+    _set_session_db(monkeypatch, tmp_path)
+    messages_seen = []
+    responses = [
+        json.dumps(
+            {
+                "type": "tool_call",
+                "tool": "create_file",
+                "args": {
+                    "path": "/workspace/hello_world.sh",
+                    "content": '#!/bin/bash\necho "Hello, World!"\n',
+                },
+                "reason": "create the script",
+            }
+        ),
+        json.dumps(
+            {
+                "type": "final",
+                "answer": "The script was created and executed. It output Hello, World!",
+            }
+        ),
+    ]
+
+    def fake_complete_chat(messages):
+        messages_seen.append([message.copy() for message in messages])
+        return responses.pop(0)
+
+    def fake_run_tool(tool, _args):
+        assert tool == "create_file"
+        return "Created file in /workspace/hello_world.sh."
+
+    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
+    monkeypatch.setattr(agent, "run_tool", fake_run_tool)
+    monkeypatch.setattr(agent, "_run_post_edit_tests", lambda: "90 passed in 1.0s")
+
+    answer = agent.run_task("create a hello world bash script in /workspace and execute it")
+
+    output = capsys.readouterr().out
+    assert answer == (
+        "Created /workspace/hello_world.sh. I did not execute it because script "
+        "execution is blocked by the current safety policy."
+    )
+    assert "Final answer:\nCreated /workspace/hello_world.sh." in output
+    assert "output Hello, World" not in answer
+    assert any("Do not claim these files were run" in message["content"] for message in messages_seen[-1])
+    assert responses == []
+
+
+def test_successful_create_file_hides_internal_pytest_warning_noise(monkeypatch, capsys, tmp_path):
+    _set_session_db(monkeypatch, tmp_path)
+    responses = [
+        json.dumps(
+            {
+                "type": "tool_call",
+                "tool": "create_file",
+                "args": {
+                    "path": "/workspace/hello.txt",
+                    "content": "Hello world!",
+                },
+                "reason": "create the file",
+            }
+        ),
+        json.dumps(
+            {
+                "type": "final",
+                "answer": (
+                    "The file /workspace/hello.txt was created successfully with content:\n"
+                    "Hello world!\n\n"
+                    "The test suite ran but encountered a Pytest cache warning due to "
+                    "a read-only file system at /app/.pytest_cache. This appears "
+                    "unrelated to your file creation task. Would you like to inspect "
+                    "the file contents or try another action?"
+                ),
+            }
+        ),
+    ]
+
+    def fake_complete_chat(_messages):
+        return responses.pop(0)
+
+    def fake_run_tool(tool, _args):
+        assert tool == "create_file"
+        return "Created file in /workspace/hello.txt."
+
+    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
+    monkeypatch.setattr(agent, "run_tool", fake_run_tool)
+    monkeypatch.setattr(agent, "_run_post_edit_tests", lambda: "90 passed in 1.0s")
+
+    answer = agent.run_task("can you create a file hello.txt with the content 'Hello world!'")
+
+    output = capsys.readouterr().out
+    assert answer == (
+        "The file /workspace/hello.txt was created successfully with content:\n"
+        "Hello world!"
+    )
+    assert "pytest" not in answer.lower()
+    assert "read-only" not in answer.lower()
+    assert "Final answer:\nThe file /workspace/hello.txt" in output
+    assert responses == []
+
+
+def test_successful_edit_keeps_test_warning_when_user_asked(monkeypatch, capsys, tmp_path):
+    _set_session_db(monkeypatch, tmp_path)
+    responses = [
+        json.dumps(
+            {
+                "type": "tool_call",
+                "tool": "create_file",
+                "args": {
+                    "path": "/workspace/hello.txt",
+                    "content": "Hello world!",
+                },
+                "reason": "create the file",
+            }
+        ),
+        json.dumps(
+            {
+                "type": "final",
+                "answer": "Created the file. Pytest reported a cache warning.",
+            }
+        ),
+    ]
+
+    def fake_complete_chat(_messages):
+        return responses.pop(0)
+
+    def fake_run_tool(tool, _args):
+        assert tool == "create_file"
+        return "Created file in /workspace/hello.txt."
+
+    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
+    monkeypatch.setattr(agent, "run_tool", fake_run_tool)
+    monkeypatch.setattr(agent, "_run_post_edit_tests", lambda: "90 passed in 1.0s")
+
+    answer = agent.run_task("create hello.txt and tell me about any pytest warnings")
+
+    output = capsys.readouterr().out
+    assert answer == "Created the file. Pytest reported a cache warning."
+    assert "Final answer:\nCreated the file. Pytest reported a cache warning." in output
+    assert responses == []
+
+
+def test_failed_post_edit_tests_stop_before_model_final(monkeypatch, capsys, tmp_path):
+    _set_session_db(monkeypatch, tmp_path)
+    responses = [
+        json.dumps(
+            {
+                "type": "tool_call",
+                "tool": "replace_text",
+                "args": {
+                    "path": "/workspace/demo.py",
+                    "old_text": "    return result\n",
+                    "new_text": "        return result\n",
+                    "all_occurrences": False,
+                },
+                "reason": "perform the edit",
+            }
+        )
+    ]
+
+    def fake_complete_chat(_messages):
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
+    monkeypatch.setattr(
+        agent,
+        "run_tool",
+        lambda _tool, _args: "Replaced 1 occurrence(s) in /workspace/demo.py.",
+    )
+    monkeypatch.setattr(
+        agent,
+        "_run_post_edit_tests",
+        lambda: "Command exited with code 1.\n1 failed",
+    )
+
+    answer = agent.run_task("Make an edit that breaks tests")
+
+    output = capsys.readouterr().out
+    assert "post-edit test suite failed" in answer
+    assert "Command exited with code 1.\n1 failed" in answer
+    assert "Final answer:" in output
+    assert responses == []
+
+
+def test_blocked_edit_does_not_run_post_edit_tests(monkeypatch, capsys, tmp_path):
+    _set_session_db(monkeypatch, tmp_path)
+    responses = [
+        json.dumps(
+            {
+                "type": "tool_call",
+                "tool": "edit_section",
+                "args": {
+                    "path": "/workspace/demo.py",
+                    "old_text": "return result",
+                    "new_text": "        return result",
+                },
+                "reason": "perform the edit",
+            }
+        ),
+        json.dumps({"type": "final", "answer": "The edit was blocked."}),
+    ]
+
+    def fake_complete_chat(_messages):
+        return responses.pop(0)
+
+    def fail_if_called():
+        raise AssertionError("blocked edits must not run the test suite")
+
+    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
+    monkeypatch.setattr(
+        agent,
+        "run_tool",
+        lambda _tool, _args: "Edit blocked: old_text was not found as a complete line section.",
+    )
+    monkeypatch.setattr(agent, "_run_post_edit_tests", fail_if_called)
+
+    answer = agent.run_task("Make an unsafe edit")
+
+    output = capsys.readouterr().out
+    assert answer == "The edit was blocked."
+    assert "Final answer:\nThe edit was blocked." in output
+    assert responses == []
+
+
+def test_blocked_create_file_does_not_run_post_edit_tests(monkeypatch, capsys, tmp_path):
+    _set_session_db(monkeypatch, tmp_path)
+    responses = [
+        json.dumps(
+            {
+                "type": "tool_call",
+                "tool": "create_file",
+                "args": {
+                    "path": "/workspace/hello.txt",
+                    "content": "Hello world!",
+                },
+                "reason": "create the file",
+            }
+        ),
+        json.dumps({"type": "final", "answer": "The create was blocked."}),
+    ]
+
+    def fake_complete_chat(_messages):
+        return responses.pop(0)
+
+    def fail_if_called():
+        raise AssertionError("blocked creates must not run the test suite")
+
+    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
+    monkeypatch.setattr(
+        agent,
+        "run_tool",
+        lambda _tool, _args: "Edit blocked: file already exists: /workspace/hello.txt",
+    )
+    monkeypatch.setattr(agent, "_run_post_edit_tests", fail_if_called)
+
+    answer = agent.run_task("Create a file that already exists")
+
+    output = capsys.readouterr().out
+    assert answer == "The create was blocked."
+    assert "Final answer:\nThe create was blocked." in output
     assert responses == []
 
 

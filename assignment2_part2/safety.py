@@ -1,4 +1,6 @@
+import posixpath
 import re
+import shlex
 
 
 # Read-only commands the agent is allowed to run. Anything not on this list is
@@ -18,10 +20,23 @@ ALLOWED_COMMANDS = frozenset(
         "sort",
         "uniq",
         "cut",
-        "awk",
-        "sed",
         "true",
         "false",
+    }
+)
+
+PATH_ARGUMENT_COMMANDS = frozenset(
+    {
+        "cat",
+        "grep",
+        "head",
+        "tail",
+        "wc",
+        "find",
+        "ls",
+        "sort",
+        "uniq",
+        "cut",
     }
 )
 
@@ -119,25 +134,103 @@ DANGEROUS_PATTERNS = [
     (re.compile(r">\("), "I will not run output process substitution."),
     (re.compile(r"(^|\s)\d?>>?(\s|$)"), "I will not run shell redirection."),
     (re.compile(r"(?i)(^|[\s;|&])sed\s+-[a-z]*i\b"), "I will not run sed in-place edits."),
+    (re.compile(r"(?i)(^|[\s;|&])find\b[^\n;|&]*\s-exec(dir)?\b"), "find -exec is not safe here."),
+    (re.compile(r"(?i)(^|[\s;|&])find\b[^\n;|&]*\s-ok(dir)?\b"), "find -ok is not safe here."),
 ]
 
 
-# Segments separated by ; | & (the agent only inspects the first token of each).
-_SEGMENT_SPLIT = re.compile(r"[;|&]+")
-_FIRST_TOKEN = re.compile(r"\S+")
+# Segments separated by shell control operators. shlex keeps quoted operators
+# inside the same token, so `printf 'a|b'` is not treated like a pipeline.
+_CONTROL_OPERATOR = re.compile(r"[;|&]+")
+
+
+def _tokenize_command(command):
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";|&")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer), None
+    except ValueError as exc:
+        return None, f"could not parse command: {exc}"
+
+
+def _command_segments(command):
+    tokens, error = _tokenize_command(command)
+    if error:
+        return None, error
+
+    segments = []
+    current = []
+    for token in tokens:
+        if _CONTROL_OPERATOR.fullmatch(token):
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments, None
+
+
+def _looks_like_path(token):
+    return (
+        token in {".", "..", "~"}
+        or token.startswith(("/", "./", "../", "~/"))
+        or "/" in token
+        or "\\" in token
+    )
+
+
+def _path_stays_in_workspace(token):
+    normalized = token.replace("\\", "/")
+    if any(char in normalized for char in "*?["):
+        return False, "wildcard paths are too broad"
+
+    parts = [part for part in normalized.split("/") if part]
+    if ".." in parts:
+        return False, "paths must not contain '..'"
+
+    if normalized.startswith("/"):
+        cleaned = posixpath.normpath(normalized)
+        if cleaned == "/workspace" or cleaned.startswith("/workspace/"):
+            return True, None
+        return False, "absolute paths must stay under /workspace"
+
+    return True, None
+
+
+def _command_argument_check(command):
+    segments, error = _command_segments(command)
+    if error:
+        return False, error
+
+    for tokens in segments:
+        command_name = tokens[0]
+        if command_name not in PATH_ARGUMENT_COMMANDS:
+            continue
+
+        for token in tokens[1:]:
+            if token.startswith("-"):
+                continue
+            if not _looks_like_path(token):
+                continue
+            ok, reason = _path_stays_in_workspace(token)
+            if not ok:
+                return False, reason
+
+    return True, None
 
 
 def command_allowlist_check(command):
     """Reject commands whose first token in any segment is not on the allowlist."""
 
-    for segment in _SEGMENT_SPLIT.split(command):
-        stripped = segment.strip()
-        if not stripped:
-            continue
-        match = _FIRST_TOKEN.search(stripped)
-        if not match:
-            continue
-        first = match.group(0)
+    segments, error = _command_segments(command)
+    if error:
+        return False, error
+
+    for tokens in segments:
+        first = tokens[0]
         if first not in ALLOWED_COMMANDS:
             return False, f"command '{first}' is not on the allowlist"
     return True, None
@@ -165,6 +258,10 @@ def safety_check(command):
     for pattern, reason in DANGEROUS_PATTERNS:
         if pattern.search(command):
             return False, f"Blocked by safety check: {reason}"
+
+    arguments_safe, argument_reason = _command_argument_check(command)
+    if not arguments_safe:
+        return False, f"Blocked by safety check: {argument_reason}"
     return True, None
 
 

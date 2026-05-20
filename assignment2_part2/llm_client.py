@@ -27,7 +27,7 @@ PROVIDERS = {
 
 
 JSON_RESPONSE_FORMAT = {"type": "json_object"}
-TOOL_NAMES = {"bash", "edit_section", "replace_text"}
+TOOL_NAMES = {"bash", "create_file", "edit_section", "replace_text"}
 
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))

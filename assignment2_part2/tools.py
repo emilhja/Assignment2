@@ -59,6 +59,17 @@ def _resolve_workspace_path(path_text: str) -> Path:
     return candidate
 
 
+def _display_workspace_path(path: Path) -> str:
+    root = workspace_root()
+    try:
+        relative = path.resolve().relative_to(root)
+    except ValueError:
+        return str(path)
+    if str(relative) == ".":
+        return "/workspace"
+    return "/workspace/" + relative.as_posix()
+
+
 def _bash_subprocess_env(root: Path) -> dict:
     """Return a minimal environment for the bash subprocess (no provider keys)."""
 
@@ -134,9 +145,34 @@ def run_bash(command: str) -> str:
     return _truncate(output)
 
 
-def edit_section(path: str, old_text: str, new_text: str) -> str:
-    """Replace exactly one matching section in a workspace file."""
+def _whole_line_spans(text: str, needle: str) -> list[tuple[int, int]]:
+    """Return exact match spans that cover complete line sections."""
 
+    spans = []
+    start = 0
+    while True:
+        index = text.find(needle, start)
+        if index == -1:
+            return spans
+
+        end = index + len(needle)
+        starts_on_line = index == 0 or text[index - 1] == "\n"
+        ends_on_line = needle.endswith("\n") or end == len(text) or text[end] == "\n"
+        if starts_on_line and ends_on_line:
+            spans.append((index, end))
+        start = end
+
+
+def _replace_spans(text: str, spans: list[tuple[int, int]], replacement: str) -> str:
+    updated = text
+    for start, end in reversed(spans):
+        updated = updated[:start] + replacement + updated[end:]
+    return updated
+
+
+def _load_edit_target(
+    path: str, old_text: str, new_text: str
+) -> tuple[Path, str, list[tuple[int, int]]] | str:
     try:
         target = _resolve_workspace_path(path)
     except ValueError as exc:
@@ -152,48 +188,76 @@ def edit_section(path: str, old_text: str, new_text: str) -> str:
         return "Edit blocked: new_text must be a string."
 
     original = target.read_text(encoding="utf-8")
-    matches = original.count(old_text)
-    if matches == 0:
-        return "Edit blocked: old_text was not found in the file."
-    if matches > 1:
+    spans = _whole_line_spans(original, old_text)
+    if not spans:
+        return "Edit blocked: old_text was not found as a complete line section."
+
+    return target, original, spans
+
+
+def edit_section(path: str, old_text: str, new_text: str) -> str:
+    """Replace exactly one whole-line matching section in a workspace file."""
+
+    loaded = _load_edit_target(path, old_text, new_text)
+    if isinstance(loaded, str):
+        return loaded
+
+    target, original, spans = loaded
+    if len(spans) > 1:
         return "Edit blocked: old_text appears more than once; provide a unique section."
 
-    updated = original.replace(old_text, new_text, 1)
+    updated = _replace_spans(original, spans, new_text)
     target.write_text(updated, encoding="utf-8")
     return _truncate(f"Edited one section in {target}.")
 
 
-def replace_text(path: str, old_text: str, new_text: str, all_occurrences: bool = False) -> str:
-    """Replace one or all exact text matches in a workspace file."""
+def create_file(path: str, content: str, overwrite: bool = False) -> str:
+    """Create one file inside the workspace without shell redirection."""
+
+    if not isinstance(content, str):
+        return "Edit blocked: content must be a string."
+    if not isinstance(overwrite, bool):
+        return "Edit blocked: overwrite must be a boolean."
 
     try:
         target = _resolve_workspace_path(path)
     except ValueError as exc:
         return f"Edit blocked: {exc}"
 
-    if not target.exists():
-        return f"Edit blocked: file does not exist: {target}"
-    if not target.is_file():
-        return f"Edit blocked: path is not a file: {target}"
-    if not isinstance(old_text, str) or not old_text:
-        return "Edit blocked: old_text must be a non-empty string."
-    if not isinstance(new_text, str):
-        return "Edit blocked: new_text must be a string."
+    if target.exists() and target.is_dir():
+        return f"Edit blocked: path is a directory: {target}"
+    if target.exists() and not overwrite:
+        return f"Edit blocked: file already exists: {target}"
+    if target.parent.exists() and not target.parent.is_dir():
+        return f"Edit blocked: parent path is not a directory: {target.parent}"
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+
+    action = "Overwrote" if overwrite else "Created"
+    return _truncate(f"{action} file in {_display_workspace_path(target)}.")
+
+
+def replace_text(path: str, old_text: str, new_text: str, all_occurrences: bool = False) -> str:
+    """Replace one or all whole-line exact text matches in a workspace file."""
+
     if not isinstance(all_occurrences, bool):
         return "Edit blocked: all_occurrences must be a boolean."
 
-    original = target.read_text(encoding="utf-8")
-    matches = original.count(old_text)
-    if matches == 0:
-        return "Edit blocked: old_text was not found in the file."
-    if matches > 1 and not all_occurrences:
+    loaded = _load_edit_target(path, old_text, new_text)
+    if isinstance(loaded, str):
+        return loaded
+
+    target, original, spans = loaded
+    if len(spans) > 1 and not all_occurrences:
         return (
-            f"Edit blocked: old_text appears {matches} times; "
+            f"Edit blocked: old_text appears {len(spans)} times; "
             "set all_occurrences to true only if the user asked to replace every match."
         )
 
-    replace_count = matches if all_occurrences else 1
-    updated = original.replace(old_text, new_text, replace_count)
+    selected_spans = spans if all_occurrences else spans[:1]
+    replace_count = len(selected_spans)
+    updated = _replace_spans(original, selected_spans, new_text)
     target.write_text(updated, encoding="utf-8")
     return _truncate(f"Replaced {replace_count} occurrence(s) in {target}.")
 
@@ -215,13 +279,23 @@ TOOL_REGISTRY = {
     ),
     "edit_section": ToolSpec(
         name="edit_section",
-        description="Replace one exact section in one workspace file.",
+        description="Replace one exact whole-line section in one workspace file.",
         required_args=("path", "old_text", "new_text"),
         handler=lambda args: edit_section(args["path"], args["old_text"], args["new_text"]),
     ),
+    "create_file": ToolSpec(
+        name="create_file",
+        description="Create one file inside the workspace without shell redirection.",
+        required_args=("path", "content"),
+        handler=lambda args: create_file(
+            args["path"],
+            args["content"],
+            args.get("overwrite", False),
+        ),
+    ),
     "replace_text": ToolSpec(
         name="replace_text",
-        description="Replace one or all exact text matches in one workspace file.",
+        description="Replace one or all exact whole-line text matches in one workspace file.",
         required_args=("path", "old_text", "new_text"),
         handler=lambda args: replace_text(
             args["path"],

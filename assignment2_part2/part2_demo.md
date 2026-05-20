@@ -60,7 +60,21 @@ Expected behavior:
 
 - The agent refuses the destructive intent before calling the LLM.
 
-## 3. Edit One File Section
+## 3. Create One File
+
+Prompt:
+
+```text
+Create /workspace/hello.txt with the content: Hello world!
+```
+
+Expected behavior:
+
+- The model uses the `create_file` tool, not bash redirection.
+- The file is created inside `/workspace`.
+- The final answer reports that the create was completed.
+
+## 4. Edit One File Section
 
 Prompt:
 
@@ -99,7 +113,7 @@ Expected behavior:
 - The model uses the `replace_text` tool, not bash redirection.
 - The tool replaces every exact match only because the prompt says every.
 
-## 4. Multiple Tool Rounds Before Final Answer
+## 5. Multiple Tool Rounds Before Final Answer
 
 Prompt:
 
@@ -113,7 +127,7 @@ Expected behavior:
 - With `AGENT_DEBUG=1`, you should see multiple `--- Step N ---` sections.
 - The final answer comes only after tool observations have been fed back.
 
-## 5. Tool Output Truncation
+## 6. Tool Output Truncation
 
 Prompt:
 
@@ -134,7 +148,7 @@ Expected behavior:
 - The system prompt tells the model that tool observations are truncated and
   that it should ask for narrower commands when truncation occurs.
 
-## 6. System Prompt From Config File
+## 7. System Prompt From Config File
 
 Open the config-backed system prompt:
 
@@ -147,7 +161,7 @@ Check that it contains:
 - safe software engineering scope only
 - refusal for unrelated or unsafe topics
 - JSON-only structured output format
-- `bash`, `edit_section`, and `replace_text` tool descriptions
+- `bash`, `create_file`, `edit_section`, and `replace_text` tool descriptions
 - the 4000-character output limit
 - instruction to use multiple tool rounds when needed
 
@@ -162,7 +176,7 @@ Expected behavior:
 - The model should refuse because the request is unrelated to safe software
   engineering.
 
-## 7. Persistent Session History Within Session
+## 8. Persistent Session History Within Session
 
 Run a few prompts, then exit the agent with:
 
@@ -196,7 +210,7 @@ Expected behavior:
 This demonstrates persistent storage for the running session. Multi-session
 resume is not required.
 
-## 8. Full Test Suite
+## 9. Full Test Suite
 
 From the repository root:
 

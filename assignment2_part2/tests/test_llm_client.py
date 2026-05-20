@@ -178,6 +178,31 @@ def test_groq_failed_generation_native_replace_text_tool_is_recovered(monkeypatc
     )
 
 
+def test_groq_failed_generation_native_create_file_tool_is_recovered(monkeypatch):
+    body = {
+        "error": {
+            "message": "Tool choice is none, but model called a tool",
+            "type": "invalid_request_error",
+            "code": "tool_use_failed",
+            "failed_generation": (
+                '{"name": "create_file", "arguments": {"path":"/workspace/hello.txt",'
+                '"content":"Hello world!","overwrite":false}}'
+            ),
+        }
+    }
+    client, _completions = _client_with([FakeProviderError(body)])
+
+    monkeypatch.setenv("LLM_PROVIDER_ORDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setattr(llm_client, "_client_for_provider", lambda _config: client)
+
+    assert llm_client.complete_chat([{"role": "user", "content": "create hello.txt"}]) == (
+        '{"type": "tool_call", "tool": "create_file", '
+        '"args": {"path": "/workspace/hello.txt", "content": "Hello world!", '
+        '"overwrite": false}, "reason": "recovered provider tool call"}'
+    )
+
+
 def test_groq_failed_generation_bash_tool_arguments_are_recovered(monkeypatch):
     body = {
         "error": {

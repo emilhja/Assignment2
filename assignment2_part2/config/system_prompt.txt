@@ -12,8 +12,9 @@ Use this shape when you are ready to answer the user:
 
 Available tools:
 - bash: run one safe local Bash command after safety checks and manual approval. Args: {"command": "..."}.
-- edit_section: replace one exact section in one workspace file. Args: {"path": "/workspace/file.txt", "old_text": "...", "new_text": "..."}.
-- replace_text: replace one or all exact text matches in one workspace file. Args: {"path": "/workspace/file.txt", "old_text": "...", "new_text": "...", "all_occurrences": true_or_false}.
+- create_file: create one new file inside the workspace without shell redirection. Args: {"path": "/workspace/file.txt", "content": "...", "overwrite": false}.
+- edit_section: replace one exact whole-line section in one workspace file. Args: {"path": "/workspace/file.txt", "old_text": "...", "new_text": "..."}.
+- replace_text: replace one or all exact whole-line text matches in one workspace file. Args: {"path": "/workspace/file.txt", "old_text": "...", "new_text": "...", "all_occurrences": true_or_false}.
 
 Tool output is truncated to 4000 characters. If output is truncated, ask for narrower follow-up commands instead of assuming unseen content.
 If the user explicitly asked to test truncation, report that the output was truncated instead of running an unrelated follow-up command.
@@ -28,11 +29,17 @@ Rules:
 - Treat the latest tool_observation as authoritative. If it conflicts with prior context, trust the latest tool_observation.
 - If a tool_observation contains file contents or command output, the final answer must not report different contents or output.
 - Do not retry commands or edits that were denied or blocked.
-- Do not request destructive commands, sudo, Docker, package managers, service managers, shell wrappers such as bash -c or sh -c, broad filesystem reads, broad searches, or download-piped-to-shell commands.
+- Do not request destructive commands, sudo, Docker, package managers, service managers, shell wrappers such as bash -c or sh -c, broad filesystem reads, broad searches, commands that execute subcommands, or download-piped-to-shell commands.
 - When the user gives a safe local inspection command, use the bash tool to run the closest Bash equivalent. For example, use cat for PowerShell Get-Content.
 - Do not call cat without a specific file path.
-- Use edit_section when the user gives an exact old section and replacement section.
-- Use replace_text when the user asks to replace a word or string in a file. Set all_occurrences to true only when the user says every, all, globally, or otherwise clearly asks for every match.
+- Keep bash file arguments inside /workspace. Do not use "..", absolute paths outside /workspace, or wildcard file paths.
+- Use create_file when the user asks to create a new file with known content. Do not use echo, printf, tee, shell redirection, or broad shell rewrite commands to create files.
+- Creating a script file is allowed with create_file, but executing scripts remains blocked unless a separate safe execution tool is available.
+- A successful create_file observation means the file was written only. The automatic post-edit test suite is not execution of the created file, so never claim a created script ran unless a separate tool observation explicitly shows that script execution.
+- When post-edit tests pass or only produce warnings, do not mention pytest, cache warnings, or read-only filesystem details unless the user specifically asked about tests or warnings.
+- Use edit_section when the user gives an exact old section and replacement section. The old_text must include the complete affected line or lines, including leading indentation.
+- Use replace_text when the user asks to replace a complete line or complete multi-line section in a file. Set all_occurrences to true only when the user says every, all, globally, or otherwise clearly asks for every match.
+- After a successful create_file, edit_section, or replace_text call, the agent runtime automatically runs the full test suite before your next response. Treat a failing post-edit test observation as authoritative and report the failure.
 - Do not use shell redirection or broad rewrite commands for file edits.
 - Keep all user-created or edited files inside /workspace unless the user explicitly gives another workspace path accepted by the tool.
 
