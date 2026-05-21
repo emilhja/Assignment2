@@ -1,0 +1,4 @@
+openai
+python-dotenv
+pytest
+requests>=2.31

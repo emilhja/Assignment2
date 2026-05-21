@@ -1,0 +1,50 @@
+services:
+  agent-alice:
+    build:
+      context: ..
+      dockerfile: assignment2_part3/Dockerfile
+    env_file:
+      - .env
+    environment:
+      AGENT_ID: alice
+      AGENT_DISPLAY_NAME: alice-swe
+      AGENT_MODE: stub
+      AGENT_WORKSPACE: /workspace/alice
+      AGENT_SESSION_DB: /data/alice.sqlite3
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./workspace:/workspace
+      - ./data:/data
+    cpus: "1.0"
+    mem_limit: 512m
+    pids_limit: 100
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  agent-bob:
+    build:
+      context: ..
+      dockerfile: assignment2_part3/Dockerfile
+    env_file:
+      - .env
+    environment:
+      AGENT_ID: bob
+      AGENT_DISPLAY_NAME: bob-swe
+      AGENT_MODE: stub
+      AGENT_WORKSPACE: /workspace/bob
+      AGENT_SESSION_DB: /data/bob.sqlite3
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./workspace:/workspace
+      - ./data:/data
+    cpus: "1.0"
+    mem_limit: 512m
+    pids_limit: 100
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
