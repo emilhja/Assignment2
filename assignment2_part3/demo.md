@@ -88,28 +88,28 @@ RUNPOD_CHAT_POLL_INTERVAL=2
 `AGENT_DISPLAY_NAME` is set per-service in `docker-compose.yml`
 (`alice-swe`, `bob-swe`). Override there if you want a different name.
 
-### 3. Bring up the agents (detached)
+### 3. Bring up the agents (detached) and follow the combined log
 
 ```bash
 docker compose up -d
-docker compose logs -f          # follow the combined stream
+docker compose logs -f          # follow both alice and bob in one stream
 ```
 
-**Run detached.** If you use foreground `docker compose up`, compose
-owns the containers' stdin and your separate `docker attach` calls won't
-be able to send `:approve` / `:deny` / `:say`. Detached + `logs -f`
-gives you the same output without that conflict.
+**Always run detached.** If you use foreground `docker compose up`,
+compose owns the containers' stdin and `docker attach` for approvals
+won't work. Detached + `logs -f` gives you identical output without that
+conflict.
 
 You should see banners like `listening via runpod` for both agents. If
 they say `stub` instead, your `.env` change to `AGENT_MODE=runpod` isn't
 reaching the container — make sure compose interpolates it (the file
 uses `${AGENT_MODE:-stub}`, so `AGENT_MODE` in `.env` is picked up).
 
-### 4. Chat with them from another terminal
+### 4. Chat with them from a third terminal
 
 ```bash
+python tools/chat.py tail --follow             # stream the clean chat log
 python tools/chat.py say "@alice-swe please list files in /workspace"
-python tools/chat.py tail --follow             # stream the conversation
 python tools/chat.py stats                     # per-agent counts
 ```
 
@@ -118,47 +118,53 @@ from the env. Override per-call with `--url`, `--password`, `--as`.
 
 ### Terminal layout — where to look for what
 
-You'll typically have 4 terminals open. Each shows a distinct slice:
+Three terminals are all you need:
 
 | Terminal | Command | What it shows |
 |---|---|---|
 | T1 — hub | `python tools/local_hub.py --password local-hub` | One line per POST + every GET. Server-side traffic. |
-| T2 — agents | `docker compose logs -f` | Each agent's internals: `[hub<-]`, `[hub->]`, `[approval needed]`, budget, errors. |
-| T3 — chat view | `python tools/chat.py tail --follow` | Clean formatted chat log. **Best for "what are they saying"**. |
-| T4 — input | `python tools/chat.py say "..."` and `docker attach ...` | Where you type messages and answer approvals. |
+| T2 — agents | `docker compose logs -f` | Both agents interleaved, prefixed by container name: `[hub<-]`, `[hub->]`, `[skip]`, `[approval needed]`, budget lines, errors. |
+| T3 — chat | `python tools/chat.py tail --follow` and `chat.py say "..."` | Clean formatted chat log. **Best for "what are they saying"**. Also where you type messages. |
 
-A tiling terminal (Windows Terminal panes, tmux, iTerm2 split) makes
-this layout much easier to scan.
+`docker compose logs -f` replaces opening a separate `docker attach` terminal
+for each agent. Example combined output:
 
-### Approving bash commands locally
+```
+agent-alice-1  | [hub->] seq=3 alice-swe: Created utils.py with add(a,b)
+agent-bob-1    | [skip] not addressed; not a broadcast
+agent-bob-1    | [hub->] seq=8 bob-swe: Hi, happy to help!
+agent-alice-1  | [approval needed] bash> ls -la /workspace/alice
+```
 
-When an agent proposes a bash command, you'll see in **T2**:
+To filter to one agent only: `docker compose logs -f agent-alice`.
+
+### Approving bash commands (on demand only)
+
+When an agent proposes a bash command, T2 shows:
 
 ```
 agent-alice-1  | [approval needed] bash> ls -la /workspace
 agent-alice-1  | Type :approve or :deny.
 ```
 
-To answer, attach to **that specific container** in T4:
+Open a temporary fourth terminal, attach to **that specific container**,
+approve, then immediately detach:
 
 ```bash
 docker attach assignment2_part3-agent-alice-1
+:approve          # or :deny, then Enter
+# Detach: Ctrl-P then Ctrl-Q. Never Ctrl-C — that kills the agent.
 ```
 
-Then type `:approve` (or `:deny`) and press **Enter**. The attach
-terminal is blind — no prompt, no echo from the agent until output
-arrives. After you hit Enter, T2 will show:
+After you detach, T2 confirms:
 
 ```
 agent-alice-1  | [approved]
 agent-alice-1  | [hub->] seq=N alice-swe: <ls output>
 ```
 
-**Detach without killing alice:** press `Ctrl-P` then `Ctrl-Q`. Do NOT
-press `Ctrl-C` — that sends SIGINT and shuts the agent down.
-
-The hub never sees the bash command or the approval — only the final
-scrubbed answer is posted. (Verify with `python tools/chat.py tail`.)
+The hub never sees the bash command or the approval prompt — only the
+final scrubbed answer is posted. (Verify with `chat.py tail` in T3.)
 
 ## Run against the TH25 hub (opt-in)
 
@@ -188,7 +194,7 @@ final scrubbed answer is posted.
 ## Use cases — concrete demos
 
 Each maps to a Part 3 rubric criterion. Run them against the local hub
-(T1) with the 4-terminal layout described above.
+(T1) with the 3-terminal layout described above.
 
 ### A. Direct mention triggers a reply (P3.1, P3.6)
 
@@ -196,9 +202,9 @@ Each maps to a Part 3 rubric criterion. Run them against the local hub
 python tools/chat.py say --as emil-user "@alice-swe please list files in /workspace"
 ```
 
-Expect in T2: `[hub<-] ... @alice-swe ...` on alice, then `[hub->]
-seq=N alice-swe: ...` once she replies. Bob stays silent (no mention,
-broadcast cooldown applies).
+Expect in T2: `agent-alice-1  | [hub<-] ... @alice-swe ...`, then
+`agent-alice-1  | [hub->] seq=N alice-swe: ...` once she replies.
+Bob's line will show `agent-bob-1  | [skip] not addressed; not a broadcast`.
 
 ### B. Broadcast question — only one agent replies (P3.6)
 
@@ -206,21 +212,21 @@ broadcast cooldown applies).
 python tools/chat.py say --as emil-user "anyone want to review utils.py?"
 ```
 
-Expect: exactly one of alice/bob picks it up. The other should log
-`reply_decision respond=False reason=broadcast_window_exhausted` (visible
-in T2 if you watch closely).
+Expect: exactly one of alice/bob picks it up. The other logs
+`[skip] broadcast back-off: replied 1 times in last 300s` — visible in T2.
 
 ### C. Operator broadcast via `:say` (P3.4)
 
-T4:
+Open a temporary terminal to attach to alice:
 ```bash
 docker attach assignment2_part3-agent-alice-1
 :say I'm pausing for a moment, hold any heavy work
 # Ctrl-P, Ctrl-Q to detach
 ```
 
-T3 should show alice's message. Bob will see it via `[hub<-]`. This
-exercises the operator-input path without burning LLM tokens.
+T3 (`chat.py tail`) should show alice's message. T2 will show
+`agent-bob-1  | [hub<-] ...` as bob receives it. This exercises the
+operator-input path without burning LLM tokens.
 
 ### D. Leak-prevention refusal (P3.2)
 
@@ -246,35 +252,42 @@ instead of the raw value. Confirm with `chat.py tail`.
 
 ### F. Budget control (P3.5)
 
-T4:
+Open a temporary terminal to attach to alice:
 ```bash
 docker attach assignment2_part3-agent-alice-1
 :budget
 :limit tpm 100
 :pause
 :resume
+# Ctrl-P, Ctrl-Q to detach
 ```
 
-In T2 you'll see `[budget paused]` / `[budget resumed]`. While paused,
-alice's `peer_task.run_peer_task` blocks before any LLM call.
+T2 will show `agent-alice-1  | [budget paused]` / `[budget resumed]`.
+While paused, alice's `peer_task.run_peer_task` blocks before any LLM call.
 
 ### G. Local-only bash approval (P3.2 + safety)
 
-Send alice a task that requires a shell action:
+Send alice a task that requires a shell action (T3):
 
 ```bash
 python tools/chat.py say --as emil-user "@alice-swe run ls -la /workspace/alice"
 ```
 
-In T2:
+T2 shows:
 ```
 agent-alice-1  | [approval needed] bash> ls -la /workspace/alice
 agent-alice-1  | Type :approve or :deny.
 ```
 
-T4 (`docker attach` to alice), type `:approve`. The result is posted to
-the hub by alice; the approval prompt itself is **only visible locally**
-— `chat.py tail` will not show the `[approval needed]` line.
+Open a temporary terminal, attach to alice, and approve:
+```bash
+docker attach assignment2_part3-agent-alice-1
+:approve
+# Ctrl-P, Ctrl-Q to detach
+```
+
+The result is posted to the hub; the approval prompt itself is
+**only visible in T2** — `chat.py tail` in T3 will not show it.
 
 ### H. Two-agent collaboration on the same project (P3.1)
 
