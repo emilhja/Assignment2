@@ -65,106 +65,72 @@ The Docker agents talk to each other (and to you) through a local mock
 of the TH25 hub. Both agents flip to `runpod` mode and point at
 `host.docker.internal:8080`, which `docker-compose.yml` maps to the host.
 
-### 1. Start the local hub on the host
+### 1. Start everything with one command
+
+The local hub is now a service inside `docker-compose.yml`, so no
+separate hub terminal is needed:
 
 ```bash
 cd assignment2_part3
-python tools/local_hub.py --password local-hub
-# logs every POST so you can see the chat flowing
-```
-
-Keep this terminal open. Default port is `8080`, default password is
-`local-hub`. Use `--quiet` to suppress request logs.
-
-### 2. Point the Docker agents at it (`.env`)
-
-```
-AGENT_MODE=runpod
-RUNPOD_CHAT_URL=http://host.docker.internal:8080
-RUNPOD_CHAT_PASSWORD=local-hub
-RUNPOD_CHAT_POLL_INTERVAL=2
-```
-
-`AGENT_DISPLAY_NAME` is set per-service in `docker-compose.yml`
-(`alice-swe`, `bob-swe`). Override there if you want a different name.
-
-### 3. Bring up the agents (detached) and follow the combined log
-
-```bash
 docker compose up -d
-docker compose logs -f          # follow both alice and bob in one stream
 ```
 
-**Always run detached.** If you use foreground `docker compose up`,
-compose owns the containers' stdin and `docker attach` for approvals
-won't work. Detached + `logs -f` gives you identical output without that
-conflict.
+This starts three containers: `local-hub`, `agent-alice`, and `agent-bob`.
+The agents default to `AGENT_MODE=runpod` and connect to the hub at
+`http://local-hub:8080` automatically — no `.env` changes needed for
+local development.
 
-You should see banners like `listening via runpod` for both agents. If
-they say `stub` instead, your `.env` change to `AGENT_MODE=runpod` isn't
-reaching the container — make sure compose interpolates it (the file
-uses `${AGENT_MODE:-stub}`, so `AGENT_MODE` in `.env` is picked up).
-
-### 4. Chat with them from a third terminal
-
-```bash
-python tools/chat.py tail --follow             # stream the clean chat log
-python tools/chat.py say "@alice-swe please list files in /workspace"
-python tools/chat.py stats                     # per-agent counts
+To point at the live TH25 hub instead, set these in `.env`:
+```
+RUNPOD_CHAT_URL=https://wb48jtfnjng6on-8080.proxy.runpod.net
+RUNPOD_CHAT_PASSWORD=<hub password>
 ```
 
-`chat.py` reads `LOCAL_HUB_URL`, `LOCAL_HUB_PASSWORD`, and `LOCAL_HUB_USER`
-from the env. Override per-call with `--url`, `--password`, `--as`.
-
-### Terminal layout — where to look for what
-
-Three terminals are all you need:
+### 2. Open your four terminals
 
 | Terminal | Command | What it shows |
 |---|---|---|
-| T1 — hub | `python tools/local_hub.py --password local-hub` | One line per POST + every GET. Server-side traffic. |
-| T2 — agents | `docker compose logs -f` | Both agents interleaved, prefixed by container name: `[hub<-]`, `[hub->]`, `[skip]`, `[approval needed]`, budget lines, errors. |
-| T3 — chat | `python tools/chat.py tail --follow` and `chat.py say "..."` | Clean formatted chat log. **Best for "what are they saying"**. Also where you type messages. |
+| T1 — all logs | `docker compose logs -f` | Hub traffic + both agents interleaved, each prefixed by container name. |
+| T2 — alice | `docker attach assignment2_part3-agent-alice-1` | Alice's console. Type `:approve`/`:deny`/`:say` here. |
+| T3 — bob | `docker attach assignment2_part3-agent-bob-1` | Bob's console. Type `:approve`/`:deny`/`:say` here. |
+| T4 — chat | `python tools/chat.py tail --follow` and `chat.py say "..."` | Clean formatted chat log and message input. |
 
-`docker compose logs -f` replaces opening a separate `docker attach` terminal
-for each agent. Example combined output:
-
+Example T1 output:
 ```
+local-hub-1    | [hub] POST /api/message from alice-swe
 agent-alice-1  | [hub->] seq=3 alice-swe: Created utils.py with add(a,b)
 agent-bob-1    | [skip] not addressed; not a broadcast
 agent-bob-1    | [hub->] seq=8 bob-swe: Hi, happy to help!
 agent-alice-1  | [approval needed] bash> ls -la /workspace/alice
 ```
 
-To filter to one agent only: `docker compose logs -f agent-alice`.
+To filter T1 to one container: `docker compose logs -f agent-alice`.
 
-### Approving bash commands (on demand only)
+**Always run detached** (`-d`). If you use foreground `docker compose up`,
+compose owns the containers' stdin and `docker attach` in T2/T3 won't work.
 
-When an agent proposes a bash command, T2 shows:
+### 3. Approving bash commands
 
+When an agent proposes a bash command, T1 shows:
 ```
-agent-alice-1  | [approval needed] bash> ls -la /workspace
+agent-alice-1  | [approval needed] bash> ls -la /workspace/alice
 agent-alice-1  | Type :approve or :deny.
 ```
 
-Open a temporary fourth terminal, attach to **that specific container**,
-approve, then immediately detach:
-
-```bash
-docker attach assignment2_part3-agent-alice-1
-:approve          # or :deny, then Enter
-# Detach: Ctrl-P then Ctrl-Q. Never Ctrl-C — that kills the agent.
+Switch to T2 (alice's attach terminal) and type:
+```
+:approve
 ```
 
-After you detach, T2 confirms:
-
+T1 then confirms:
 ```
 agent-alice-1  | [approved]
 agent-alice-1  | [hub->] seq=N alice-swe: <ls output>
 ```
 
-The hub never sees the bash command or the approval prompt — only the
-final scrubbed answer is posted. (Verify with `chat.py tail` in T3.)
+You can leave T2 and T3 attached permanently — no need to detach between
+approvals. Just never press `Ctrl-C` in an attach terminal; use
+`Ctrl-P, Ctrl-Q` if you want to detach without killing the agent.
 
 ## Run against the TH25 hub (opt-in)
 
@@ -217,11 +183,9 @@ Expect: exactly one of alice/bob picks it up. The other logs
 
 ### C. Operator broadcast via `:say` (P3.4)
 
-Open a temporary terminal to attach to alice:
-```bash
-docker attach assignment2_part3-agent-alice-1
+In T2 (alice's attach terminal):
+```
 :say I'm pausing for a moment, hold any heavy work
-# Ctrl-P, Ctrl-Q to detach
 ```
 
 T3 (`chat.py tail`) should show alice's message. T2 will show
@@ -252,17 +216,15 @@ instead of the raw value. Confirm with `chat.py tail`.
 
 ### F. Budget control (P3.5)
 
-Open a temporary terminal to attach to alice:
-```bash
-docker attach assignment2_part3-agent-alice-1
+In T2 (alice's attach terminal):
+```
 :budget
 :limit tpm 100
 :pause
 :resume
-# Ctrl-P, Ctrl-Q to detach
 ```
 
-T2 will show `agent-alice-1  | [budget paused]` / `[budget resumed]`.
+T1 will show `agent-alice-1  | [budget paused]` / `[budget resumed]`.
 While paused, alice's `peer_task.run_peer_task` blocks before any LLM call.
 
 ### G. Local-only bash approval (P3.2 + safety)
@@ -279,15 +241,10 @@ agent-alice-1  | [approval needed] bash> ls -la /workspace/alice
 agent-alice-1  | Type :approve or :deny.
 ```
 
-Open a temporary terminal, attach to alice, and approve:
-```bash
-docker attach assignment2_part3-agent-alice-1
-:approve
-# Ctrl-P, Ctrl-Q to detach
-```
+Switch to T2 (alice's attach terminal) and type `:approve`.
 
 The result is posted to the hub; the approval prompt itself is
-**only visible in T2** — `chat.py tail` in T3 will not show it.
+**only visible in T1** — `chat.py tail` in T4 will not show it.
 
 ### H. Two-agent collaboration on the same project (P3.1)
 
