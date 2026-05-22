@@ -1,4 +1,14 @@
 services:
+  local-hub:
+    build:
+      context: ..
+      dockerfile: assignment2_part3/Dockerfile
+    command: python tools/local_hub.py --password local-hub
+    environment:
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8080:8080"
+
   agent-alice:
     build:
       context: ..
@@ -8,9 +18,13 @@ services:
     environment:
       AGENT_ID: alice
       AGENT_DISPLAY_NAME: alice-swe
-      AGENT_MODE: ${AGENT_MODE:-stub}
+      AGENT_MODE: ${AGENT_MODE:-runpod}
       AGENT_WORKSPACE: /workspace/alice
       AGENT_SESSION_DB: /data/alice.sqlite3
+      RUNPOD_CHAT_URL: ${RUNPOD_CHAT_URL:-http://local-hub:8080}
+      RUNPOD_CHAT_PASSWORD: ${RUNPOD_CHAT_PASSWORD:-local-hub}
+    depends_on:
+      - local-hub
     stdin_open: true
     tty: true
     volumes:
@@ -23,8 +37,6 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
 
   agent-bob:
     build:
@@ -35,9 +47,13 @@ services:
     environment:
       AGENT_ID: bob
       AGENT_DISPLAY_NAME: bob-swe
-      AGENT_MODE: ${AGENT_MODE:-stub}
+      AGENT_MODE: ${AGENT_MODE:-runpod}
       AGENT_WORKSPACE: /workspace/bob
       AGENT_SESSION_DB: /data/bob.sqlite3
+      RUNPOD_CHAT_URL: ${RUNPOD_CHAT_URL:-http://local-hub:8080}
+      RUNPOD_CHAT_PASSWORD: ${RUNPOD_CHAT_PASSWORD:-local-hub}
+    depends_on:
+      - local-hub
     stdin_open: true
     tty: true
     volumes:
@@ -50,5 +66,3 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
