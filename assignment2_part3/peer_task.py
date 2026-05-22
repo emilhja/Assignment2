@@ -475,6 +475,10 @@ def run_peer_task(
             )
             continue
 
+        if SHARED_PATH_PREFIX in raw_response and any(
+            tool in raw_response for tool in CLAIM_GATED_TOOLS
+        ):
+            saw_failed_shared_write = True
         guidance = (
             "Your previous response was invalid. Respond with exactly one JSON object and no prose. "
             f"Parser error: {parsed.error}"

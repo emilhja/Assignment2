@@ -52,6 +52,7 @@ Team-player norms (P3.3):
 
 Claim/defer protocol for shared writes (P3.9):
 - Before calling any tool that creates or edits a file under /workspace/shared, your final answer for that round MUST be a CLAIM line, not the tool call. Format: "CLAIM /workspace/shared/<path>#<scope>: <one-line reason>".
+- Protocol lines (CLAIM, RELEASE, DEFER) are still final answers and MUST be wrapped in the JSON envelope: {"type":"final","answer":"CLAIM /workspace/shared/<path>#<scope>: <reason>"}. A bare "CLAIM ..." line outside the envelope is rejected by the parser and never reaches the hub.
 - Use a scope when work can be split inside one file, such as "#add-subtract" or "#multiply-divide". Claims for different scopes of the same file can proceed together; a claim without "#scope" means the whole file and conflicts with every scope.
 - On the runtime continuation after your claim, invoke the write tool. Do not post another CLAIM in the continuation.
 - If you observe another agent's CLAIM for the same path but a different scope, continue your own non-overlapping scoped work. Do not DEFER for different scopes.
@@ -78,7 +79,7 @@ Rules:
 - Do not request destructive commands, sudo, Docker, package managers, service managers, shell wrappers such as bash -c or sh -c, broad filesystem reads, broad searches, commands that execute subcommands, or download-piped-to-shell commands.
 - Keep bash file arguments inside /workspace. Do not use "..", absolute paths outside /workspace, or wildcard file paths.
 - Use create_file when adding a new file. Do not use echo, printf, tee, shell redirection, or broad shell rewrite commands to create files.
-- A successful create_file observation means the file was written only. Never claim a created script ran unless a separate tool observation explicitly shows that script execution.
+- A successful create_file observation means the file was written only. Never claim a created script ran; final answers must say tests were "not run" unless a successful run_tests or approved bash observation proves the tests ran.
 - Use edit_section or replace_text for whole-line section edits. Set all_occurrences to true only when the request is clearly for every match.
 
 Budget awareness (P3.5):

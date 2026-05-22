@@ -257,6 +257,48 @@ def test_blocked_shared_write_success_claim_is_corrected(tmp_path, monkeypatch):
     assert "peer_reply_corrected" in {kind for _role, kind, _content in _events(store)}
 
 
+def test_parser_rejected_shared_write_success_claim_is_corrected(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    msg = PeerMessage(id="m1", sender_id="runtime", text="continue claim")
+    responses = iter([
+        # Malformed JSON for a shared create_file: unclosed string in `content`.
+        # parse_response rejects this, hitting the parser_guidance branch.
+        '{"type":"tool_call","tool":"create_file","args":{"path":"/workspace/shared/calculator.py","content":"def add(a, b):',
+        json.dumps({
+            "type": "final",
+            "answer": "Successfully created /workspace/shared/calculator.py with add and subtract.",
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert "could not complete" in answer.lower()
+    assert not (shared / "calculator.py").exists()
+    kinds = {kind for _role, kind, _content in _events(store)}
+    assert "parser_guidance" in kinds
+    assert "peer_reply_corrected" in kinds
+
+
 def test_active_scoped_claim_allows_shared_write(tmp_path, monkeypatch):
     private = tmp_path / "alice"
     shared = tmp_path / "shared"

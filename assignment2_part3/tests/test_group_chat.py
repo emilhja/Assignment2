@@ -22,7 +22,7 @@ from thread_safe_store import ThreadSafeSessionStore as SessionStore
 
 from budget import Budget
 from console_control import ConsoleControl
-from group_chat import run_group_chat
+from group_chat import load_system_prompt, run_group_chat
 from transport import StubTransport
 
 
@@ -101,6 +101,12 @@ def _outbox_replies(outbox):
 def _events(store):
     cur = store.connection.execute("SELECT role, kind, content FROM events ORDER BY id")
     return list(cur.fetchall())
+
+
+def test_system_prompt_requires_not_run_without_test_observation():
+    prompt = load_system_prompt("alice", "alice-swe")
+    assert 'tests were "not run"' in prompt
+    assert "successful run_tests or approved bash observation proves the tests ran" in prompt
 
 
 def test_direct_mention_triggers_reply_and_chatter_is_skipped(tmp_path, monkeypatch):
@@ -211,6 +217,123 @@ def test_followup_receives_recent_group_chat_context(tmp_path, monkeypatch):
     assert "recent_group_chat_context" in second_call[1]["content"]
     assert "division-by-zero handling" in second_call[1]["content"]
     assert "assigned: alice yes please" in second_call[2]["content"]
+
+
+def test_bare_yes_routes_to_pending_agent_question(tmp_path, monkeypatch):
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "@alice should I add division-by-zero handling?",
+        })
+        + "\n",
+        json.dumps({"id": "m2", "sender_id": "emil-user", "text": "yes"}) + "\n",
+    ]
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "Would you like me to create this?",
+        }),
+        json.dumps({"type": "final", "answer": "I will create it now."}),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(2.5)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert ctx["fake_chat"].calls == 2
+    second_call = ctx["fake_chat"].messages[1]
+    assert "recent_group_chat_context" in second_call[1]["content"]
+    assert "Would you like me to create this?" in second_call[1]["content"]
+    assert '"text": "yes"' in second_call[2]["content"]
+
+
+def test_bare_yes_without_pending_question_is_skipped(tmp_path, monkeypatch):
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "yes"}) + "\n",
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies=[])
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(0.8)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert ctx["fake_chat"].calls == 0
+    decision_rows = [
+        content for role, kind, content in _events(ctx["store"])
+        if kind == "reply_decision"
+    ]
+    assert any("not addressed; not a broadcast" in row for row in decision_rows)
+
+
+def test_followup_confirmation_bypasses_cooldown(tmp_path, monkeypatch):
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "assigned: alice should I create the test file?",
+        })
+        + "\n",
+        json.dumps({"id": "m2", "sender_id": "emil-user", "text": "yes"}) + "\n",
+    ]
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "Would you like me to create the test file?",
+        }),
+        json.dumps({"type": "final", "answer": "Creating it now."}),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert ctx["fake_chat"].calls == 2
+    decision_rows = [
+        content for role, kind, content in _events(ctx["store"])
+        if kind == "reply_decision"
+    ]
+    assert any("respond=True reason=follow-up confirmation" in row for row in decision_rows)
+    assert not any("msg_id=m2" in row and "cooldown" in row for row in decision_rows)
+
+
+def test_pending_followup_expires(tmp_path, monkeypatch):
+    monkeypatch.setenv("PENDING_FOLLOWUP_SECONDS", "0")
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "assigned: alice should I add a README?",
+        })
+        + "\n",
+        json.dumps({"id": "m2", "sender_id": "emil-user", "text": "yes"}) + "\n",
+    ]
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "Would you like me to add a README?",
+        }),
+        json.dumps({"type": "final", "answer": "This should not be used."}),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert ctx["fake_chat"].calls == 1
+    events = _events(ctx["store"])
+    assert any(kind == "pending_followup_expired" for _role, kind, _content in events)
 
 
 def test_multi_agent_assignment_injects_own_scope_guidance(tmp_path, monkeypatch):

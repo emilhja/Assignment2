@@ -15,9 +15,11 @@ agent's conversation — that goes through the transport only (P3.4).
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import part2_bridge  # noqa: F401 — sys.path side effect
@@ -42,7 +44,44 @@ DEFAULT_TPM = 20_000
 DEFAULT_RPM = 30
 DEFAULT_TOTAL = 200_000
 DEFAULT_CLAIM_CONTINUATION_GRACE_SECONDS = 1.5
+DEFAULT_PENDING_FOLLOWUP_SECONDS = 120.0
 MAX_RECENT_CONTEXT_ENTRIES = 64
+
+CONFIRMATION_REPLIES = {
+    "yes",
+    "y",
+    "yep",
+    "yeah",
+    "ok",
+    "okay",
+    "sure",
+    "yes please",
+    "please do",
+    "go ahead",
+    "do it",
+    "sounds good",
+}
+REJECTION_REPLIES = {
+    "no",
+    "nope",
+    "not now",
+    "cancel",
+    "don't",
+    "do not",
+}
+CONFIRMATION_REQUEST_PATTERN = re.compile(
+    r"(?i)\b("
+    r"would you like me to|do you want me to|should i|shall i|"
+    r"want me to|can i proceed|should we proceed"
+    r")\b"
+)
+
+
+@dataclass
+class PendingFollowup:
+    timestamp: float
+    message_id: str
+    text: str
 
 
 def _env_int(name: str, default: int) -> int:
@@ -107,6 +146,32 @@ def _context_entry(sender_id: str, text: str, message_id: str | None = None) -> 
     return entry
 
 
+def _normalized_short_reply(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+    return normalized.strip(" .!?")
+
+
+def _followup_reply_kind(text: str) -> str | None:
+    normalized = _normalized_short_reply(text)
+    if not normalized or len(normalized.split()) > 3:
+        return None
+    if normalized in CONFIRMATION_REPLIES:
+        return "confirmation"
+    if normalized in REJECTION_REPLIES:
+        return "rejection"
+    return None
+
+
+def _looks_like_operator_sender(sender_id: str, agent_id: str) -> bool:
+    sender = (sender_id or "").strip().lower()
+    return bool(sender) and sender != agent_id.lower() and not sender.endswith("-swe")
+
+
+def _answer_invites_followup(answer: str) -> bool:
+    text = (answer or "").strip()
+    return bool(text) and (text.endswith("?") or CONFIRMATION_REQUEST_PATTERN.search(text) is not None)
+
+
 def run_group_chat(
     *,
     transport: Transport | None = None,
@@ -160,6 +225,11 @@ def run_group_chat(
         0.0,
         _env_float("CLAIM_CONTINUATION_GRACE_SECONDS", DEFAULT_CLAIM_CONTINUATION_GRACE_SECONDS),
     )
+    pending_followup_seconds = max(
+        0.0,
+        _env_float("PENDING_FOLLOWUP_SECONDS", DEFAULT_PENDING_FOLLOWUP_SECONDS),
+    )
+    pending_followup: PendingFollowup | None = None
     _log(store, "session_start", f"agent_id={agent_id} display={display_name} mode={mode}")
     print(
         colors.dim(
@@ -177,6 +247,7 @@ def run_group_chat(
         print(f"{colors.ts()} {tag} {colors.agent_label(sender)}: {snippet}", flush=True)
 
     def _send_answer(answer: str, msg_id: str) -> None:
+        nonlocal pending_followup
         transport.send(answer)
         if not runpod:
             _hub_echo("->", display_name, answer)
@@ -186,6 +257,11 @@ def run_group_chat(
         recent_replies.append((time.time(), msg_id))
         if len(recent_replies) > 64:
             del recent_replies[:-64]
+        if _answer_invites_followup(answer):
+            pending_followup = PendingFollowup(timestamp=time.time(), message_id=msg_id, text=answer)
+            _log(store, "pending_followup", f"msg_id={msg_id}")
+        else:
+            pending_followup = None
         budget.save()
 
     def _run_task_for_message(
@@ -265,10 +341,41 @@ def run_group_chat(
             )
 
     def _process_message(message: PeerMessage, *, allow_claim_continuation: bool = True) -> None:
+        nonlocal pending_followup
         if not runpod:
             _hub_echo("<-", message.sender_id, message.text)
 
         prior_context = _remember_inbound(message)
+
+        now = time.time()
+        followup_kind = _followup_reply_kind(message.text)
+        if (
+            followup_kind is not None
+            and pending_followup is not None
+            and _looks_like_operator_sender(message.sender_id, agent_id)
+            and now - pending_followup.timestamp <= pending_followup_seconds
+        ):
+            reason = f"follow-up {followup_kind}"
+            _log(
+                store,
+                "reply_decision",
+                f"respond=True reason={reason} msg_id={message.id} sender={message.sender_id}",
+            )
+            pending_followup = None
+            answer = _run_task_for_message(message, prior_context)
+            if answer is None:
+                _absorb_inbound_claims(message)
+                return
+            _absorb_inbound_claims(message)
+            _send_answer(answer, message.id)
+
+            if allow_claim_continuation:
+                _continue_claims(message, answer)
+            return
+
+        if pending_followup is not None and now - pending_followup.timestamp > pending_followup_seconds:
+            _log(store, "pending_followup_expired", f"msg_id={pending_followup.message_id}")
+            pending_followup = None
 
         decision = should_reply(
             message, agent_id, display_name, recent_replies, claims=claims
