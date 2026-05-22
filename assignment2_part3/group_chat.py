@@ -30,7 +30,7 @@ from claims import CLAIM_PATTERN, Claim, ClaimRegistry, split_claim_target
 from console_control import ConsoleControl
 from peer import PeerMessage
 from peer_task import run_peer_task
-from reply_policy import should_reply
+from reply_policy import CollisionInfo, should_reply
 from transport import Transport, build_transport
 
 
@@ -190,6 +190,7 @@ def run_group_chat(
     def _run_task_for_message(
         message: PeerMessage,
         prior_context: list[dict[str, str]] | None = None,
+        collision: CollisionInfo | None = None,
     ) -> str | None:
         try:
             return run_peer_task(
@@ -202,6 +203,7 @@ def run_group_chat(
                 agent_id=agent_id,
                 recent_context=prior_context,
                 absorb_claims=False,
+                collision=collision,
             )
         except RuntimeError as exc:
             # Most often: every LLM provider was rate-limited or unreachable.
@@ -262,7 +264,7 @@ def run_group_chat(
         if decision.delay_seconds > 0:
             time.sleep(decision.delay_seconds)
 
-        answer = _run_task_for_message(message, prior_context)
+        answer = _run_task_for_message(message, prior_context, decision.collision)
         if answer is None:
             _absorb_inbound_claims(message)
             return

@@ -53,6 +53,12 @@ def _use_openai_provider(monkeypatch, client):
     monkeypatch.setattr(llm_client, "_client_for_provider", lambda _config: client)
 
 
+def _use_local_provider(monkeypatch, client):
+    monkeypatch.setenv("LLM_PROVIDER_ORDER", "local")
+    monkeypatch.delenv("LOCAL_LLM_API_KEY", raising=False)
+    monkeypatch.setattr(llm_client, "_client_for_provider", lambda _config: client)
+
+
 def test_json_mode_is_sent_on_first_request(monkeypatch):
     client, completions = _client_with(["ok"])
     _use_openai_provider(monkeypatch, client)
@@ -63,9 +69,63 @@ def test_json_mode_is_sent_on_first_request(monkeypatch):
         {
             "model": llm_client.PROVIDERS["openai"]["default_model"],
             "messages": [{"role": "user", "content": "Return JSON"}],
+            "max_tokens": llm_client.DEFAULT_MAX_TOKENS,
+            "timeout": llm_client.DEFAULT_REQUEST_TIMEOUT_SECONDS,
             "response_format": {"type": "json_object"},
         }
     ]
+
+
+def test_local_provider_does_not_require_api_key(monkeypatch):
+    client, completions = _client_with(['{"type":"final","answer":"local ok"}'])
+    _use_local_provider(monkeypatch, client)
+    monkeypatch.setenv("LOCAL_LLM_MODEL", "qwen-local")
+
+    assert llm_client.complete_chat([{"role": "user", "content": "Return JSON"}]) == (
+        '{"type":"final","answer":"local ok"}'
+    )
+
+    assert completions.calls == [
+        {
+            "model": "qwen-local",
+            "messages": [{"role": "user", "content": "Return JSON"}],
+            "max_tokens": llm_client.DEFAULT_MAX_TOKENS,
+            "timeout": llm_client.DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            "response_format": {"type": "json_object"},
+        }
+    ]
+
+
+def test_max_tokens_and_timeout_are_forwarded_per_request(monkeypatch):
+    client, completions = _client_with(["ok"])
+    _use_openai_provider(monkeypatch, client)
+    monkeypatch.setenv("LLM_MAX_TOKENS", "4096")
+    monkeypatch.setenv("LLM_REQUEST_TIMEOUT_SECONDS", "42")
+
+    assert llm_client.complete_chat([{"role": "user", "content": "Return JSON"}]) == "ok"
+
+    assert completions.calls[0]["max_tokens"] == 4096
+    assert completions.calls[0]["timeout"] == 42.0
+
+
+def test_zero_disables_max_tokens_and_timeout(monkeypatch):
+    client, completions = _client_with(["ok"])
+    _use_openai_provider(monkeypatch, client)
+    monkeypatch.setenv("LLM_MAX_TOKENS", "0")
+    monkeypatch.setenv("LLM_REQUEST_TIMEOUT_SECONDS", "0")
+
+    assert llm_client.complete_chat([{"role": "user", "content": "Return JSON"}]) == "ok"
+
+    assert "max_tokens" not in completions.calls[0]
+    assert "timeout" not in completions.calls[0]
+
+
+def test_local_base_url_accepts_server_root(monkeypatch):
+    monkeypatch.setenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:8080")
+
+    assert llm_client._base_url_for_provider(llm_client.PROVIDERS["local"]) == (
+        "http://127.0.0.1:8080/v1"
+    )
 
 
 def test_json_mode_success_uses_returned_content(monkeypatch):

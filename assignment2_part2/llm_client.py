@@ -13,10 +13,13 @@ import colors
 
 
 DEFAULT_PROVIDER_ORDER = "groq,openai"
+LOCAL_PROVIDER_DUMMY_API_KEY = "local-llm"
 RATE_LIMIT_RETRY_WAIT = 10  # fallback when the provider gives no hint
 RATE_LIMIT_MAX_WAIT = 60    # cap any single sleep
 RATE_LIMIT_JITTER_MAX = 5   # spread agents across the reset window
 DEFAULT_RATE_LIMIT_TOTAL_WAIT = 0  # 0 means wait indefinitely
+DEFAULT_MAX_TOKENS = 2048
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
 
 RETRY_AFTER_BODY_PATTERN = re.compile(r"try again in\s+([\d.]+)\s*s", re.IGNORECASE)
 
@@ -35,10 +38,35 @@ def _env_nonnegative_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _env_nonnegative_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return int(default)
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return int(default)
+
+
 def _rate_limit_total_wait_seconds() -> float:
     return _env_nonnegative_float(
         "LLM_RATE_LIMIT_MAX_WAIT_SECONDS",
         DEFAULT_RATE_LIMIT_TOTAL_WAIT,
+    )
+
+
+def _max_tokens() -> int:
+    """Cap on tokens generated per request. 0 disables the cap (SDK default)."""
+
+    return _env_nonnegative_int("LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS)
+
+
+def _request_timeout_seconds() -> float:
+    """Per-request HTTP timeout. 0 disables the timeout (SDK default)."""
+
+    return _env_nonnegative_float(
+        "LLM_REQUEST_TIMEOUT_SECONDS",
+        DEFAULT_REQUEST_TIMEOUT_SECONDS,
     )
 
 
@@ -93,6 +121,16 @@ PROVIDERS = {
         "model_env": "OPENAI_MODEL",
         "default_model": "gpt-4o-mini",
         "base_url": None,
+        "requires_api_key": True,
+    },
+    "local": {
+        "api_key_env": "LOCAL_LLM_API_KEY",
+        "model_env": "LOCAL_LLM_MODEL",
+        "default_model": "local-model",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "base_url_env": "LOCAL_LLM_BASE_URL",
+        "requires_api_key": False,
+        "append_v1_if_missing": True,
     },
 }
 
@@ -124,10 +162,21 @@ def _provider_order():
 
 
 def _client_for_provider(config):
-    api_key = os.getenv(config["api_key_env"])
-    if config["base_url"]:
-        return OpenAI(api_key=api_key, base_url=config["base_url"], max_retries=0)
+    api_key = os.getenv(config["api_key_env"]) or LOCAL_PROVIDER_DUMMY_API_KEY
+    base_url = _base_url_for_provider(config)
+    if base_url:
+        return OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
     return OpenAI(api_key=api_key, max_retries=0)
+
+
+def _base_url_for_provider(config):
+    base_url = os.getenv(config.get("base_url_env", ""), config.get("base_url") or "")
+    base_url = base_url.strip().rstrip("/")
+    if not base_url:
+        return None
+    if config.get("append_v1_if_missing") and not base_url.endswith("/v1"):
+        return f"{base_url}/v1"
+    return base_url
 
 
 def _looks_like_json_mode_rejection(exc):
@@ -285,6 +334,12 @@ def _create_completion(client, model, messages, *, use_json_mode):
         "model": model,
         "messages": list(messages),
     }
+    max_tokens = _max_tokens()
+    if max_tokens > 0:
+        kwargs["max_tokens"] = max_tokens
+    timeout = _request_timeout_seconds()
+    if timeout > 0:
+        kwargs["timeout"] = timeout
     if use_json_mode:
         kwargs["response_format"] = JSON_RESPONSE_FORMAT
 
@@ -323,12 +378,12 @@ def _create_with_rate_limit_retry(client, model, messages, *, use_json_mode, pro
             waited += wait
 
 
-def complete_chat(messages):
+def complete_chat_with_metadata(messages):
     errors = []
 
     for provider_name in _provider_order():
         config = PROVIDERS[provider_name]
-        if not os.getenv(config["api_key_env"]):
+        if config.get("requires_api_key", True) and not os.getenv(config["api_key_env"]):
             errors.append(f"{provider_name}: missing {config['api_key_env']}")
             continue
 
@@ -346,7 +401,7 @@ def complete_chat(messages):
         except Exception as exc:
             recovered = _failed_generation_json(exc)
             if recovered:
-                return recovered
+                return recovered, provider_name, model
 
             if not _looks_like_json_mode_rejection(exc):
                 errors.append(f"{provider_name}: {type(exc).__name__}: {exc}")
@@ -363,7 +418,7 @@ def complete_chat(messages):
             except Exception as retry_exc:
                 recovered = _failed_generation_json(retry_exc)
                 if recovered:
-                    return recovered
+                    return recovered, provider_name, model
 
                 errors.append(
                     f"{provider_name}: {type(retry_exc).__name__}: {retry_exc}"
@@ -371,7 +426,12 @@ def complete_chat(messages):
                 continue
 
         content = response.choices[0].message.content
-        return content or ""
+        return content or "", provider_name, model
 
     detail = "; ".join(errors) if errors else "no providers were tried"
     raise RuntimeError(f"I could not get a reply from any LLM provider ({detail})")
+
+
+def complete_chat(messages):
+    content, _provider, _model = complete_chat_with_metadata(messages)
+    return content

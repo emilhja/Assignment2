@@ -13,6 +13,8 @@ from budget import Budget
 from claims import ClaimRegistry
 from peer import PeerMessage
 from peer_task import _ensure_peer_mentions, run_peer_task
+from reply_policy import CollisionInfo
+from thread_safe_store import ThreadSafeSessionStore
 
 
 SYSTEM_PROMPT = "You are alice-swe, a SWE agent."
@@ -296,3 +298,289 @@ def test_active_scoped_claim_allows_shared_write(tmp_path, monkeypatch):
     assert "Created" in answer
     assert (shared / "calculator.py").read_text(encoding="utf-8").startswith("def add")
     assert not (private / "calculator.py").exists()
+
+
+def test_scoped_claim_cannot_recreate_existing_shared_file(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    existing = "def multiply(a, b):\n    return a * b\n"
+    (shared / "calculator.py").write_text(existing, encoding="utf-8")
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
+    msg = PeerMessage(id="m1", sender_id="runtime", text="continue claim")
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {
+                "path": "/workspace/shared/calculator.py",
+                "content": "def add(a, b):\n    return a + b\n",
+                "overwrite": True,
+            },
+        }),
+        json.dumps({"type": "final", "answer": "The recreate was blocked."}),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert "blocked" in answer.lower()
+    assert (shared / "calculator.py").read_text(encoding="utf-8") == existing
+    events = _events(store)
+    assert "claim_block" in {kind for _role, kind, _content in events}
+    assert any("cannot recreate existing shared file" in content for _role, _kind, content in events)
+
+
+def test_non_conflicting_scoped_claims_allow_patch_without_losing_peer_work(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    original = "def multiply(a, b):\n    return a * b\n"
+    updated = (
+        "def add(a, b):\n"
+        "    return a + b\n\n"
+        "def subtract(a, b):\n"
+        "    return a - b\n\n"
+        "def multiply(a, b):\n"
+        "    return a * b\n"
+    )
+    (shared / "calculator.py").write_text(original, encoding="utf-8")
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
+    claims.record_observed("bob", "/workspace/shared/calculator.py#multiply-divide")
+    msg = PeerMessage(id="m1", sender_id="runtime", text="continue claim")
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "edit_section",
+            "args": {
+                "path": "/workspace/shared/calculator.py",
+                "old_text": original,
+                "new_text": updated,
+            },
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Updated /workspace/shared/calculator.py with add and subtract.",
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert "Updated" in answer
+    assert (shared / "calculator.py").read_text(encoding="utf-8") == updated
+    kinds = {kind for _role, kind, _content in _events(store)}
+    assert "claim_block" not in kinds
+
+
+def test_collision_self_wins_injects_proceed_guidance(tmp_path):
+    """When the runtime hands us a self-wins collision, the LLM must see
+    deterministic 'proceed, do not DEFER' guidance before its first round."""
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    msg = PeerMessage(
+        id="m1",
+        sender_id="bob",
+        text="CLAIM /workspace/shared/calc.py#multiply-divide: I'll write it",
+    )
+    seen = []
+
+    def chat_fn(messages):
+        seen.append(messages)
+        return json.dumps({"type": "final", "answer": "Proceeding with my claim."})
+
+    collision = CollisionInfo(
+        path="/workspace/shared/calc.py#multiply-divide",
+        peer_id="bob",
+        outcome="self-wins",
+    )
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="alice",
+        collision=collision,
+    )
+
+    assert "Proceeding" in answer
+    # Find the runtime guidance message in the LLM's input
+    contents = [m["content"] for m in seen[0]]
+    runtime_msg = next(c for c in contents if "role_origin" in c and "runtime" in c)
+    assert "hold the tie-break" in runtime_msg
+    assert "Do NOT" in runtime_msg
+    assert "@bob" in runtime_msg
+    kinds = {kind for _role, kind, _content in _events(store)}
+    assert "tie_break_injection" in kinds
+
+
+def test_collision_self_loses_injects_defer_release_guidance(tmp_path):
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    msg = PeerMessage(
+        id="m1",
+        sender_id="alice",
+        text="CLAIM /workspace/shared/calc.py#multiply-divide: drafting",
+    )
+    seen = []
+
+    def chat_fn(messages):
+        seen.append(messages)
+        return json.dumps({
+            "type": "final",
+            "answer": "DEFER to @alice\nRELEASE /workspace/shared/calc.py#multiply-divide",
+        })
+
+    collision = CollisionInfo(
+        path="/workspace/shared/calc.py#multiply-divide",
+        peer_id="alice",
+        outcome="self-loses",
+    )
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="bob",
+        collision=collision,
+    )
+
+    assert "DEFER" in answer
+    contents = [m["content"] for m in seen[0]]
+    runtime_msg = next(c for c in contents if "role_origin" in c and "runtime" in c)
+    assert "lost the tie-break" in runtime_msg
+    assert "DEFER to @alice" in runtime_msg
+    assert "RELEASE /workspace/shared/calc.py#multiply-divide" in runtime_msg
+
+
+def test_chat_metadata_tuple_is_logged_to_events_table(tmp_path):
+    """When chat_fn returns (content, provider, model), the raw_json event row
+    must carry the provider and model so post-hoc analysis can attribute
+    behavior to the LLM that produced it."""
+
+    store = ThreadSafeSessionStore(str(tmp_path / "sess.sqlite3"))
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    msg = PeerMessage(id="m1", sender_id="bob", text="say hi")
+
+    def chat_fn(messages):
+        return (
+            json.dumps({"type": "final", "answer": "Hello."}),
+            "groq",
+            "llama-3.1-8b-instant",
+        )
+
+    answer = run_peer_task(
+        msg, store=store, budget=budget, system_prompt=SYSTEM_PROMPT, chat_fn=chat_fn
+    )
+    assert answer == "Hello."
+
+    cur = store.connection.execute(
+        "SELECT provider, model FROM events WHERE kind='raw_json' ORDER BY id"
+    )
+    rows = cur.fetchall()
+    assert rows == [("groq", "llama-3.1-8b-instant")]
+
+    cur = store.connection.execute(
+        "SELECT COUNT(*) FROM events WHERE kind!='raw_json' AND "
+        "(provider IS NOT NULL OR model IS NOT NULL)"
+    )
+    assert cur.fetchone()[0] == 0
+
+
+def test_chat_string_return_still_works_with_null_metadata(tmp_path):
+    """Test fakes that return a plain string (legacy contract) must still
+    work; provider/model just stay NULL."""
+
+    store = ThreadSafeSessionStore(str(tmp_path / "sess.sqlite3"))
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    msg = PeerMessage(id="m1", sender_id="bob", text="say hi")
+
+    def chat_fn(messages):
+        return json.dumps({"type": "final", "answer": "Hello."})
+
+    answer = run_peer_task(
+        msg, store=store, budget=budget, system_prompt=SYSTEM_PROMPT, chat_fn=chat_fn
+    )
+    assert answer == "Hello."
+
+    cur = store.connection.execute(
+        "SELECT provider, model FROM events WHERE kind='raw_json' ORDER BY id"
+    )
+    rows = cur.fetchall()
+    assert rows == [(None, None)]
+
+
+def test_mutual_defer_injects_tie_break_guidance(tmp_path):
+    """If both agents have already DEFERred to each other, the next round
+    triggered by a peer message must inject mutual-defer guidance even
+    without a fresh CLAIM-collision signal."""
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    # Simulate that alice and bob have each DEFERred to the other already.
+    claims.absorb_text("alice", "DEFER to @bob")
+    claims.absorb_text("bob", "DEFER to @alice")
+
+    msg = PeerMessage(id="m3", sender_id="bob", text="Are you still there?")
+    seen = []
+
+    def chat_fn(messages):
+        seen.append(messages)
+        return json.dumps({"type": "final", "answer": "Re-claiming and proceeding."})
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert "Re-claiming" in answer
+    contents = [m["content"] for m in seen[0]]
+    runtime_msg = next(c for c in contents if "role_origin" in c and "runtime" in c)
+    assert "Mutual-defer detected" in runtime_msg
+    kinds = {kind for _role, kind, _content in _events(store)}
+    assert "mutual_defer_injection" in kinds

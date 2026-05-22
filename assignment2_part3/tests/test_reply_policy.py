@@ -276,6 +276,45 @@ def test_claim_collision_bypasses_cooldown():
     assert "claim collision" in decision.reason
 
 
+def test_claim_collision_decides_tie_break_self_wins():
+    """When self_id is lex-smaller than the peer, collision outcome is self-wins."""
+
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calc.py#multiply-divide")
+
+    incoming = _msg(
+        "CLAIM /workspace/shared/calc.py#multiply-divide: also working on this",
+        sender="bob",
+    )
+    decision = should_reply(
+        incoming, "alice", "alice-swe", [], now=1000.0, claims=claims
+    )
+    assert decision.respond is True
+    assert decision.collision is not None
+    assert decision.collision.outcome == "self-wins"
+    assert decision.collision.peer_id == "bob"
+    assert decision.collision.path == "/workspace/shared/calc.py#multiply-divide"
+
+
+def test_claim_collision_decides_tie_break_self_loses():
+    """When peer is lex-smaller, collision outcome is self-loses."""
+
+    claims = ClaimRegistry()
+    claims.record_observed("bob", "/workspace/shared/calc.py#multiply-divide")
+
+    incoming = _msg(
+        "CLAIM /workspace/shared/calc.py#multiply-divide: also working on this",
+        sender="alice",
+    )
+    decision = should_reply(
+        incoming, "bob", "bob-swe", [], now=1000.0, claims=claims
+    )
+    assert decision.respond is True
+    assert decision.collision is not None
+    assert decision.collision.outcome == "self-loses"
+    assert decision.collision.peer_id == "alice"
+
+
 def test_claim_collision_only_fires_on_self_claim():
     """A peer CLAIM for a path we do not own should not bypass cooldown."""
 

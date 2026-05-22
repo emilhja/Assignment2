@@ -9,7 +9,7 @@ Examples (against a hub on http://localhost:8080):
     python tools/chat.py stats
 
 Flags:
-    --url       hub base URL  (default $LOCAL_HUB_URL or http://localhost:8080)
+    --url       hub base URL  (default $LOCAL_HUB_URL, or localhost:$LOCAL_HUB_PORT)
     --password  hub password  (default $LOCAL_HUB_PASSWORD or "local-hub")
     --as NAME   sender name for `say` / `live`  (default $LOCAL_HUB_USER or "emil-user")
 """
@@ -54,6 +54,7 @@ def _get(url: str, params: dict) -> dict:
         data = {"error": resp.text[:200]}
     if resp.status_code != 200:
         sys.stderr.write(f"[chat] {url} -> {resp.status_code}: {data}\n")
+        _maybe_warn_wrong_server(url, data)
     return data
 
 
@@ -65,7 +66,30 @@ def _post(url: str, payload: dict) -> dict:
         data = {"error": resp.text[:200]}
     if resp.status_code != 200:
         sys.stderr.write(f"[chat] {url} -> {resp.status_code}: {data}\n")
+        _maybe_warn_wrong_server(url, data)
     return data
+
+
+def _maybe_warn_wrong_server(url: str, data: dict) -> None:
+    error = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        return
+    if error.get("type") != "not_found_error":
+        return
+    if url.startswith("http://localhost:8080") or url.startswith("http://127.0.0.1:8080"):
+        sys.stderr.write(
+            "[chat!] port 8080 looks like your local LLM server, not the chat hub. "
+            "Start the hub on another port and run with --url http://localhost:8090, "
+            "or set LOCAL_HUB_URL=http://localhost:8090.\n"
+        )
+
+
+def _default_hub_url() -> str:
+    explicit = os.environ.get("LOCAL_HUB_URL", "").strip()
+    if explicit:
+        return explicit
+    port = os.environ.get("LOCAL_HUB_PORT", "").strip() or "8080"
+    return f"http://localhost:{port}"
 
 
 def cmd_say(args, base: str, password: str) -> int:
@@ -213,7 +237,7 @@ def cmd_stats(_args, base: str, password: str) -> int:
 
 def main(argv: Optional[list[str]] = None) -> int:
     _load_dotenv()
-    default_url = os.environ.get("LOCAL_HUB_URL", "http://localhost:8080")
+    default_url = _default_hub_url()
     default_pw = (
         os.environ.get("LOCAL_HUB_PASSWORD")
         or os.environ.get("RUNPOD_CHAT_PASSWORD")

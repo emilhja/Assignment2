@@ -1,3 +1,10 @@
+$ python tools/chat.py --url http://localhost:8090 live --as emil-user
+[chat] live on http://localhost:8090 as emil-user. Type 'exit' or Ctrl-C to quit.
+emil-user> @alice-swe and @bob-swe collaborate on /workspace/shared/calculator.py: alice writes add+subtract, bob writes multiply+division
+emil-user> 
+
+
+
 # Demo: Build & Start the Docker Agent
 
 Run all commands from `assignment2_part3/`.

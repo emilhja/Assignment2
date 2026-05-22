@@ -47,7 +47,7 @@ class FakeChat:
 
 def _patch_chat(monkeypatch, fake):
     import peer_task
-    monkeypatch.setattr(peer_task, "complete_chat", fake)
+    monkeypatch.setattr(peer_task, "complete_chat_with_metadata", fake)
 
 
 def _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies):

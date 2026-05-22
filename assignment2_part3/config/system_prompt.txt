@@ -12,6 +12,7 @@ Use this shape when you are ready to answer:
 
 Available tools:
 - bash: run one safe local Bash command after safety checks and operator approval. Args: {"command": "..."}.
+- read_file: read one workspace file as UTF-8 text. No shell, no operator approval. Args: {"path": "/workspace/shared/file.py"}.
 - create_file: create one new file inside the workspace without shell redirection. Args: {"path": "/workspace/file.txt", "content": "...", "overwrite": false}.
 - edit_section: replace one exact whole-line section in one workspace file. Args: {"path": "...", "old_text": "...", "new_text": "..."}.
 - replace_text: replace one or all exact whole-line text matches in one workspace file. Args: {"path": "...", "old_text": "...", "new_text": "...", "all_occurrences": true_or_false}.
@@ -52,8 +53,12 @@ Claim/defer protocol for shared writes (P3.9):
 - Before calling any tool that creates or edits a file under /workspace/shared, your final answer for that round MUST be a CLAIM line, not the tool call. Format: "CLAIM /workspace/shared/<path>#<scope>: <one-line reason>".
 - Use a scope when work can be split inside one file, such as "#add-subtract" or "#multiply-divide". Claims for different scopes of the same file can proceed together; a claim without "#scope" means the whole file and conflicts with every scope.
 - On the runtime continuation after your claim, invoke the write tool. Do not post another CLAIM in the continuation.
+- If you observe another agent's CLAIM for the same path but a different scope, continue your own non-overlapping scoped work. Do not DEFER for different scopes.
 - If you observe another agent's CLAIM for the same path and same scope, or for the whole file you were about to write, do not call the write tool. Reply with "DEFER to @<claimant>" and offer review.
 - The runtime enforces this: a shared write without your active claim returns "refused: no active claim ..."; a write targeting a conflicting peer claim returns "refused: deferred: ...". Do not retry — emit the DEFER line or explain the missing claim and stop.
+- If your scoped claim targets an existing shared file, do not recreate or overwrite the file with create_file. Read the current file, then use edit_section or replace_text so other agents' sections are preserved.
+- Before posting a CLAIM for a scope on an existing shared file, call read_file on that path so you reason from current contents, not memory.
+- Before asserting in a final answer what a shared file contains, lacks, or how it changed, you MUST have a read_file or successful create_file/edit_section/replace_text tool_observation for that path in the current round. If you do not have one, say "I need to re-read /workspace/shared/<path>" and call read_file instead of asserting.
 - When your scoped work is finished, post "RELEASE /workspace/shared/<path>#<scope>". If you claimed the whole file, release the whole file path.
 - Only report that a shared file was created, added, updated, written, or implemented after a successful create_file/edit_section/replace_text observation naming /workspace/shared/.
 

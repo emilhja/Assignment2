@@ -280,6 +280,34 @@ def edit_section(path: str, old_text: str, new_text: str) -> str:
     return _truncate(f"Edited one section in {target}.")
 
 
+def read_file(path: str) -> str:
+    """Return the UTF-8 contents of one workspace file, truncated to MAX_OUTPUT_CHARS.
+
+    No shell, no operator approval. The agent uses this to verify shared-file
+    state before claiming a scope or asserting contents in a final answer.
+    Refusals use the `Edit blocked:` prefix so the existing "do not retry"
+    rule in the system prompt covers them.
+    """
+
+    try:
+        target = _resolve_workspace_path(path)
+    except ValueError as exc:
+        return f"Edit blocked: {exc}"
+
+    if not target.exists():
+        return f"Edit blocked: file does not exist: {target}"
+    if not target.is_file():
+        return f"Edit blocked: path is not a file: {target}"
+
+    try:
+        contents = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return f"Edit blocked: file is not valid UTF-8: {target}"
+
+    display = _display_workspace_path(target)
+    return _truncate(f"--- {display} ---\n{contents}")
+
+
 def create_file(path: str, content: str, overwrite: bool = False) -> str:
     """Create one file inside the workspace without shell redirection."""
 
@@ -351,6 +379,12 @@ TOOL_REGISTRY = {
         description="Replace one exact whole-line section in one workspace file.",
         required_args=("path", "old_text", "new_text"),
         handler=lambda args: edit_section(args["path"], args["old_text"], args["new_text"]),
+    ),
+    "read_file": ToolSpec(
+        name="read_file",
+        description="Read one workspace file as UTF-8 text without shell or operator approval.",
+        required_args=("path",),
+        handler=lambda args: read_file(args["path"]),
     ),
     "create_file": ToolSpec(
         name="create_file",

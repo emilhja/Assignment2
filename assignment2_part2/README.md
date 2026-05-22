@@ -37,7 +37,7 @@ cd assignment2_part2
 python -m pip install -r requirements.txt
 ```
 
-Create `.env` with one or more provider keys:
+Create `.env` with one or more hosted provider keys:
 
 ```env
 LLM_PROVIDER_ORDER=groq,openai
@@ -48,6 +48,18 @@ GROQ_MODEL=llama-3.1-8b-instant
 OPENAI_API_KEY=your_openai_key_here
 OPENAI_MODEL=gpt-4o-mini
 ```
+
+To use a local OpenAI-compatible server such as `llama-server`:
+
+```env
+LLM_PROVIDER_ORDER=local
+LOCAL_LLM_BASE_URL=http://127.0.0.1:8080
+LOCAL_LLM_MODEL=local-model
+```
+
+`LOCAL_LLM_BASE_URL` may include `/v1`, but it does not have to. No real API
+key is required for the local provider; `LOCAL_LLM_API_KEY` is only available
+for servers that explicitly require one.
 
 ## Run
 

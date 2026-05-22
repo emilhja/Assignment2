@@ -1,8 +1,8 @@
 # Assignment 2 Part 1 Minimal ReAct Agent
 
 This directory contains Part 1 of the assignment: a small ReAct-style
-command-line agent. It sends a user task to a Groq-hosted OpenAI-compatible
-chat model, reads the model's raw text response, parses a homemade tool call,
+command-line agent. It sends a user task to an OpenAI-compatible chat model,
+reads the model's raw text response, parses a homemade tool call,
 runs one approved Bash command, sends the command output back as an
 `Observation:`, and repeats until the model returns `Final Answer:`.
 
@@ -12,7 +12,7 @@ calling, structured outputs, schemas, or JSON mode.
 ## Files
 
 - `agent.py` - interactive CLI and task-local ReAct loop
-- `llm_client.py` - Groq chat completion wrapper
+- `llm_client.py` - OpenAI-compatible provider wrapper
 - `parser.py` - homemade parser for `Final Answer:` and `Action: bash`
 - `safety.py` - small blocklist and `Run this command? [y/N]`
 - `tools.py` - local Bash command runner
@@ -55,16 +55,28 @@ cd assignment2_part1
 python -m pip install -r requirements.txt
 ```
 
-Create `.env` from the example and add your Groq key:
+Create `.env` from the example and add your Groq key, or switch to `local`:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
 ```env
+LLM_PROVIDER_ORDER=groq
 GROQ_API_KEY=your_groq_key_here
 GROQ_MODEL=llama-3.1-8b-instant
 ```
+
+To use a local OpenAI-compatible server such as `llama-server`:
+
+```env
+LLM_PROVIDER_ORDER=local
+LOCAL_LLM_BASE_URL=http://127.0.0.1:8080
+LOCAL_LLM_MODEL=local-model
+```
+
+`LOCAL_LLM_BASE_URL` may include `/v1`, but it does not have to. No real API
+key is required for the local provider.
 
 ## Run Locally
 

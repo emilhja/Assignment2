@@ -22,6 +22,7 @@ from typing import Optional
 
 
 DEFAULT_TTL_SECONDS = 300.0
+DEFAULT_DEFER_WINDOW_SECONDS = 120.0
 
 CLAIM_PATTERN = re.compile(
     r"(?im)^\s*CLAIM\s+(?P<path>/workspace/shared/[^\s:]+)\s*(?::\s*(?P<reason>.+))?$"
@@ -29,6 +30,19 @@ CLAIM_PATTERN = re.compile(
 RELEASE_PATTERN = re.compile(
     r"(?im)^\s*RELEASE\s+(?P<path>/workspace/shared/[^\s:]+)\s*$"
 )
+DEFER_PATTERN = re.compile(
+    r"(?im)^\s*DEFER\s+to\s+@?(?P<target>[A-Za-z0-9_.\-]+)"
+)
+
+
+def tie_break_winner(id_a: str, id_b: str) -> str:
+    """Return the lexicographically smaller AGENT_ID. Single source of truth
+    for the P3.9 racing-CLAIM rule referenced in `config/system_prompt.txt`.
+    """
+
+    a = (id_a or "").lower()
+    b = (id_b or "").lower()
+    return id_a if a <= b else id_b
 
 
 @dataclass(frozen=True)
@@ -78,10 +92,18 @@ class ClaimRegistry:
     forever.
     """
 
-    def __init__(self, ttl_seconds: float = DEFAULT_TTL_SECONDS, clock=time.monotonic):
+    def __init__(
+        self,
+        ttl_seconds: float = DEFAULT_TTL_SECONDS,
+        clock=time.monotonic,
+        defer_window_seconds: float = DEFAULT_DEFER_WINDOW_SECONDS,
+    ):
         self._ttl = float(ttl_seconds)
         self._clock = clock
         self._claims: dict[str, Claim] = {}
+        self._defer_window = float(defer_window_seconds)
+        # (deferrer_id_lower, target_id_lower) -> last observed timestamp
+        self._defers: dict[tuple[str, str], float] = {}
         self._lock = Lock()
 
     def record_observed(self, claimant: str, path: str, reason: str = "") -> Claim:
@@ -168,9 +190,13 @@ class ClaimRegistry:
             ]
 
     def absorb_text(self, sender_id: str, text: str) -> list[Claim]:
-        """Scan one message for CLAIM/RELEASE markers; update state.
+        """Scan one message for CLAIM/RELEASE/DEFER markers; update state.
 
         Returns the list of new claims recorded (useful for tests and logs).
+        DEFER lines are tracked separately so the runtime can detect
+        mutual-defer deadlocks; RELEASE clears the sender's outstanding
+        defers so an agent that releases and moves on is not still
+        considered "currently deferring."
         """
 
         if not isinstance(text, str) or not text:
@@ -181,6 +207,55 @@ class ClaimRegistry:
             reason = (match.group("reason") or "").strip()
             claim = self.record_observed(sender_id, match.group("path"), reason)
             recorded.append(claim)
-        for match in RELEASE_PATTERN.finditer(text):
-            self.release(sender_id, match.group("path"))
+        for match in DEFER_PATTERN.finditer(text):
+            self.record_defer(sender_id, match.group("target"))
+        if RELEASE_PATTERN.search(text):
+            for match in RELEASE_PATTERN.finditer(text):
+                self.release(sender_id, match.group("path"))
+            self._clear_defers_for(sender_id)
         return recorded
+
+    def record_defer(self, deferrer: str, target: str) -> None:
+        """Record that `deferrer` posted a DEFER to `target`."""
+
+        deferrer_norm = (deferrer or "").lower()
+        target_norm = (target or "").lstrip("@").lower()
+        if not deferrer_norm or not target_norm:
+            return
+        with self._lock:
+            self._defers[(deferrer_norm, target_norm)] = self._clock()
+
+    def _defer_recent_locked(self, deferrer: str, target: str) -> bool:
+        ts = self._defers.get(((deferrer or "").lower(), (target or "").lower()))
+        if ts is None:
+            return False
+        return (self._clock() - ts) <= self._defer_window
+
+    def mutual_defer_detected(self, self_id: str, peer_id: str) -> bool:
+        """True iff each side has DEFERred to the other within the window."""
+
+        if not self_id or not peer_id:
+            return False
+        with self._lock:
+            return (
+                self._defer_recent_locked(self_id, peer_id)
+                and self._defer_recent_locked(peer_id, self_id)
+            )
+
+    def _clear_defers_for(self, agent_id: str) -> None:
+        norm = (agent_id or "").lower()
+        if not norm:
+            return
+        with self._lock:
+            stale = [key for key in self._defers if key[0] == norm or key[1] == norm]
+            for key in stale:
+                del self._defers[key]
+
+    def clear_defers_between(self, agent_a: str, agent_b: str) -> None:
+        a = (agent_a or "").lower()
+        b = (agent_b or "").lower()
+        if not a or not b:
+            return
+        with self._lock:
+            self._defers.pop((a, b), None)
+            self._defers.pop((b, a), None)

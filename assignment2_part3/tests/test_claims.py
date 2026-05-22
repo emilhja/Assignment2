@@ -1,4 +1,4 @@
-from claims import ClaimRegistry
+from claims import ClaimRegistry, tie_break_winner
 
 
 def test_absorb_text_records_claim_and_release():
@@ -88,3 +88,58 @@ def test_whole_file_release_clears_claimants_scopes():
     assert registry.release("alice", "/workspace/shared/calculator.py") is True
 
     assert registry.active_claims_for("alice") == []
+
+
+def test_tie_break_winner_is_lexicographic_and_case_insensitive():
+    assert tie_break_winner("alice", "bob") == "alice"
+    assert tie_break_winner("bob", "alice") == "alice"
+    assert tie_break_winner("Alice", "alice") in ("Alice", "alice")
+    # Symmetry: same inputs return same winner regardless of arg order.
+    assert tie_break_winner("alice-swe", "bob-swe") == tie_break_winner("bob-swe", "alice-swe")
+
+
+def test_absorb_defer_records_pair():
+    registry = ClaimRegistry()
+    registry.absorb_text("alice", "DEFER to @bob-swe")
+
+    # Until bob defers back, mutual-defer is False.
+    assert registry.mutual_defer_detected("alice", "bob-swe") is False
+
+    registry.absorb_text("bob-swe", "DEFER to @alice")
+    assert registry.mutual_defer_detected("alice", "bob-swe") is True
+    # Symmetric: the detection works from either side's perspective.
+    assert registry.mutual_defer_detected("bob-swe", "alice") is True
+
+
+def test_release_clears_deferrer_outstanding_defers():
+    registry = ClaimRegistry()
+    registry.absorb_text("alice", "DEFER to @bob")
+    registry.absorb_text("bob", "DEFER to @alice")
+    assert registry.mutual_defer_detected("alice", "bob") is True
+
+    # Alice releases — her side of the mutual-defer should clear so she
+    # is not still considered "currently deferring" after moving on.
+    registry.record_observed("alice", "/workspace/shared/x.py")
+    registry.absorb_text("alice", "RELEASE /workspace/shared/x.py")
+    assert registry.mutual_defer_detected("alice", "bob") is False
+
+
+def test_defer_window_expires():
+    times = iter([100.0, 100.0, 250.0, 250.0])
+    registry = ClaimRegistry(defer_window_seconds=60.0, clock=lambda: next(times))
+    registry.absorb_text("alice", "DEFER to @bob")
+    registry.absorb_text("bob", "DEFER to @alice")
+    # By the time we check, clock has advanced past the defer window.
+    assert registry.mutual_defer_detected("alice", "bob") is False
+
+
+def test_clear_defers_between_targets_pair():
+    registry = ClaimRegistry()
+    registry.absorb_text("alice", "DEFER to @bob")
+    registry.absorb_text("bob", "DEFER to @alice")
+    registry.absorb_text("alice", "DEFER to @carol")
+
+    registry.clear_defers_between("alice", "bob")
+    assert registry.mutual_defer_detected("alice", "bob") is False
+    # Unrelated defers remain.
+    assert registry.mutual_defer_detected("alice", "carol") is False  # carol hasn't deferred back

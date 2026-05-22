@@ -31,7 +31,9 @@ class ThreadSafeSessionStore:
                 role TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 content TEXT NOT NULL,
-                trace_id TEXT
+                trace_id TEXT,
+                provider TEXT,
+                model TEXT
             )
             """
         )
@@ -40,15 +42,32 @@ class ThreadSafeSessionStore:
             self.connection.execute("ALTER TABLE events ADD COLUMN trace_id TEXT")
         except sqlite3.OperationalError:
             pass
+        try:
+            self.connection.execute("ALTER TABLE events ADD COLUMN provider TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self.connection.execute("ALTER TABLE events ADD COLUMN model TEXT")
+        except sqlite3.OperationalError:
+            pass
         self.connection.commit()
         self._lock = threading.Lock()
 
-    def record(self, role: str, kind: str, content: str, trace_id: Optional[str] = None) -> None:
+    def record(
+        self,
+        role: str,
+        kind: str,
+        content: str,
+        trace_id: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> None:
         timestamp = datetime.now(UTC).isoformat()
         with self._lock:
             self.connection.execute(
-                "INSERT INTO events (created_at, role, kind, content, trace_id) VALUES (?, ?, ?, ?, ?)",
-                (timestamp, role, kind, content, trace_id),
+                "INSERT INTO events (created_at, role, kind, content, trace_id, provider, model) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (timestamp, role, kind, content, trace_id, provider, model),
             )
             self.connection.commit()
 

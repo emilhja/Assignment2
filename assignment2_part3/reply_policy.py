@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from claims import CLAIM_PATTERN, ClaimRegistry
+from claims import CLAIM_PATTERN, ClaimRegistry, tie_break_winner
 
 
 def _env_int(name: str, default: int) -> int:
@@ -53,10 +53,26 @@ HANDOFF_PATTERN = re.compile(r"(?im)^\s*(assigned|handoff\s*->|task\s+for)\s*:?\
 
 
 @dataclass(frozen=True)
+class CollisionInfo:
+    """Description of a racing-CLAIM collision the runtime detected.
+
+    `outcome` is "self-wins" when the receiving agent owns the lexicographic
+    tie-break and should proceed, "self-loses" when the agent must defer and
+    release. This is computed once in the policy gate so the LLM does not
+    have to apply the rule itself.
+    """
+
+    path: str
+    peer_id: str
+    outcome: str  # "self-wins" | "self-loses"
+
+
+@dataclass(frozen=True)
 class ReplyDecision:
     respond: bool
     reason: str
     delay_seconds: float = 0.0
+    collision: Optional[CollisionInfo] = None
 
 
 def _mentions(text: str, names: tuple[str, ...]) -> bool:
@@ -90,8 +106,18 @@ def _last_reply_age(recent_replies, now: float) -> float | None:
     return now - recent_replies[-1][0]
 
 
-def _claim_collision(text: str, agent_id: str, claims: Optional[ClaimRegistry]) -> Optional[str]:
-    """Return the contested path if the incoming text races a CLAIM we own."""
+def _claim_collision(
+    text: str,
+    agent_id: str,
+    peer_id: str,
+    claims: Optional[ClaimRegistry],
+) -> Optional[CollisionInfo]:
+    """Return collision info if the incoming text races a CLAIM we own.
+
+    The outcome is decided here so downstream code (peer_task) can inject
+    deterministic tie-break guidance instead of leaving the lexicographic
+    rule to the LLM.
+    """
 
     if claims is None or not isinstance(text, str):
         return None
@@ -99,7 +125,9 @@ def _claim_collision(text: str, agent_id: str, claims: Optional[ClaimRegistry]) 
         path = match.group("path")
         existing = claims.lookup(path)
         if existing is not None and existing.claimant == agent_id:
-            return path
+            winner = tie_break_winner(agent_id, peer_id)
+            outcome = "self-wins" if winner == agent_id else "self-loses"
+            return CollisionInfo(path=path, peer_id=peer_id, outcome=outcome)
     return None
 
 
@@ -141,9 +169,14 @@ def should_reply(
 
     # Claim collision wins over the cooldown gate — otherwise two agents
     # who emit competing CLAIMs in the same round stay stuck.
-    contested_path = _claim_collision(message.text, agent_id, claims)
-    if contested_path is not None:
-        return ReplyDecision(True, f"claim collision on {contested_path}", delay_seconds=0.0)
+    collision = _claim_collision(message.text, agent_id, message.sender_id, claims)
+    if collision is not None:
+        return ReplyDecision(
+            True,
+            f"claim collision on {collision.path} ({collision.outcome})",
+            delay_seconds=0.0,
+            collision=collision,
+        )
 
     last_age = _last_reply_age(recent_replies, now)
     if last_age is not None and last_age < COOLDOWN_SECONDS:

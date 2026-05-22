@@ -362,6 +362,83 @@ def test_resolve_workspace_normalizes_bare_workspace_prefix(tmp_path, monkeypatc
     assert not (private / "alice").exists()
 
 
+def test_read_file_returns_contents_with_header(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    target = tmp_path / "notes.txt"
+    target.write_text("line1\nline2\n", encoding="utf-8")
+
+    output = tools.read_file("/workspace/notes.txt")
+
+    assert output.startswith("--- /workspace/notes.txt ---\n")
+    assert "line1\nline2\n" in output
+
+
+def test_read_file_reads_shared_workspace(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+    (shared / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+
+    output = tools.read_file("/workspace/shared/calc.py")
+
+    assert "def add" in output
+    assert "/workspace/shared/calc.py" in output
+
+
+def test_read_file_blocks_missing_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+
+    output = tools.read_file("/workspace/missing.txt")
+
+    assert output.startswith("Edit blocked:")
+    assert "does not exist" in output
+
+
+def test_read_file_blocks_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    (tmp_path / "sub").mkdir()
+
+    output = tools.read_file("/workspace/sub")
+
+    assert output.startswith("Edit blocked:")
+    assert "not a file" in output
+
+
+def test_read_file_blocks_outside_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path / "workspace"))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    output = tools.read_file(str(outside))
+
+    assert output.startswith("Edit blocked:")
+    assert "secret" not in output
+
+
+def test_read_file_truncates_oversized_content(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    target = tmp_path / "big.txt"
+    target.write_text("x" * (tools.MAX_OUTPUT_CHARS + 200), encoding="utf-8")
+
+    output = tools.read_file("/workspace/big.txt")
+
+    assert output.endswith("[output truncated]")
+    assert len(output) <= tools.MAX_OUTPUT_CHARS + len("\n... [output truncated]")
+
+
+def test_read_file_via_tool_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    target = tmp_path / "demo.txt"
+    target.write_text("hello\n", encoding="utf-8")
+
+    output = tools.run_tool("read_file", {"path": "/workspace/demo.txt"})
+
+    assert "hello" in output
+
+
 def test_create_file_blocks_path_outside_both_roots(tmp_path, monkeypatch):
     private = tmp_path / "alice"
     shared = tmp_path / "shared"

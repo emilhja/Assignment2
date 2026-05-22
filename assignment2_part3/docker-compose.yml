@@ -9,7 +9,7 @@ services:
     environment:
       PYTHONUNBUFFERED: "1"
     ports:
-      - "8080:8080"
+      - "${LOCAL_HUB_PORT:-8080}:8080"
 
   agent-alice:
     build:
@@ -25,10 +25,14 @@ services:
       SHARED_WORKSPACE: /workspace/shared
       AGENT_SESSION_DB: /data/alice.sqlite3
       AGENT_TPM_LIMIT: ${AGENT_TPM_LIMIT:-5500}
+      LLM_PROVIDER_ORDER: ${ALICE_LLM_PROVIDER_ORDER:-local}
       LLM_RATE_LIMIT_MAX_WAIT_SECONDS: ${LLM_RATE_LIMIT_MAX_WAIT_SECONDS:-0}
-      RUNPOD_CHAT_URL: ${RUNPOD_CHAT_URL:-http://local-hub:8080}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-2048}
+      LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-120}
+      RUNPOD_CHAT_URL: ${LOCAL_AGENT_HUB_URL:-http://local-hub:8080}
       RUNPOD_CHAT_PASSWORD: ${RUNPOD_CHAT_PASSWORD:?Set RUNPOD_CHAT_PASSWORD in .env (must match LOCAL_HUB_PASSWORD for the local hub)}
       RUNPOD_CHAT_POLL_INTERVAL: ${RUNPOD_CHAT_POLL_INTERVAL:-4}
+      LOCAL_LLM_BASE_URL: ${LOCAL_LLM_BASE_URL:-http://host.docker.internal:8080}
     depends_on:
       - local-hub
     stdin_open: true
@@ -58,10 +62,14 @@ services:
       SHARED_WORKSPACE: /workspace/shared
       AGENT_SESSION_DB: /data/bob.sqlite3
       AGENT_TPM_LIMIT: ${AGENT_TPM_LIMIT:-5500}
+      LLM_PROVIDER_ORDER: ${BOB_LLM_PROVIDER_ORDER:-groq}
       LLM_RATE_LIMIT_MAX_WAIT_SECONDS: ${LLM_RATE_LIMIT_MAX_WAIT_SECONDS:-0}
-      RUNPOD_CHAT_URL: ${RUNPOD_CHAT_URL:-http://local-hub:8080}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-2048}
+      LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-120}
+      RUNPOD_CHAT_URL: ${LOCAL_AGENT_HUB_URL:-http://local-hub:8080}
       RUNPOD_CHAT_PASSWORD: ${RUNPOD_CHAT_PASSWORD:?Set RUNPOD_CHAT_PASSWORD in .env (must match LOCAL_HUB_PASSWORD for the local hub)}
       RUNPOD_CHAT_POLL_INTERVAL: ${RUNPOD_CHAT_POLL_INTERVAL:-4}
+      LOCAL_LLM_BASE_URL: ${LOCAL_LLM_BASE_URL:-http://host.docker.internal:8080}
     depends_on:
       - local-hub
     stdin_open: true

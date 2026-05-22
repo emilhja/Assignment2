@@ -178,8 +178,11 @@ The agents default to `AGENT_MODE=runpod` and `RUNPOD_CHAT_URL=http://local-hub:
 so the only `.env` setup for local development is `LOCAL_HUB_PASSWORD` and
 `RUNPOD_CHAT_PASSWORD` (use the same value for both). Compose refuses to start
 without them, which keeps any shared secret out of the committed compose file.
-To point at the live TH25 hub instead, set `RUNPOD_CHAT_URL` and
-`RUNPOD_CHAT_PASSWORD` in `.env` — they override the local defaults.
+For local Docker runs, `docker-compose.yml` deliberately points the agents at
+the internal Docker service URL `http://local-hub:8080`; `LOCAL_HUB_PORT` only
+controls the host port used by `tools/chat.py`.
+To point at another hub from the Docker agents, set `LOCAL_AGENT_HUB_URL`.
+For host-side, non-Docker runs, set `RUNPOD_CHAT_URL` directly.
 
 `tools/chat.py` is a small REST client for the hub. Subcommands:
 
@@ -191,7 +194,9 @@ To point at the live TH25 hub instead, set `RUNPOD_CHAT_URL` and
 | `chat.py stats` | Per-agent message counts. |
 
 It reads `LOCAL_HUB_URL`, `LOCAL_HUB_PASSWORD`, `LOCAL_HUB_USER` from
-the env (override with `--url`, `--password`, `--as`).
+the env (override with `--url`, `--password`, `--as`). If `LOCAL_HUB_URL`
+is not set, it uses `LOCAL_HUB_PORT` and falls back to
+`http://localhost:8080`.
 
 ### Mode 3 — TH25 RunPod hub (opt-in)
 
@@ -290,9 +295,29 @@ scrubbed answer is posted.
 | `RUNPOD_CHAT_PASSWORD` | *(empty)* | Hub password. `RUNPOD_CHAT_TOKEN` accepted as fallback. |
 | `RUNPOD_CHAT_POLL_INTERVAL` | `4` | Seconds between GETs (hub rate-limits at 1 req/s). |
 | `LLM_PROVIDER_ORDER` | `groq,openai` | Forwarded to Part 2's `llm_client`. |
-| `GROQ_API_KEY` / `OPENAI_API_KEY` | *(empty)* | At least one provider key required. |
+| `GROQ_API_KEY` / `OPENAI_API_KEY` | *(empty)* | Required when using the hosted Groq/OpenAI providers. |
 | `GROQ_MODEL` | `llama-3.1-8b-instant` | Model id for Groq. |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model id for OpenAI. |
+| `LOCAL_LLM_BASE_URL` | `http://127.0.0.1:8080` | Local OpenAI-compatible endpoint when `LLM_PROVIDER_ORDER=local`. |
+| `LOCAL_LLM_MODEL` | `local-model` | Model id sent to the local endpoint. |
+| `LOCAL_LLM_API_KEY` | *(empty)* | Optional key for local servers that require one. |
+| `LOCAL_HUB_PORT` | `8080` | Host port for Docker's local hub; set to `8090` if a local LLM already owns port 8080. |
+
+For host-side runs against `llama-server` on port 8080, set:
+
+```env
+LLM_PROVIDER_ORDER=local
+LOCAL_LLM_BASE_URL=http://127.0.0.1:8080
+LOCAL_LLM_MODEL=local-model
+```
+
+For Docker agents on Windows/Mac, the containers usually need the host alias:
+
+```env
+LLM_PROVIDER_ORDER=local
+LOCAL_LLM_BASE_URL=http://host.docker.internal:8080
+LOCAL_HUB_PORT=8090
+```
 
 ---
 

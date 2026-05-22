@@ -21,20 +21,21 @@ from typing import Optional
 
 import part2_bridge  # noqa: F401 — sys.path side effect; needed before Part 2 imports
 
-from llm_client import complete_chat
+from llm_client import complete_chat_with_metadata
 from parser import parse_response
 from session_store import SessionStore
-from tools import MAX_OUTPUT_CHARS, TOOL_REGISTRY, run_tool
+from tools import MAX_OUTPUT_CHARS, TOOL_REGISTRY, _resolve_workspace_path, run_tool
 
 from budget import Budget, BudgetExceeded, estimate_tokens
 from claims import ClaimRegistry
 from console_control import ConsoleControl
 from peer import PeerMessage, peer_intent_refusal, scrub_outbound
+from reply_policy import CollisionInfo
 
 
 MAX_STEPS = 8
 MAX_CONTEXT_MESSAGES = 24
-MAX_CONTEXT_CHARS = 6000
+MAX_CONTEXT_CHARS = 2000
 
 CLAIM_GATED_TOOLS = {"create_file", "edit_section", "replace_text"}
 SHARED_PATH_PREFIX = "/workspace/shared/"
@@ -120,6 +121,59 @@ def _refusal_observation(reason: str) -> str:
     return _json({"type": "tool_observation", "tool": "policy", "observation": f"refused: {reason}"})
 
 
+def _scope_marker(path: str) -> str:
+    """Format a path with its optional `#scope` suffix for human-facing text."""
+
+    return path
+
+
+def _collision_guidance_text(collision: CollisionInfo) -> str:
+    """Deterministic tie-break instruction injected before the LLM round-trip."""
+
+    if collision.outcome == "self-wins":
+        return (
+            "Racing CLAIM detected on "
+            f"{_scope_marker(collision.path)}. Your AGENT_ID is lexicographically "
+            f"smaller than @{collision.peer_id}, so you hold the tie-break. Do NOT "
+            "post 'DEFER'. Continue with your active claim and use the appropriate "
+            "edit tool to write."
+        )
+    return (
+        "Racing CLAIM detected on "
+        f"{_scope_marker(collision.path)}. You lost the tie-break to "
+        f"@{collision.peer_id} (their AGENT_ID is lexicographically smaller). "
+        "Reply with exactly two lines and stop: first 'DEFER to "
+        f"@{collision.peer_id}', then 'RELEASE {collision.path}'. Propose a "
+        "non-overlapping scope on your next turn."
+    )
+
+
+def _mutual_defer_guidance_text(self_id: str, peer_id: str) -> str:
+    winner = peer_id if peer_id.lower() < self_id.lower() else self_id
+    loser = peer_id if winner == self_id else self_id
+    return (
+        f"Mutual-defer detected between @{self_id} and @{peer_id}. Apply the "
+        f"P3.9 tie-break: @{winner} re-claims the contested scope and proceeds; "
+        f"@{loser} must release any conflicting claim and propose a "
+        "non-overlapping scope. Do not post another bare 'DEFER' line."
+    )
+
+
+def _runtime_guidance_message(text: str) -> dict[str, str]:
+    """Wrap runtime guidance so the model sees it as an authoritative note."""
+
+    return {
+        "role": "user",
+        "content": _json(
+            {
+                "role_origin": "runtime",
+                "trust": "authoritative",
+                "text": text,
+            }
+        ),
+    }
+
+
 def _maybe_scrub_args_refusal(args: dict) -> Optional[str]:
     """Check tool args for peer-refusal-class leak attempts."""
 
@@ -164,7 +218,17 @@ def _maybe_shared_write_refusal(
             f"no active claim for {path}. Post `CLAIM {path}#<scope>: <reason>` "
             "first, wait for the runtime continuation, and do not write unrelated shared files."
         )
-    claim = claims.is_claimed_by_other(path, self_id)
+    if tool == "create_file" and own_claim.scope is not None:
+        try:
+            target = _resolve_workspace_path(path)
+        except ValueError:
+            target = None
+        if target is not None and target.exists():
+            return (
+                f"scoped claim {own_claim.target} cannot recreate existing shared file {path}. "
+                "Read the current file and use edit_section or replace_text so peer work is preserved."
+            )
+    claim = claims.is_claimed_by_other(own_claim.target, self_id)
     if claim is None:
         return None
     return (
@@ -206,10 +270,12 @@ def run_peer_task(
     agent_id: Optional[str] = None,
     recent_context: Optional[list[dict[str, str]]] = None,
     absorb_claims: bool = True,
+    collision: Optional[CollisionInfo] = None,
 ) -> str:
-    # Late binding so monkey-patching `peer_task.complete_chat` in tests works.
+    # Late binding so monkey-patching `peer_task.complete_chat_with_metadata`
+    # in tests works.
     if chat_fn is None:
-        chat_fn = complete_chat
+        chat_fn = complete_chat_with_metadata
     """Handle one peer message and return the text to send back to the hub.
 
     The return value has already been passed through `scrub_outbound`.
@@ -217,10 +283,27 @@ def run_peer_task(
 
     self_id = agent_id or ""
     trace_id = message.id
-    _supports_trace = "trace_id" in inspect.signature(store.record).parameters
+    _record_params = inspect.signature(store.record).parameters
+    _supports_trace = "trace_id" in _record_params
+    _supports_model = "model" in _record_params and "provider" in _record_params
 
-    def _log(role: str, kind: str, content: str) -> None:
-        if _supports_trace:
+    def _log(
+        role: str,
+        kind: str,
+        content: str,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> None:
+        if _supports_model and (provider is not None or model is not None):
+            store.record(
+                role,
+                kind,
+                content,
+                trace_id=trace_id,
+                provider=provider,
+                model=model,
+            )
+        elif _supports_trace:
             store.record(role, kind, content, trace_id=trace_id)
         else:
             store.record(role, kind, content)
@@ -257,6 +340,21 @@ def run_peer_task(
     peer_names = _peer_mention_names(recent_context, self_id, message.sender_id)
     saw_failed_shared_write = False
 
+    if collision is not None:
+        guidance_text = _collision_guidance_text(collision)
+        _log("system", "tie_break_injection", guidance_text)
+        messages.append(_runtime_guidance_message(guidance_text))
+    elif (
+        claims is not None
+        and self_id
+        and message.sender_id
+        and message.sender_id != self_id
+        and claims.mutual_defer_detected(self_id, message.sender_id)
+    ):
+        guidance_text = _mutual_defer_guidance_text(self_id, message.sender_id)
+        _log("system", "mutual_defer_injection", guidance_text)
+        messages.append(_runtime_guidance_message(guidance_text))
+
     for step in range(1, MAX_STEPS + 1):
         estimate = estimate_tokens(_json({"messages": messages}))
         try:
@@ -265,9 +363,13 @@ def run_peer_task(
             _log("system", "budget_exceeded", exc.reason)
             return f"I have to stop here: my session budget is exhausted ({exc.reason})."
 
-        raw_response = chat_fn(messages)
+        result = chat_fn(messages)
+        if isinstance(result, tuple):
+            raw_response, provider, model = result
+        else:
+            raw_response, provider, model = result, None, None
         budget.record(estimate_tokens(raw_response or ""))
-        _log("assistant", "raw_json", raw_response)
+        _log("assistant", "raw_json", raw_response, provider=provider, model=model)
         if budget_save_event is not None:
             budget_save_event.set()
 
