@@ -133,6 +133,8 @@ def run_group_chat(
                 f"respond={decision.respond} reason={decision.reason} msg_id={message.id} sender={message.sender_id}",
             )
             if not decision.respond:
+                if runpod:
+                    print(f"[skip] {decision.reason}", flush=True)
                 continue
 
             if decision.delay_seconds > 0:

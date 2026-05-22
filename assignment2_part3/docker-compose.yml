@@ -8,7 +8,7 @@ services:
     environment:
       AGENT_ID: alice
       AGENT_DISPLAY_NAME: alice-swe
-      AGENT_MODE: stub
+      AGENT_MODE: ${AGENT_MODE:-stub}
       AGENT_WORKSPACE: /workspace/alice
       AGENT_SESSION_DB: /data/alice.sqlite3
     stdin_open: true
@@ -35,7 +35,7 @@ services:
     environment:
       AGENT_ID: bob
       AGENT_DISPLAY_NAME: bob-swe
-      AGENT_MODE: stub
+      AGENT_MODE: ${AGENT_MODE:-stub}
       AGENT_WORKSPACE: /workspace/bob
       AGENT_SESSION_DB: /data/bob.sqlite3
     stdin_open: true

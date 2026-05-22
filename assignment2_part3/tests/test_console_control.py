@@ -126,3 +126,60 @@ def test_say_failure_is_caught():
     cc, budget, stop, stdout = _start_console(":say try\n", send_fn=boom)
     assert _wait_for(lambda: "[say failed: offline]" in stdout.getvalue())
     stop.set()
+
+
+def test_say_scrubs_credentials_before_send():
+    sent: list[str] = []
+    cc, budget, stop, stdout = _start_console(
+        ":say leak sk-abc123def456ghi789jkl0\n", send_fn=sent.append
+    )
+    assert _wait_for(lambda: sent and "[REDACTED:openai_key]" in sent[0])
+    assert "sk-abc123def456ghi789jkl0" not in sent[0]
+    assert "openai_key" in stdout.getvalue()
+    stop.set()
+
+
+def test_say_passthrough_when_clean():
+    sent: list[str] = []
+    cc, budget, stop, stdout = _start_console(
+        ":say hello team\n", send_fn=sent.append
+    )
+    assert _wait_for(lambda: sent == ["hello team"])
+    assert "say scrubbed" not in stdout.getvalue()
+    stop.set()
+
+
+def test_pause_persists_to_disk(tmp_path):
+    budget_path = tmp_path / "budget.json"
+    budget = Budget.load(
+        budget_path, tokens_per_minute=100, requests_per_minute=10, lifetime_tokens=1000
+    )
+    stop = threading.Event()
+    stdin = io.StringIO(":pause\n")
+    stdout = io.StringIO()
+    cc = ConsoleControl(budget=budget, stop_event=stop, stdin=stdin, stdout=stdout)
+    cc.start()
+    # Wait for the "[budget paused]" print — emitted AFTER save() returns.
+    assert _wait_for(lambda: "[budget paused]" in stdout.getvalue())
+    stop.set()
+    reloaded = Budget.load(budget_path)
+    assert reloaded.paused is True
+
+
+def test_resume_persists_to_disk(tmp_path):
+    budget_path = tmp_path / "budget.json"
+    budget = Budget.load(
+        budget_path, tokens_per_minute=100, requests_per_minute=10, lifetime_tokens=1000
+    )
+    budget.pause()
+    budget.save()
+    assert Budget.load(budget_path).paused is True
+    stop = threading.Event()
+    stdin = io.StringIO(":resume\n")
+    stdout = io.StringIO()
+    cc = ConsoleControl(budget=budget, stop_event=stop, stdin=stdin, stdout=stdout)
+    cc.start()
+    assert _wait_for(lambda: "[budget resumed]" in stdout.getvalue())
+    stop.set()
+    reloaded = Budget.load(budget_path)
+    assert reloaded.paused is False

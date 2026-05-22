@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Callable, IO, Optional
 
 from budget import Budget
+from peer import scrub_outbound
 
 
 HELP_TEXT = (
@@ -133,9 +134,11 @@ class ConsoleControl:
             self._cmd_limit(args)
         elif cmd == "pause":
             self.budget.pause()
+            self.budget.save()
             self._print("[budget paused]")
         elif cmd == "resume":
             self.budget.resume()
+            self.budget.save()
             self._print("[budget resumed]")
         elif cmd == "approve":
             if self._resolve_pending(True):
@@ -159,8 +162,11 @@ class ConsoleControl:
         if self.send_fn is None:
             self._print("[say not wired \u2014 transport unavailable]")
             return
+        scrubbed, hits = scrub_outbound(message)
+        if hits:
+            self._print(f"[say scrubbed: {sorted(set(hits))}]")
         try:
-            self.send_fn(message)
+            self.send_fn(scrubbed)
         except Exception as exc:
             self._print(f"[say failed: {exc}]")
 

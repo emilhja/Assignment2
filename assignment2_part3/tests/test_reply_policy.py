@@ -103,3 +103,136 @@ def test_direct_mention_bypasses_cooldown(monkeypatch):
         now=1000.0,
     )
     assert d.respond is True
+
+
+def _rng():
+    return random.Random(0)
+
+
+def test_broadcast_keyword_everyone():
+    d = should_reply(
+        _msg("everyone, status please"), "alice", "alice-swe", [], now=1000.0, rng=_rng()
+    )
+    assert d.respond is True
+    assert "broadcast" in d.reason
+
+
+def test_broadcast_keyword_all_agents():
+    d = should_reply(
+        _msg("all agents, please report"), "alice", "alice-swe", [], now=1000.0, rng=_rng()
+    )
+    assert d.respond is True
+    assert "broadcast" in d.reason
+
+
+def test_broadcast_keyword_any_volunteers():
+    d = should_reply(
+        _msg("any volunteers to help with the migration?"),
+        "alice",
+        "alice-swe",
+        [],
+        now=1000.0,
+        rng=_rng(),
+    )
+    assert d.respond is True
+    assert "broadcast" in d.reason
+
+
+def test_broadcast_keyword_whoever():
+    d = should_reply(
+        _msg("whoever picks this up, go ahead"),
+        "alice",
+        "alice-swe",
+        [],
+        now=1000.0,
+        rng=_rng(),
+    )
+    assert d.respond is True
+    assert "broadcast" in d.reason
+
+
+def test_bare_all_does_not_trigger_broadcast():
+    # "All" alone (no "agents") must NOT be treated as a broadcast — the
+    # regex requires \b(everyone|anyone|all\s+agents?|...). This pins the
+    # tight match so a future regex tweak can't silently broaden it.
+    d = should_reply(
+        _msg("All systems go"), "alice", "alice-swe", [], now=1000.0, rng=_rng()
+    )
+    assert d.respond is False
+
+
+def test_multi_mention_triggers_both_agents():
+    text = "@alice-swe @bob-swe ping"
+    d_alice = should_reply(_msg(text), "alice", "alice-swe", [], now=1000.0, rng=_rng())
+    d_bob = should_reply(_msg(text), "bob", "bob-swe", [], now=1000.0, rng=_rng())
+    assert d_alice.respond is True
+    assert "addressed" in d_alice.reason
+    assert d_bob.respond is True
+    assert "addressed" in d_bob.reason
+
+
+def test_cooldown_blocks_broadcast_silently(monkeypatch):
+    # Recreates the user's "no feedback" scenario: a recent direct reply
+    # puts the agent in cooldown, and a broadcast arrives. The reply
+    # gate must return the cooldown reason (not the broadcast reason),
+    # because the cooldown check runs first by design. Locking this in
+    # so any reordering of should_reply fails loudly.
+    monkeypatch.setattr(reply_policy, "COOLDOWN_SECONDS", 30)
+    recent = [(995.0, "m-prev")]  # replied 5s ago
+    d = should_reply(
+        _msg("all agents, please share your status"),
+        "alice",
+        "alice-swe",
+        recent,
+        now=1000.0,
+        rng=_rng(),
+    )
+    assert d.respond is False
+    assert d.reason.startswith("cooldown:")
+
+
+def test_swedish_broadcast_triggers_reply():
+    d = should_reply(
+        _msg("kan någon kolla det här?"),
+        "alice",
+        "alice-swe",
+        [],
+        now=1000.0,
+        rng=_rng(),
+    )
+    assert d.respond is True
+    assert "broadcast" in d.reason
+
+
+def test_swedish_broadcast_backoff(monkeypatch):
+    monkeypatch.setattr(reply_policy, "MAX_BROADCAST_REPLIES", 1)
+    monkeypatch.setattr(reply_policy, "BROADCAST_WINDOW_SECONDS", 300)
+    monkeypatch.setattr(reply_policy, "COOLDOWN_SECONDS", 0)
+    recent = [(950.0, "m-prev")]
+    d = should_reply(
+        _msg("alla agenter, status?"),
+        "alice",
+        "alice-swe",
+        recent,
+        now=1000.0,
+    )
+    assert d.respond is False
+    assert "back-off" in d.reason
+
+
+def test_broadcast_window_resets_after_window_seconds(monkeypatch):
+    monkeypatch.setattr(reply_policy, "MAX_BROADCAST_REPLIES", 1)
+    monkeypatch.setattr(reply_policy, "BROADCAST_WINDOW_SECONDS", 300)
+    monkeypatch.setattr(reply_policy, "COOLDOWN_SECONDS", 0)
+    # Previous broadcast reply is older than the window — should NOT count.
+    recent = [(500.0, "m-old")]  # 500s ago, window is 300s
+    d = should_reply(
+        _msg("anyone able to take this?"),
+        "alice",
+        "alice-swe",
+        recent,
+        now=1000.0,
+        rng=_rng(),
+    )
+    assert d.respond is True
+    assert "broadcast" in d.reason

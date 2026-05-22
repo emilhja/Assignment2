@@ -146,3 +146,66 @@ def test_outbound_reply_is_scrubbed(tmp_path, monkeypatch):
     if replies:
         for payload in replies:
             assert "sk-abcdefghij" not in payload["text"]
+
+
+def test_broadcast_message_triggers_reply(tmp_path, monkeypatch):
+    peer_lines = [
+        json.dumps(
+            {"id": "m1", "sender_id": "emil-user", "text": "all agents, please share your status"}
+        )
+        + "\n",
+    ]
+    scripted = [json.dumps({"type": "final", "answer": "Status: all green here."})]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert len(replies) == 1
+    assert "green" in replies[0]["text"]
+
+    decision_rows = [
+        content for role, kind, content in _events(ctx["store"])
+        if kind == "reply_decision"
+    ]
+    assert any("broadcast" in row for row in decision_rows)
+
+
+def test_skip_reason_silent_in_stub_mode(tmp_path, monkeypatch, capsys):
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "bob", "text": "random chatter, no mention"}) + "\n",
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies=[])
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(0.8)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    captured = capsys.readouterr()
+    assert "[skip]" not in captured.out
+
+
+def test_skip_reason_printed_in_runpod_mode(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("AGENT_MODE", "runpod")
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "bob", "text": "random chatter, no mention"}) + "\n",
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies=[])
+    # _setup_run overwrites AGENT_MODE back to "stub"; re-set it after.
+    monkeypatch.setenv("AGENT_MODE", "runpod")
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(0.8)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    captured = capsys.readouterr()
+    assert "[skip]" in captured.out
+    assert "not addressed" in captured.out

@@ -37,7 +37,12 @@ COOLDOWN_SECONDS = _env_int("REPLY_COOLDOWN_SECONDS", 30)
 MAX_BROADCAST_REPLIES = _env_int("REPLY_MAX_BROADCAST", 1)
 BROADCAST_WINDOW_SECONDS = _env_int("REPLY_BROADCAST_WINDOW_SECONDS", 300)
 
-BROADCAST_PATTERN = re.compile(r"(?i)\b(everyone|anyone|all\s+agents?|any\s+volunteers?|whoever)\b")
+BROADCAST_PATTERN = re.compile(
+    r"(?i)\b("
+    r"everyone|anyone|all\s+agents?|any\s+volunteers?|whoever"
+    r"|alla|någon|vem\s+som\s+helst|alla\s+agenter|volontär(?:er)?"
+    r")\b"
+)
 HANDOFF_PATTERN = re.compile(r"(?im)^\s*(assigned|handoff\s*->|task\s+for)\s*:?\s*(?P<target>[\w.-]+)")
 
 
