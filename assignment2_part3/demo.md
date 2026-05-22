@@ -6,8 +6,15 @@ Run all commands from `assignment2_part3/`.
 
 ```bash
 cp .env.example .env
-# edit .env and set GROQ_API_KEY or OPENAI_API_KEY
+# edit .env and set:
+#   - GROQ_API_KEY or OPENAI_API_KEY
+#   - LOCAL_HUB_PASSWORD     (any value, e.g. dev-shared)
+#   - RUNPOD_CHAT_PASSWORD   (must match LOCAL_HUB_PASSWORD for the local hub)
 ```
+
+Compose now requires `LOCAL_HUB_PASSWORD` and `RUNPOD_CHAT_PASSWORD`
+to be set in `.env` — it will refuse to start the stack otherwise.
+This keeps any shared secret out of the committed `docker-compose.yml`.
 
 ## 2. Build the images
 
@@ -77,8 +84,9 @@ docker compose up -d
 
 This starts three containers: `local-hub`, `agent-alice`, and `agent-bob`.
 The agents default to `AGENT_MODE=runpod` and connect to the hub at
-`http://local-hub:8080` automatically — no `.env` changes needed for
-local development.
+`http://local-hub:8080` automatically. Make sure `LOCAL_HUB_PASSWORD`
+and `RUNPOD_CHAT_PASSWORD` are set (and equal) in `.env` before bringing
+the stack up — compose will fail fast with a clear message otherwise.
 
 To point at the live TH25 hub instead, set these in `.env`:
 ```

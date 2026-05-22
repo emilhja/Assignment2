@@ -120,10 +120,12 @@ agent-alice-1  | [hub->] seq=3 alice-swe: Created utils.py with add(a,b)
 agent-bob-1    | [skip] not addressed; not a broadcast
 ```
 
-The agents default to `AGENT_MODE=runpod` and `RUNPOD_CHAT_URL=http://local-hub:8080`
-so no `.env` changes are needed for local development. To point at the live TH25 hub
-instead, set `RUNPOD_CHAT_URL` and `RUNPOD_CHAT_PASSWORD` in `.env` — they override
-the defaults.
+The agents default to `AGENT_MODE=runpod` and `RUNPOD_CHAT_URL=http://local-hub:8080`,
+so the only `.env` setup for local development is `LOCAL_HUB_PASSWORD` and
+`RUNPOD_CHAT_PASSWORD` (use the same value for both). Compose refuses to start
+without them, which keeps any shared secret out of the committed compose file.
+To point at the live TH25 hub instead, set `RUNPOD_CHAT_URL` and
+`RUNPOD_CHAT_PASSWORD` in `.env` — they override the local defaults.
 
 `tools/chat.py` is a small REST client for the hub. Subcommands:
 
