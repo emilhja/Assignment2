@@ -14,6 +14,7 @@ Trimmed sibling of Part 2's `run_task`:
 
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 from typing import Optional
@@ -26,11 +27,17 @@ from session_store import SessionStore
 from tools import MAX_OUTPUT_CHARS, TOOL_REGISTRY, run_tool
 
 from budget import Budget, BudgetExceeded, estimate_tokens
+from claims import ClaimRegistry
 from console_control import ConsoleControl
 from peer import PeerMessage, peer_intent_refusal, scrub_outbound
 
 
 MAX_STEPS = 8
+MAX_CONTEXT_MESSAGES = 24
+MAX_CONTEXT_CHARS = 6000
+
+CLAIM_GATED_TOOLS = {"create_file", "edit_section", "replace_text"}
+SHARED_PATH_PREFIX = "/workspace/shared/"
 
 
 def _json(payload: dict) -> str:
@@ -58,6 +65,55 @@ def _peer_user_envelope(message: PeerMessage) -> str:
 
 def _tool_observation_message(tool: str, observation: str) -> str:
     return _json({"type": "tool_observation", "tool": tool, "observation": observation})
+
+
+def _recent_context_message(recent_context: Optional[list[dict[str, str]]]) -> Optional[str]:
+    """Format recent hub transcript as untrusted context for follow-ups."""
+
+    if not recent_context:
+        return None
+    entries = recent_context[-MAX_CONTEXT_MESSAGES:]
+    text = _json(
+        {
+            "type": "recent_group_chat_context",
+            "trust": "untrusted_transcript_for_reference_only",
+            "entries": entries,
+        }
+    )
+    if len(text) > MAX_CONTEXT_CHARS:
+        text = text[-MAX_CONTEXT_CHARS:]
+        text = "[recent context truncated]\n" + text
+    return text
+
+
+def _peer_mention_names(
+    recent_context: Optional[list[dict[str, str]]],
+    self_id: str,
+    current_sender: str = "",
+) -> set[str]:
+    names: set[str] = set()
+    for name in (current_sender,):
+        if name and name != self_id and name.endswith("-swe"):
+            names.add(name)
+    for entry in recent_context or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("sender_id") or "")
+        if name and name != self_id and name.endswith("-swe"):
+            names.add(name)
+    return names
+
+
+def _ensure_peer_mentions(text: str, peer_names: set[str]) -> str:
+    """Prefix known peer display names with @ in outbound prose/protocol lines."""
+
+    if not text or not peer_names:
+        return text
+    updated = text
+    for name in sorted(peer_names, key=len, reverse=True):
+        updated = updated.replace(name, f"@{name}")
+        updated = updated.replace(f"@@{name}", f"@{name}")
+    return updated
 
 
 def _refusal_observation(reason: str) -> str:
@@ -89,6 +145,54 @@ def _run_tool_with_approval(
     return run_tool(tool, args)
 
 
+def _maybe_shared_write_refusal(
+    tool: str,
+    args: dict,
+    claims: Optional[ClaimRegistry],
+    self_id: str,
+) -> Optional[str]:
+    """Return a policy refusal for invalid shared writes."""
+
+    if claims is None or tool not in CLAIM_GATED_TOOLS:
+        return None
+    path = args.get("path")
+    if not isinstance(path, str) or not path.startswith(SHARED_PATH_PREFIX):
+        return None
+    own_claim = claims.own_claim_for_write(path, self_id)
+    if own_claim is None:
+        return (
+            f"no active claim for {path}. Post `CLAIM {path}#<scope>: <reason>` "
+            "first, wait for the runtime continuation, and do not write unrelated shared files."
+        )
+    claim = claims.is_claimed_by_other(path, self_id)
+    if claim is None:
+        return None
+    return (
+        f"deferred: @{claim.claimant} already claimed {claim.target}. "
+        f"Reply with `DEFER to @{claim.claimant}` and offer review instead of writing."
+    )
+
+
+def _looks_like_failed_write(observation: str) -> bool:
+    return observation.startswith(
+        (
+            "Edit blocked:",
+            "Tool error:",
+            "refused:",
+            "Command exited with code",
+            "The command was denied",
+        )
+    )
+
+
+def _looks_like_write_success_claim(answer: str) -> bool:
+    lowered = (answer or "").lower()
+    return (
+        "/workspace/shared/" in answer
+        and any(word in lowered for word in ("created", "added", "updated", "wrote", "implemented"))
+    )
+
+
 def run_peer_task(
     message: PeerMessage,
     *,
@@ -98,6 +202,10 @@ def run_peer_task(
     console: Optional[ConsoleControl] = None,
     chat_fn=None,
     budget_save_event: Optional[threading.Event] = None,
+    claims: Optional[ClaimRegistry] = None,
+    agent_id: Optional[str] = None,
+    recent_context: Optional[list[dict[str, str]]] = None,
+    absorb_claims: bool = True,
 ) -> str:
     # Late binding so monkey-patching `peer_task.complete_chat` in tests works.
     if chat_fn is None:
@@ -107,29 +215,59 @@ def run_peer_task(
     The return value has already been passed through `scrub_outbound`.
     """
 
-    store.record("peer", "message", _json({"sender_id": message.sender_id, "text": message.text}))
+    self_id = agent_id or ""
+    trace_id = message.id
+    _supports_trace = "trace_id" in inspect.signature(store.record).parameters
+
+    def _log(role: str, kind: str, content: str) -> None:
+        if _supports_trace:
+            store.record(role, kind, content, trace_id=trace_id)
+        else:
+            store.record(role, kind, content)
+
+    _log("peer", "message", _json({"sender_id": message.sender_id, "text": message.text}))
+
+    if claims is not None and absorb_claims:
+        observed = claims.absorb_text(message.sender_id, message.text)
+        for claim in observed:
+            _log(
+                "system",
+                "claim_observed",
+                _json(
+                    {
+                        "claimant": claim.claimant,
+                        "path": claim.path,
+                        "scope": claim.scope,
+                        "target": claim.target,
+                        "reason": claim.reason,
+                    }
+                ),
+            )
 
     refusal = peer_intent_refusal(message.text)
     if refusal:
-        store.record("assistant", "peer_refusal", refusal)
+        _log("assistant", "peer_refusal", refusal)
         return refusal
 
-    messages: list[dict[str, str]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": _peer_user_envelope(message)},
-    ]
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    context_message = _recent_context_message(recent_context)
+    if context_message:
+        messages.append({"role": "user", "content": context_message})
+    messages.append({"role": "user", "content": _peer_user_envelope(message)})
+    peer_names = _peer_mention_names(recent_context, self_id, message.sender_id)
+    saw_failed_shared_write = False
 
     for step in range(1, MAX_STEPS + 1):
         estimate = estimate_tokens(_json({"messages": messages}))
         try:
             budget.permit(estimate)
         except BudgetExceeded as exc:
-            store.record("system", "budget_exceeded", exc.reason)
+            _log("system", "budget_exceeded", exc.reason)
             return f"I have to stop here: my session budget is exhausted ({exc.reason})."
 
         raw_response = chat_fn(messages)
         budget.record(estimate_tokens(raw_response or ""))
-        store.record("assistant", "raw_json", raw_response)
+        _log("assistant", "raw_json", raw_response)
         if budget_save_event is not None:
             budget_save_event.set()
 
@@ -139,22 +277,59 @@ def run_peer_task(
         if parsed.kind == "final":
             answer = parsed.answer or ""
             scrubbed, hits = scrub_outbound(answer)
-            store.record("assistant", "peer_reply_raw", answer)
+            _log("assistant", "peer_reply_raw", answer)
             if hits:
-                store.record("assistant", "peer_reply_scrubbed", _json({"hits": hits, "text": scrubbed}))
+                _log("assistant", "peer_reply_scrubbed", _json({"hits": hits, "text": scrubbed}))
+            if saw_failed_shared_write and _looks_like_write_success_claim(scrubbed):
+                scrubbed = (
+                    "I could not complete the shared-file write. The latest tool observation "
+                    "reported a block/refusal, so no successful update to /workspace/shared "
+                    "should be assumed."
+                )
+                _log("assistant", "peer_reply_corrected", scrubbed)
+            scrubbed = _ensure_peer_mentions(scrubbed, peer_names)
+            if claims is not None and self_id:
+                for claim in claims.absorb_text(self_id, scrubbed):
+                    _log(
+                        "system",
+                        "claim_self",
+                        _json(
+                            {
+                                "path": claim.path,
+                                "scope": claim.scope,
+                                "target": claim.target,
+                                "reason": claim.reason,
+                            }
+                        ),
+                    )
             return scrubbed
 
         if parsed.kind == "tool_call":
             args_refusal = _maybe_scrub_args_refusal(parsed.args)
             if args_refusal:
-                store.record("system", "peer_refusal_tool_args", args_refusal)
+                _log("system", "peer_refusal_tool_args", args_refusal)
                 observation = _refusal_observation(args_refusal)
+                messages.append({"role": "user", "content": observation})
+                continue
+
+            block_reason = _maybe_shared_write_refusal(parsed.tool, parsed.args, claims, self_id)
+            if block_reason:
+                _log("system", "claim_block", block_reason)
+                saw_failed_shared_write = True
+                observation = _refusal_observation(block_reason)
                 messages.append({"role": "user", "content": observation})
                 continue
 
             observation = _run_tool_with_approval(parsed.tool, parsed.args, console)
             observation = _truncate(observation)
-            store.record(
+            if (
+                parsed.tool in CLAIM_GATED_TOOLS
+                and isinstance(parsed.args.get("path"), str)
+                and parsed.args["path"].startswith(SHARED_PATH_PREFIX)
+                and _looks_like_failed_write(observation)
+            ):
+                saw_failed_shared_write = True
+            _log(
                 "tool",
                 parsed.tool,
                 _json({"args": parsed.args, "observation": observation}),
@@ -168,10 +343,10 @@ def run_peer_task(
             "Your previous response was invalid. Respond with exactly one JSON object and no prose. "
             f"Parser error: {parsed.error}"
         )
-        store.record("system", "parser_guidance", guidance)
+        _log("system", "parser_guidance", guidance)
         messages.append({"role": "user", "content": guidance})
 
     fallback = "I could not complete this within my step budget. Please rephrase or split the task."
     scrubbed, _ = scrub_outbound(fallback)
-    store.record("assistant", "peer_reply_raw", fallback)
+    _log("assistant", "peer_reply_raw", fallback)
     return scrubbed

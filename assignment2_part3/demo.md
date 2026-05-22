@@ -101,7 +101,14 @@ RUNPOD_CHAT_PASSWORD=<hub password>
 | T1 — all logs | `docker compose logs -f` | Hub traffic + both agents interleaved, each prefixed by container name. |
 | T2 — alice | `docker attach assignment2_part3-agent-alice-1` | Alice's console. Type `:approve`/`:deny`/`:say` here. |
 | T3 — bob | `docker attach assignment2_part3-agent-bob-1` | Bob's console. Type `:approve`/`:deny`/`:say` here. |
-| T4 — chat | `python tools/chat.py tail --follow` and `chat.py say "..."` | Clean formatted chat log and message input. |
+| T4 — live chat | `python tools/chat.py live --as emil-user` | REPL: incoming hub messages stream in, you type to post. |
+
+`chat.py live` runs a background poller that prints any new hub messages
+above the prompt while the main thread reads your input — same UX as
+Part 2's `Input to: HAL 9000 >` loop. Type `exit` or Ctrl-C to quit.
+
+If you'd rather split posting and reading: `chat.py tail --follow` for a
+read-only stream, plus `chat.py say "..."` from any shell.
 
 Example T1 output:
 ```
@@ -167,8 +174,9 @@ final scrubbed answer is posted.
 
 ## Use cases — concrete demos
 
-Each maps to a Part 3 rubric criterion. Run them against the local hub
-(T1) with the 3-terminal layout described above.
+Each maps to a Part 3 rubric criterion. Type messages at T4's `live`
+prompt (or run `chat.py say` from any shell); watch T1/T2/T3 for the
+expected output.
 
 ### A. Direct mention triggers a reply (P3.1, P3.6)
 
@@ -196,9 +204,8 @@ In T2 (alice's attach terminal):
 :say I'm pausing for a moment, hold any heavy work
 ```
 
-T3 (`chat.py tail`) should show alice's message. T2 will show
-`agent-bob-1  | [hub<-] ...` as bob receives it. This exercises the
-operator-input path without burning LLM tokens.
+T1 will show alice's `[hub->]` post and bob's `[hub<-]` receive. This
+exercises the operator-input path without burning LLM tokens.
 
 ### D. Leak-prevention refusal (P3.2)
 
@@ -237,7 +244,7 @@ While paused, alice's `peer_task.run_peer_task` blocks before any LLM call.
 
 ### G. Local-only bash approval (P3.2 + safety)
 
-Send alice a task that requires a shell action (T3):
+Send alice a task that requires a shell action (T4):
 
 ```bash
 python tools/chat.py say --as emil-user "@alice-swe run ls -la /workspace/alice"
@@ -252,7 +259,8 @@ agent-alice-1  | Type :approve or :deny.
 Switch to T2 (alice's attach terminal) and type `:approve`.
 
 The result is posted to the hub; the approval prompt itself is
-**only visible in T1** — `chat.py tail` in T4 will not show it.
+**only visible in T1/T2** — it never reaches the hub, so T4's `live`
+view will not show it.
 
 ### H. Two-agent collaboration on the same project (P3.1)
 

@@ -1,5 +1,6 @@
 import random
 
+from claims import ClaimRegistry
 from peer import PeerMessage
 import reply_policy
 from reply_policy import should_reply
@@ -23,6 +24,20 @@ def test_direct_mention_display_name_triggers_reply():
 def test_literal_name_triggers_reply():
     d = should_reply(_msg("Alice, this is yours"), "alice", "alice-swe", [], now=1000.0)
     assert d.respond is True
+
+
+def test_other_agent_assignment_with_role_description_does_not_trigger_reply():
+    d = should_reply(
+        _msg(
+            "@bob-swe collaborate on /workspace/shared/calculator.py: "
+            "alice writes add+subtract, bob writes multiply+divide"
+        ),
+        "alice",
+        "alice-swe",
+        [],
+        now=1000.0,
+    )
+    assert d.respond is False
 
 
 def test_coordinator_handoff_triggers_reply():
@@ -236,3 +251,47 @@ def test_broadcast_window_resets_after_window_seconds(monkeypatch):
     )
     assert d.respond is True
     assert "broadcast" in d.reason
+
+
+def test_claim_collision_bypasses_cooldown():
+    """Peer's CLAIM for a path we already self-claimed must override cooldown."""
+
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calc.py")
+
+    incoming = _msg(
+        "CLAIM /workspace/shared/calc.py: I'll add multiply and divide",
+        sender="bob",
+    )
+    # Recent reply 1s ago — would normally trigger cooldown.
+    decision = should_reply(
+        incoming,
+        "alice",
+        "alice-swe",
+        recent_replies=[(999.0, "prev")],
+        now=1000.0,
+        claims=claims,
+    )
+    assert decision.respond is True
+    assert "claim collision" in decision.reason
+
+
+def test_claim_collision_only_fires_on_self_claim():
+    """A peer CLAIM for a path we do not own should not bypass cooldown."""
+
+    claims = ClaimRegistry()  # registry is empty: we own nothing.
+
+    incoming = _msg(
+        "CLAIM /workspace/shared/calc.py: drafting",
+        sender="bob",
+    )
+    decision = should_reply(
+        incoming,
+        "alice",
+        "alice-swe",
+        recent_replies=[(999.5, "prev")],
+        now=1000.0,
+        claims=claims,
+    )
+    assert decision.respond is False
+    assert "cooldown" in decision.reason

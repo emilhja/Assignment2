@@ -315,3 +315,64 @@ def test_replace_text_requires_all_occurrences_for_repeated_text(tmp_path, monke
 
     assert "set all_occurrences to true" in output
     assert target.read_text(encoding="utf-8") == "draft\ndraft\n"
+
+
+def test_create_file_writes_into_shared_workspace(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    output = tools.create_file(str(shared / "calc.py"), "x = 1\n")
+
+    assert output == "Created file in /workspace/shared/calc.py."
+    assert (shared / "calc.py").read_text(encoding="utf-8") == "x = 1\n"
+    assert not (private / "calc.py").exists()
+
+
+def test_create_file_routes_workspace_shared_alias_to_shared_root(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    output = tools.create_file("/workspace/shared/calc.py", "x = 1\n")
+
+    assert output == "Created file in /workspace/shared/calc.py."
+    assert (shared / "calc.py").read_text(encoding="utf-8") == "x = 1\n"
+    assert not (private / "shared" / "calc.py").exists()
+
+
+def test_resolve_workspace_normalizes_bare_workspace_prefix(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    private.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    # The bug from a live session: agent typed "workspace/alice/<file>" with
+    # no leading slash, and the resolver nested it under the private root.
+    bare = str(private).replace("\\", "/").lstrip("/")
+    output = tools.create_file(f"{bare}/calc.py", "ok\n")
+
+    assert "Created file" in output
+    assert (private / "calc.py").read_text(encoding="utf-8") == "ok\n"
+    assert not (private / "alice").exists()
+
+
+def test_create_file_blocks_path_outside_both_roots(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    bob = tmp_path / "bob"
+    private.mkdir()
+    shared.mkdir()
+    bob.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    output = tools.create_file(str(bob / "stolen.py"), "secret")
+
+    assert output.startswith("Edit blocked:")
+    assert not (bob / "stolen.py").exists()

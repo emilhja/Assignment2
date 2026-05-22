@@ -16,6 +16,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from datetime import UTC, datetime
+from typing import Optional
 
 
 class ThreadSafeSessionStore:
@@ -29,19 +30,25 @@ class ThreadSafeSessionStore:
                 created_at TEXT NOT NULL,
                 role TEXT NOT NULL,
                 kind TEXT NOT NULL,
-                content TEXT NOT NULL
+                content TEXT NOT NULL,
+                trace_id TEXT
             )
             """
         )
+        # Idempotent migration for pre-existing DBs created before trace_id.
+        try:
+            self.connection.execute("ALTER TABLE events ADD COLUMN trace_id TEXT")
+        except sqlite3.OperationalError:
+            pass
         self.connection.commit()
         self._lock = threading.Lock()
 
-    def record(self, role: str, kind: str, content: str) -> None:
+    def record(self, role: str, kind: str, content: str, trace_id: Optional[str] = None) -> None:
         timestamp = datetime.now(UTC).isoformat()
         with self._lock:
             self.connection.execute(
-                "INSERT INTO events (created_at, role, kind, content) VALUES (?, ?, ?, ?)",
-                (timestamp, role, kind, content),
+                "INSERT INTO events (created_at, role, kind, content, trace_id) VALUES (?, ?, ?, ?, ?)",
+                (timestamp, role, kind, content, trace_id),
             )
             self.connection.commit()
 

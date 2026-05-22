@@ -32,12 +32,17 @@ class FakeChat:
     def __init__(self, replies):
         self._replies = list(replies)
         self.calls = 0
+        self.messages = []
 
     def __call__(self, messages):
         self.calls += 1
+        self.messages.append(messages)
         if not self._replies:
             return json.dumps({"type": "final", "answer": "no more scripted replies"})
-        return self._replies.pop(0)
+        reply = self._replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
 
 
 def _patch_chat(monkeypatch, fake):
@@ -175,6 +180,39 @@ def test_broadcast_message_triggers_reply(tmp_path, monkeypatch):
     assert any("broadcast" in row for row in decision_rows)
 
 
+def test_followup_receives_recent_group_chat_context(tmp_path, monkeypatch):
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "assigned: alice should we add division-by-zero handling?",
+        })
+        + "\n",
+        json.dumps({"id": "m2", "sender_id": "emil-user", "text": "assigned: alice yes please"})
+        + "\n",
+    ]
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "Would you like me to add division-by-zero handling?",
+        }),
+        json.dumps({"type": "final", "answer": "I will add that handling now."}),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert ctx["fake_chat"].calls == 2
+    second_call = ctx["fake_chat"].messages[1]
+    assert "recent_group_chat_context" in second_call[1]["content"]
+    assert "division-by-zero handling" in second_call[1]["content"]
+    assert "assigned: alice yes please" in second_call[2]["content"]
+
+
 def test_skip_reason_silent_in_stub_mode(tmp_path, monkeypatch, capsys):
     peer_lines = [
         json.dumps({"id": "m1", "sender_id": "bob", "text": "random chatter, no mention"}) + "\n",
@@ -209,3 +247,108 @@ def test_skip_reason_printed_in_runpod_mode(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "[skip]" in captured.out
     assert "not addressed" in captured.out
+
+
+def test_claim_continuation_creates_shared_calculator(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+    monkeypatch.setenv("CLAIM_CONTINUATION_GRACE_SECONDS", "0")
+
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "@alice-swe collaborate on /workspace/shared/calculator.py: alice writes add+subtract",
+        })
+        + "\n",
+    ]
+    calculator = (
+        "def add(a, b):\n"
+        "    return a + b\n\n"
+        "def subtract(a, b):\n"
+        "    return a - b\n\n"
+        "def multiply(a, b):\n"
+        "    raise NotImplementedError\n\n"
+        "def divide(a, b):\n"
+        "    raise NotImplementedError\n"
+    )
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "CLAIM /workspace/shared/calculator.py#add-subtract: Implement add and subtract",
+        }),
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/calculator.py", "content": calculator},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Created /workspace/shared/calculator.py with add and subtract.",
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert len(replies) == 2
+    assert replies[0]["text"].startswith("CLAIM /workspace/shared/calculator.py#add-subtract")
+    assert "Created /workspace/shared/calculator.py" in replies[1]["text"]
+    assert (shared / "calculator.py").read_text(encoding="utf-8") == calculator
+    assert not (private / "calculator.py").exists()
+
+    events = _events(ctx["store"])
+    assert any(kind == "claim_continuation" for _role, kind, _content in events)
+
+
+def test_claim_continuation_llm_failure_does_not_send_false_failure_or_stop_loop(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAIM_CONTINUATION_GRACE_SECONDS", "0")
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "assigned: alice collaborate on /workspace/shared/calculator.py: alice writes add",
+        })
+        + "\n",
+        json.dumps({
+            "id": "m2",
+            "sender_id": "emil-user",
+            "text": "assigned: alice are you still online?",
+        })
+        + "\n",
+    ]
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "CLAIM /workspace/shared/calculator.py#add: Implement add",
+        }),
+        RuntimeError("openai: RateLimitRetryTimeout: stayed rate-limited"),
+        json.dumps({"type": "final", "answer": "Yes, I am still online."}),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert [payload["text"] for payload in replies] == [
+        "CLAIM /workspace/shared/calculator.py#add: Implement add",
+        "Yes, I am still online.",
+    ]
+    assert not any("RateLimitRetryTimeout" in payload["text"] for payload in replies)
+
+    events = _events(ctx["store"])
+    assert any(kind == "claim_continuation" for _role, kind, _content in events)
+    assert any(kind == "llm_failure" and "RateLimitRetryTimeout" in content for _role, kind, content in events)

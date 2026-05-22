@@ -20,6 +20,11 @@ def _bootstrap_env() -> None:
         base.mkdir(parents=True, exist_ok=True)
         os.environ["AGENT_WORKSPACE"] = str(base)
 
+    if not os.environ.get("SHARED_WORKSPACE"):
+        shared = Path(__file__).resolve().parent / "workspace" / "shared"
+        shared.mkdir(parents=True, exist_ok=True)
+        os.environ["SHARED_WORKSPACE"] = str(shared)
+
     data_dir = Path(__file__).resolve().parent / "data"
     data_dir.mkdir(exist_ok=True)
     os.environ.setdefault("AGENT_SESSION_DB", str(data_dir / "session_history.sqlite3"))

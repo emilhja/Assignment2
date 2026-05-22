@@ -36,6 +36,17 @@ class FakeProviderError(Exception):
         self.body = body
 
 
+class FakeRateLimitError(Exception):
+    pass
+
+
+def _rate_limit_error(message="rate limit", retry_after=None):
+    exc = FakeRateLimitError(message)
+    if retry_after is not None:
+        exc.response = SimpleNamespace(headers={"Retry-After": str(retry_after)})
+    return exc
+
+
 def _use_openai_provider(monkeypatch, client):
     monkeypatch.setenv("LLM_PROVIDER_ORDER", "openai")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
@@ -349,3 +360,117 @@ def test_provider_fallback_still_works_after_plain_retry_fails(monkeypatch):
     assert len(groq_completions.calls) == 2
     assert len(openai_completions.calls) == 1
     assert openai_completions.calls[0]["response_format"] == {"type": "json_object"}
+
+
+def test_rate_limited_provider_waits_and_eventually_returns(monkeypatch):
+    client, completions = _client_with(
+        [_rate_limit_error(retry_after=2) for _ in range(7)] + ["ok after wait"]
+    )
+    _use_openai_provider(monkeypatch, client)
+    monkeypatch.setattr(llm_client, "RateLimitError", FakeRateLimitError)
+    monkeypatch.setattr(llm_client.random, "uniform", lambda start, end: 0.25)
+    sleeps = []
+    monkeypatch.setattr(llm_client.time, "sleep", sleeps.append)
+
+    assert llm_client.complete_chat([{"role": "user", "content": "Return JSON"}]) == "ok after wait"
+
+    assert sleeps == [2.25] * 7
+    assert len(completions.calls) == 8
+
+
+def test_rate_limit_retry_wait_uses_groq_body_hint_plus_jitter(monkeypatch):
+    exc = _rate_limit_error(
+        "Error code: 429 - {'error': {'message': 'Rate limit ... "
+        "Please try again in 11.64s. Need more tokens? ...'}}"
+    )
+    monkeypatch.setattr(llm_client.random, "uniform", lambda start, end: 0.36)
+
+    assert llm_client._rate_limit_retry_wait(exc) == 12.5
+
+
+def test_finite_rate_limit_wait_raises_clear_error_after_timeout(monkeypatch):
+    client, completions = _client_with([
+        _rate_limit_error(retry_after=3),
+        _rate_limit_error(retry_after=3),
+    ])
+    _use_openai_provider(monkeypatch, client)
+    monkeypatch.setenv("LLM_RATE_LIMIT_MAX_WAIT_SECONDS", "1")
+    monkeypatch.setattr(llm_client, "RateLimitError", FakeRateLimitError)
+    monkeypatch.setattr(llm_client.random, "uniform", lambda start, end: 0)
+    sleeps = []
+    monkeypatch.setattr(llm_client.time, "sleep", sleeps.append)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        llm_client.complete_chat([{"role": "user", "content": "Return JSON"}])
+
+    message = str(excinfo.value)
+    assert "RateLimitRetryTimeout" in message
+    assert "stayed rate-limited" in message
+    assert sleeps == [1.0]
+    assert len(completions.calls) == 2
+
+
+def test_provider_fallback_still_works_for_non_rate_limit_errors(monkeypatch):
+    groq_client, groq_completions = _client_with([RuntimeError("network unavailable")])
+    openai_client, openai_completions = _client_with(["openai ok"])
+    clients = {
+        "GROQ_API_KEY": groq_client,
+        "OPENAI_API_KEY": openai_client,
+    }
+
+    monkeypatch.setenv("LLM_PROVIDER_ORDER", "groq,openai")
+    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setattr(
+        llm_client,
+        "_client_for_provider",
+        lambda config: clients[config["api_key_env"]],
+    )
+
+    assert llm_client.complete_chat([{"role": "user", "content": "Return JSON"}]) == "openai ok"
+
+    assert len(groq_completions.calls) == 1
+    assert len(openai_completions.calls) == 1
+
+
+def test_retry_after_seconds_uses_response_header():
+    exc = RuntimeError("rate limit")
+    exc.response = SimpleNamespace(headers={"Retry-After": "7.5"})
+    assert llm_client._retry_after_seconds(exc) == 7.5
+
+
+def test_retry_after_seconds_caps_at_max_wait():
+    exc = RuntimeError("rate limit")
+    exc.response = SimpleNamespace(headers={"Retry-After": "9999"})
+    assert llm_client._retry_after_seconds(exc) == llm_client.RATE_LIMIT_MAX_WAIT
+
+
+def test_retry_after_seconds_parses_groq_body_hint():
+    exc = RuntimeError(
+        "Error code: 429 - {'error': {'message': 'Rate limit ... "
+        "Please try again in 11.64s. Need more tokens? ...'}}"
+    )
+    # +0.5s slack so we don't bounce off the same window.
+    assert llm_client._retry_after_seconds(exc) == 12.14
+
+
+def test_retry_after_seconds_falls_back_to_default():
+    exc = RuntimeError("opaque error without hints")
+    assert llm_client._retry_after_seconds(exc) == float(llm_client.RATE_LIMIT_RETRY_WAIT)
+
+
+def test_rate_limit_retry_wait_adds_jitter(monkeypatch):
+    exc = RuntimeError("opaque error without hints")
+    monkeypatch.setattr(llm_client.random, "uniform", lambda start, end: 3.25)
+
+    assert llm_client._rate_limit_retry_wait(exc) == (
+        float(llm_client.RATE_LIMIT_RETRY_WAIT) + 3.25
+    )
+
+
+def test_rate_limit_retry_wait_caps_after_jitter(monkeypatch):
+    exc = RuntimeError("rate limit")
+    exc.response = SimpleNamespace(headers={"Retry-After": "59"})
+    monkeypatch.setattr(llm_client.random, "uniform", lambda start, end: 3)
+
+    assert llm_client._rate_limit_retry_wait(exc) == llm_client.RATE_LIMIT_MAX_WAIT

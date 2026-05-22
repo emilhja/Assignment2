@@ -8,10 +8,13 @@ Rules, evaluated in order:
 
 1. Direct address (`@<id>`, `@<display_name>`, or literal name) → reply.
 2. Coordinator handoff prefix (`assigned: <id>`, `handoff -> <id>`) → reply.
-3. Per-thread cooldown — if this agent replied within COOLDOWN_SECONDS → skip.
-4. Broadcast question to everyone/anyone/all → reply only if this agent has
+3. Claim collision — incoming message contains a peer CLAIM for a path
+   this agent already self-claimed → reply (bypasses cooldown so the
+   tie-break/DEFER line can actually leave).
+4. Per-thread cooldown — if this agent replied within COOLDOWN_SECONDS → skip.
+5. Broadcast question to everyone/anyone/all → reply only if this agent has
    replied fewer than MAX_BROADCAST_REPLIES times in BROADCAST_WINDOW_SECONDS.
-5. Otherwise → skip.
+6. Otherwise → skip.
 """
 
 from __future__ import annotations
@@ -21,6 +24,9 @@ import random
 import re
 import time
 from dataclasses import dataclass
+from typing import Optional
+
+from claims import CLAIM_PATTERN, ClaimRegistry
 
 
 def _env_int(name: str, default: int) -> int:
@@ -55,14 +61,14 @@ class ReplyDecision:
 
 def _mentions(text: str, names: tuple[str, ...]) -> bool:
     lowered = text.lower()
-    for name in names:
-        if not name:
-            continue
-        needle = name.lower()
-        if f"@{needle}" in lowered:
+    agent_id, display_name = names
+    for name in (agent_id, display_name):
+        if name and f"@{name.lower()}" in lowered:
             return True
-        if re.search(rf"(?i)\b{re.escape(name)}\b", text):
-            return True
+    if display_name and re.search(rf"(?i)\b{re.escape(display_name)}\b", text):
+        return True
+    if agent_id and re.search(rf"(?i)^\s*{re.escape(agent_id)}\b\s*[:,\-]", text):
+        return True
     return False
 
 
@@ -84,6 +90,19 @@ def _last_reply_age(recent_replies, now: float) -> float | None:
     return now - recent_replies[-1][0]
 
 
+def _claim_collision(text: str, agent_id: str, claims: Optional[ClaimRegistry]) -> Optional[str]:
+    """Return the contested path if the incoming text races a CLAIM we own."""
+
+    if claims is None or not isinstance(text, str):
+        return None
+    for match in CLAIM_PATTERN.finditer(text):
+        path = match.group("path")
+        existing = claims.lookup(path)
+        if existing is not None and existing.claimant == agent_id:
+            return path
+    return None
+
+
 def should_reply(
     message,
     agent_id: str,
@@ -92,6 +111,7 @@ def should_reply(
     *,
     now: float | None = None,
     rng: random.Random | None = None,
+    claims: Optional[ClaimRegistry] = None,
 ) -> ReplyDecision:
     """Decide whether to reply to a peer message.
 
@@ -118,6 +138,12 @@ def should_reply(
     if _mentions(message.text, names):
         delay = rng.uniform(0.5, 1.5)
         return ReplyDecision(True, "directly addressed", delay_seconds=delay)
+
+    # Claim collision wins over the cooldown gate — otherwise two agents
+    # who emit competing CLAIMs in the same round stay stuck.
+    contested_path = _claim_collision(message.text, agent_id, claims)
+    if contested_path is not None:
+        return ReplyDecision(True, f"claim collision on {contested_path}", delay_seconds=0.0)
 
     last_age = _last_reply_age(recent_replies, now)
     if last_age is not None and last_age < COOLDOWN_SECONDS:

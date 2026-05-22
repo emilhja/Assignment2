@@ -30,6 +30,9 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, IO, Optional
 
+import part2_bridge  # noqa: F401 — sys.path side effect for `colors`
+
+import colors
 from budget import Budget
 from peer import scrub_outbound
 
@@ -85,12 +88,15 @@ class ConsoleControl:
         response: queue.Queue = queue.Queue(maxsize=1)
         with self._approval_lock:
             self._pending = BashApproval(command=command, response=response)
-        self._print(f"\n[approval needed] bash> {command}\nType :approve or :deny.")
+        tag = colors.paint("[approval needed]", colors.BOLD, colors.YELLOW)
+        prompt = colors.paint("bash>", colors.BOLD)
+        hint = colors.dim("Type :approve or :deny.")
+        self._print(f"\n{tag} {prompt} {command}\n{hint}")
         try:
             approved = response.get(timeout=timeout)
         except queue.Empty:
             approved = False
-            self._print("[approval timed out] command denied.")
+            self._print(colors.paint("[approval timed out] command denied.", colors.RED))
         finally:
             with self._approval_lock:
                 self._pending = None
@@ -107,7 +113,7 @@ class ConsoleControl:
         with self._approval_lock:
             pending = self._pending
         if pending is None:
-            self._print("[no pending bash approval]")
+            self._print(colors.dim("[no pending bash approval]"))
             return False
         try:
             pending.response.put_nowait(approved)
@@ -135,24 +141,24 @@ class ConsoleControl:
         elif cmd == "pause":
             self.budget.pause()
             self.budget.save()
-            self._print("[budget paused]")
+            self._print(colors.paint("[budget paused]", colors.YELLOW))
         elif cmd == "resume":
             self.budget.resume()
             self.budget.save()
-            self._print("[budget resumed]")
+            self._print(colors.paint("[budget resumed]", colors.GREEN))
         elif cmd == "approve":
             if self._resolve_pending(True):
-                self._print("[approved]")
+                self._print(colors.paint("[approved]", colors.BOLD, colors.GREEN))
         elif cmd == "deny":
             if self._resolve_pending(False):
-                self._print("[denied]")
+                self._print(colors.paint("[denied]", colors.BOLD, colors.RED))
         elif cmd == "say":
             self._cmd_say(rest)
         elif cmd == "stop":
-            self._print("[stop requested]")
+            self._print(colors.paint("[stop requested]", colors.YELLOW))
             self.stop_event.set()
         else:
-            self._print(f"[unknown command: {stripped}]\n{HELP_TEXT}")
+            self._print(f"{colors.paint('[unknown command: ' + stripped + ']', colors.RED)}\n{HELP_TEXT}")
 
     def _cmd_say(self, text: str) -> None:
         message = text.strip()

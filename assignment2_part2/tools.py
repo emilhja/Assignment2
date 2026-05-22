@@ -35,12 +35,65 @@ def workspace_root() -> Path:
     return _default_workspace_root()
 
 
+def shared_workspace_root() -> Path | None:
+    configured = os.getenv("SHARED_WORKSPACE")
+    if not configured:
+        return None
+    return Path(configured).resolve()
+
+
+def _allowed_roots() -> list[Path]:
+    roots = [workspace_root()]
+    shared = shared_workspace_root()
+    if shared is not None and shared != roots[0]:
+        roots.append(shared)
+    return roots
+
+
 def _resolve_workspace_path(path_text: str) -> Path:
     if not isinstance(path_text, str) or not path_text.strip():
         raise ValueError("path must be a non-empty string")
 
-    root = workspace_root()
+    roots = _allowed_roots()
+    private_root = roots[0]
     normalized_text = path_text.strip().replace("\\", "/")
+
+    # Agents often drop the leading slash and type "workspace/...". Treat
+    # that as if it were the absolute "/workspace/..." so paths land at the
+    # intended location instead of nesting under the private root.
+    if normalized_text == "workspace" or normalized_text.startswith("workspace/"):
+        normalized_text = "/" + normalized_text
+
+    shared = shared_workspace_root()
+    if shared is not None:
+        if normalized_text == "/workspace/shared":
+            return shared
+        if normalized_text.startswith("/workspace/shared/"):
+            relative_text = normalized_text[len("/workspace/shared/") :]
+            candidate = (shared / relative_text).resolve()
+            try:
+                candidate.relative_to(shared)
+                return candidate
+            except ValueError:
+                pass
+
+    raw_path = Path(normalized_text)
+
+    # Literal interpretation first: if the path already resolves inside an
+    # allowed root, accept it as-is. This routes "/workspace/shared/..." to
+    # the shared root when SHARED_WORKSPACE is set.
+    if raw_path.is_absolute():
+        candidate = raw_path.resolve()
+        for root in roots:
+            try:
+                candidate.relative_to(root)
+                return candidate
+            except ValueError:
+                continue
+
+    # Legacy fallback: strip "/workspace/" so the agent's mental "/workspace"
+    # maps to its private workspace root. Required when AGENT_WORKSPACE is
+    # not literally "/workspace" (e.g., in tests or local dev).
     if normalized_text == "/workspace":
         normalized_text = "."
     elif normalized_text.startswith("/workspace/"):
@@ -50,21 +103,37 @@ def _resolve_workspace_path(path_text: str) -> Path:
     if raw_path.is_absolute():
         candidate = raw_path.resolve()
     else:
-        candidate = (root / raw_path).resolve()
+        candidate = (private_root / raw_path).resolve()
 
-    try:
-        candidate.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"path must stay inside workspace: {root}") from exc
-    return candidate
+    for root in roots:
+        try:
+            candidate.relative_to(root)
+            return candidate
+        except ValueError:
+            continue
+
+    allowed = ", ".join(str(r) for r in roots)
+    raise ValueError(f"path must stay inside an allowed workspace ({allowed})")
 
 
 def _display_workspace_path(path: Path) -> str:
+    resolved = path.resolve()
+    shared = shared_workspace_root()
+    if shared is not None:
+        try:
+            relative = resolved.relative_to(shared)
+        except ValueError:
+            pass
+        else:
+            if str(relative) == ".":
+                return "/workspace/shared"
+            return "/workspace/shared/" + relative.as_posix()
+
     root = workspace_root()
     try:
-        relative = path.resolve().relative_to(root)
+        relative = resolved.relative_to(root)
     except ValueError:
-        return str(path)
+        return str(resolved)
     if str(relative) == ".":
         return "/workspace"
     return "/workspace/" + relative.as_posix()

@@ -18,6 +18,9 @@ from collections import deque
 from pathlib import Path
 from typing import IO, Any, Deque, Iterable, Optional, Protocol
 
+import part2_bridge  # noqa: F401 — sys.path side effect for `colors`
+
+import colors
 from peer import PeerMessage
 
 
@@ -175,6 +178,9 @@ class RunPodTransport:
         except Exception:
             pass
 
+    def _warn(self, message: str) -> None:
+        self._echo(f"{colors.ts()} {colors.paint(message, colors.RED)}")
+
     def _throttle(self) -> None:
         gap = self._clock() - self._last_request_ts
         if gap < HUB_MIN_REQUEST_GAP:
@@ -213,18 +219,18 @@ class RunPodTransport:
                 timeout=10,
             )
         except Exception as exc:
-            self._echo(f"[hub!] recv error: {exc}")
+            self._warn(f"[hub!] recv error: {exc}")
             self._sleep(2.0)
             return None
         self._last_poll_ts = self._clock()
 
         status = getattr(resp, "status_code", 0)
         if status == 429:
-            self._echo("[hub!] recv rate-limited (429), backing off")
+            self._warn("[hub!] recv rate-limited (429), backing off")
             self._sleep(4.0)
             return None
         if status == 401:
-            self._echo("[hub!] recv auth failed (401) — check RUNPOD_CHAT_PASSWORD")
+            self._warn("[hub!] recv auth failed (401) — check RUNPOD_CHAT_PASSWORD")
             self._sleep(4.0)
             return None
         if status != 200:
@@ -233,14 +239,14 @@ class RunPodTransport:
                 body = resp.text[:200] if hasattr(resp, "text") else str(resp.json())[:200]
             except Exception:
                 pass
-            self._echo(f"[hub!] recv status={status} body={body}")
+            self._warn(f"[hub!] recv status={status} body={body}")
             self._sleep(2.0)
             return None
 
         try:
             data = resp.json()
         except Exception as exc:
-            self._echo(f"[hub!] recv json error: {exc}")
+            self._warn(f"[hub!] recv json error: {exc}")
             return None
 
         messages = data.get("messages") if isinstance(data, dict) else None
@@ -277,7 +283,10 @@ class RunPodTransport:
 
         if first_returned is not None:
             snippet = first_returned.text[:120].replace("\n", " ")
-            self._echo(f"[hub<-] seq={first_returned.id} {first_returned.sender_id}: {snippet}")
+            self._echo(
+                f"{colors.ts()} {colors.dim('[hub<-]')} "
+                f"{colors.agent_label(first_returned.sender_id)}: {snippet}"
+            )
         return first_returned
 
     def send(self, text: str) -> None:
@@ -299,18 +308,16 @@ class RunPodTransport:
                 timeout=10,
             )
         except Exception as exc:
-            self._echo(f"[hub!] send error: {exc}")
+            self._warn(f"[hub!] send error: {exc}")
             return
 
         status = getattr(resp, "status_code", 0)
         if status == 200:
-            seq = "?"
-            try:
-                seq = str(resp.json().get("seq", "?"))
-            except Exception:
-                pass
             snippet = payload_text[:120].replace("\n", " ")
-            self._echo(f"[hub->] seq={seq} {self.agent_name}: {snippet}")
+            self._echo(
+                f"{colors.ts()} {colors.dim('[hub->]')} "
+                f"{colors.agent_label(self.agent_name)}: {snippet}"
+            )
             return
 
         body = ""
@@ -318,7 +325,7 @@ class RunPodTransport:
             body = resp.text[:200] if hasattr(resp, "text") else str(resp.json())[:200]
         except Exception:
             pass
-        self._echo(f"[hub!] send failed status={status} body={body}")
+        self._warn(f"[hub!] send failed status={status} body={body}")
 
     def close(self) -> None:
         self._closed = True

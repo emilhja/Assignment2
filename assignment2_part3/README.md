@@ -60,6 +60,55 @@ narrower follow-up command instead of guessing.
 
 ---
 
+## Coordination & observability
+
+Two pieces of plumbing make joint work easier to drive and to debug
+after the fact.
+
+### Claim / defer protocol (shared writes)
+
+Each agent runs an in-process `ClaimRegistry` (`claims.py`) that watches
+every chat message for `CLAIM` and `RELEASE` markers and gates the
+write tools (`create_file`, `edit_section`, `replace_text`) when they
+target a `/workspace/shared/<path>` already claimed by a peer.
+
+Protocol the agents are taught in `system_prompt.txt`:
+
+1. Before writing a shared file, post one line on its own:
+   `CLAIM /workspace/shared/<path>: <one-line reason>`.
+2. If a peer's claim already covers your target, reply
+   `DEFER to @<claimant>` and offer review instead of writing.
+3. When the joint file is finished, post
+   `RELEASE /workspace/shared/<path>`.
+
+If the LLM tries to write anyway, the tool comes back with
+`refused: deferred: ...` and the agent is told to post a DEFER line
+and stop. Claims expire after 5 minutes so a crashed agent does not
+freeze the path forever.
+
+### Cross-agent audit (`tools/audit.py`)
+
+Every event a peer turn produces (LLM raw JSON, tool observations,
+claim observations, budget hits, scrubbed outbound text) is tagged
+with a `trace_id` equal to the inbound hub `message.id`. The same
+trace_id appears in every agent's SQLite log, so one hub interaction
+can be replayed across all agents.
+
+```bash
+# Run from assignment2_part3/. The CLI is read-only — it doesn't
+# need to be running for the agents to log.
+python tools/audit.py agents            # list per-agent SQLite files
+python tools/audit.py traces -n 10      # recent trace_ids, summary
+python tools/audit.py trace <trace_id>  # full replay, interleaved by ts
+python tools/audit.py tail --agent alice --kind tool   # filter feed
+```
+
+Useful kinds to grep for: `claim_observed`, `claim_self`,
+`claim_block`, `peer_refusal`, `peer_refusal_tool_args`,
+`budget_exceeded`, `tool`, `raw_json`.
+
+---
+
 ## How to interact with them
 
 Three modes, increasing in realism:
@@ -94,22 +143,27 @@ chat with each other and with you.
 **4-terminal setup** — hub runs inside Docker, no separate hub process needed:
 
 ```bash
-# Terminal 1 — start everything (hub + both agents) and watch all output
+# T1 — bring the stack up, then watch all logs (hub + both agents)
 cd assignment2_part3
 docker compose up -d
 docker compose logs -f
 
-# Terminal 2 — alice console (approve bash commands, send :say)
+# T2 — alice console (approve bash commands, send :say)
 docker attach assignment2_part3-agent-alice-1
 
-# Terminal 3 — bob console (approve bash commands, send :say)
+# T3 — bob console (approve bash commands, send :say)
 docker attach assignment2_part3-agent-bob-1
 
-# Terminal 4 — send messages and watch the clean chat log
-python tools/chat.py tail --follow
-python tools/chat.py say --as emil-user "@alice-swe please create utils.py with an add(a,b) function"
-python tools/chat.py say --as emil-user "@bob-swe please add multiply(a,b) to utils.py"
+# T4 — live chat: stream incoming + type to send (REPL, similar to Part 2)
+python tools/chat.py live --as emil-user
+# emil-user> @alice-swe please create utils.py with an add(a,b) function
+# emil-user> @bob-swe please add multiply(a,b) to utils.py
 ```
+
+`live` runs a poller in the background that prints any new hub messages
+above the prompt, while you type commands at the `emil-user>` line — same
+feel as Part 2's REPL. Use `say` / `tail --follow` if you'd rather have
+posting and reading in separate shells.
 
 The `local-hub` service is defined in `docker-compose.yml` alongside the agents, so
 `docker compose logs -f` shows all three containers in one stream:
@@ -133,6 +187,7 @@ To point at the live TH25 hub instead, set `RUNPOD_CHAT_URL` and
 |---|---|
 | `chat.py say "<text>"` | Post one message. `--as <name>` to spoof a sender. |
 | `chat.py tail [--follow]` | Stream the conversation; `--follow` keeps watching. |
+| `chat.py live` | REPL: stream incoming + send in one shell (Part 2 feel). |
 | `chat.py stats` | Per-agent message counts. |
 
 It reads `LOCAL_HUB_URL`, `LOCAL_HUB_PASSWORD`, `LOCAL_HUB_USER` from
@@ -253,12 +308,14 @@ scrubbed answer is posted.
 | Budget gate | `Budget.permit` (`budget.py:84-106`) | Rate / token-cap exceeded → no API call. |
 | Reply gate | `reply_policy.should_reply` | Off-topic / cooldown / broadcast back-off → no API call. |
 | Workspace sandbox | `AGENT_WORKSPACE=workspace/<AGENT_ID>` | All tool I/O confined to one directory per agent. |
+| Shared-write claim gate | `peer_task._maybe_claim_block` + `claims.ClaimRegistry` | Double-write on `/workspace/shared/<path>` when a peer already claimed it. |
 
 ---
 
 ## Quick demos by rubric criterion
 
-Each maps to a Part 3 criterion. Run with the 4-terminal layout above.
+Each maps to a Part 3 criterion. Run with the 4-terminal layout above
+(send `chat.py say` commands from T4, or type them at the `live` prompt).
 
 | Demo | Command | What to watch for |
 |---|---|---|
@@ -307,10 +364,12 @@ assignment2_part3/
 ├─ config/
 │  ├─ system_prompt.txt       loaded by group_chat.load_system_prompt
 │  └─ cooperation_norms.md    editable per session
+├─ claims.py             in-process CLAIM/RELEASE registry for shared writes
 ├─ tools/
 │  ├─ local_hub.py            mock TH25 hub for offline development
-│  └─ chat.py                 REST client (say / tail / stats)
-├─ tests/                pytest suite (93 tests)
+│  ├─ chat.py                 REST client (say / tail / stats)
+│  └─ audit.py                cross-agent SQLite log inspector (read-only)
+├─ tests/                pytest suite (101 tests)
 ├─ workspace/<AGENT_ID>/ each agent's isolated workspace
 └─ data/                 budget_<id>.json, session_history.sqlite3, seen_messages_*.json
 ```
@@ -350,7 +409,7 @@ One-line responsibilities:
 ## Testing
 
 ```bash
-python -m pytest assignment2_part3 -q     # Part 3 suite (93 tests)
+python -m pytest assignment2_part3 -q     # Part 3 suite (101 tests)
 python -m pytest assignment2_part2 -q     # Part 2 suite (95 tests)
 ```
 

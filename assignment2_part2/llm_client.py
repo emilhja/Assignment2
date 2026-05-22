@@ -1,13 +1,84 @@
 import ast
 import json
 import os
+import random
 import re
+import sys
+import time
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
+
+import colors
 
 
 DEFAULT_PROVIDER_ORDER = "groq,openai"
+RATE_LIMIT_RETRY_WAIT = 10  # fallback when the provider gives no hint
+RATE_LIMIT_MAX_WAIT = 60    # cap any single sleep
+RATE_LIMIT_JITTER_MAX = 5   # spread agents across the reset window
+DEFAULT_RATE_LIMIT_TOTAL_WAIT = 0  # 0 means wait indefinitely
+
+RETRY_AFTER_BODY_PATTERN = re.compile(r"try again in\s+([\d.]+)\s*s", re.IGNORECASE)
+
+
+class RateLimitRetryTimeout(RuntimeError):
+    """Raised only when a configured finite rate-limit wait budget is exhausted."""
+
+
+def _env_nonnegative_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return float(default)
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return float(default)
+
+
+def _rate_limit_total_wait_seconds() -> float:
+    return _env_nonnegative_float(
+        "LLM_RATE_LIMIT_MAX_WAIT_SECONDS",
+        DEFAULT_RATE_LIMIT_TOTAL_WAIT,
+    )
+
+
+def _retry_after_seconds(exc: Exception) -> float:
+    """Best-effort wait suggestion from a RateLimitError.
+
+    Prefers the Retry-After response header. Falls back to scraping the
+    provider's "try again in 11.64s" hint out of the exception text. If
+    neither is available, uses the default backoff. The result is always
+    clamped to RATE_LIMIT_MAX_WAIT so a misreported hint cannot hang the
+    agent for minutes.
+    """
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        headers = getattr(response, "headers", None) or {}
+        for key in ("retry-after", "Retry-After"):
+            raw = headers.get(key) if hasattr(headers, "get") else None
+            if raw:
+                try:
+                    return min(float(raw), RATE_LIMIT_MAX_WAIT)
+                except (TypeError, ValueError):
+                    pass
+
+    match = RETRY_AFTER_BODY_PATTERN.search(str(exc))
+    if match:
+        try:
+            # Add 0.5s slack so we cross the reset boundary cleanly.
+            return min(float(match.group(1)) + 0.5, RATE_LIMIT_MAX_WAIT)
+        except ValueError:
+            pass
+
+    return float(RATE_LIMIT_RETRY_WAIT)
+
+
+def _rate_limit_retry_wait(exc: Exception) -> float:
+    wait = _retry_after_seconds(exc)
+    if RATE_LIMIT_JITTER_MAX > 0:
+        wait += random.uniform(0, RATE_LIMIT_JITTER_MAX)
+    return min(wait, RATE_LIMIT_MAX_WAIT)
 
 
 PROVIDERS = {
@@ -55,8 +126,8 @@ def _provider_order():
 def _client_for_provider(config):
     api_key = os.getenv(config["api_key_env"])
     if config["base_url"]:
-        return OpenAI(api_key=api_key, base_url=config["base_url"])
-    return OpenAI(api_key=api_key)
+        return OpenAI(api_key=api_key, base_url=config["base_url"], max_retries=0)
+    return OpenAI(api_key=api_key, max_retries=0)
 
 
 def _looks_like_json_mode_rejection(exc):
@@ -220,6 +291,38 @@ def _create_completion(client, model, messages, *, use_json_mode):
     return client.chat.completions.create(**kwargs)
 
 
+def _create_with_rate_limit_retry(client, model, messages, *, use_json_mode, provider_name):
+    attempts = 0
+    waited = 0.0
+    max_total_wait = _rate_limit_total_wait_seconds()
+
+    while True:
+        try:
+            return _create_completion(client, model, messages, use_json_mode=use_json_mode)
+        except RateLimitError as exc:
+            attempts += 1
+            wait = _rate_limit_retry_wait(exc)
+            if max_total_wait > 0:
+                remaining = max_total_wait - waited
+                if remaining <= 0:
+                    raise RateLimitRetryTimeout(
+                        f"{provider_name} stayed rate-limited after waiting "
+                        f"{waited:.1f}s (limit {max_total_wait:.1f}s)"
+                    ) from exc
+                wait = min(wait, remaining)
+            line = (
+                f"[llm] {provider_name} rate-limited "
+                f"(attempt {attempts}); waiting {wait:.1f}s"
+            )
+            print(
+                f"{colors.ts()} {colors.paint(line, colors.DIM, colors.YELLOW)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(wait)
+            waited += wait
+
+
 def complete_chat(messages):
     errors = []
 
@@ -233,11 +336,12 @@ def complete_chat(messages):
         model = os.getenv(config["model_env"], config["default_model"])
 
         try:
-            response = _create_completion(
+            response = _create_with_rate_limit_retry(
                 client,
                 model,
                 messages,
                 use_json_mode=True,
+                provider_name=provider_name,
             )
         except Exception as exc:
             recovered = _failed_generation_json(exc)
@@ -249,12 +353,13 @@ def complete_chat(messages):
                 continue
 
             try:
-                response = _create_completion(
+                response = _create_with_rate_limit_retry(
                     client,
                     model,
                     messages,
-                use_json_mode=False,
-            )
+                    use_json_mode=False,
+                    provider_name=provider_name,
+                )
             except Exception as retry_exc:
                 recovered = _failed_generation_json(retry_exc)
                 if recovered:
