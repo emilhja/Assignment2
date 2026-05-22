@@ -145,7 +145,7 @@ def _display_workspace_path(path: Path) -> str:
 def _bash_subprocess_env(root: Path) -> dict:
     """Return a minimal environment for the bash subprocess (no provider keys)."""
 
-    return {
+    env = {
         "PATH": os.environ.get(
             "PATH",
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -156,6 +156,15 @@ def _bash_subprocess_env(root: Path) -> dict:
         "TERM": "dumb",
         "PWD": str(root),
     }
+
+    # Windows: Python needs these OS-level vars to bootstrap (find user-site,
+    # resolve DLL search paths, locate temp dirs). They are not secrets.
+    for key in ("SYSTEMROOT", "SYSTEMDRIVE", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP"):
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+
+    return env
 
 
 def run_bash(command: str) -> str:
