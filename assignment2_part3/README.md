@@ -46,6 +46,11 @@ narrower follow-up command instead of guessing.
   immediately, per-thread cooldown silences chatter after a recent
   reply, and broadcasts (`everyone`, `anyone`, `alla`, `någon`, …) are
   capped at one reply per 300-second window per agent.
+- **Deterministic coordinator hints.** Common prompts such as
+  `alice writes add+subtract, bob writes multiply + division` are parsed
+  before the LLM call. Each mentioned agent receives authoritative runtime
+  guidance for only its own shared-file scope, so Bob should not claim
+  Alice's `#add-subtract` work.
 - **Budget gating.** Every LLM call passes through `Budget.permit`
   first. Three caps are enforced on a sliding 60-second window:
   tokens-per-minute, requests-per-minute, and a lifetime token total.
@@ -256,6 +261,10 @@ written to `data/budget_<AGENT_ID>.json` so a restart preserves it.
 - `[say scrubbed: [...]]` — operator's `:say` text had credentials
   redacted before posting.
 
+`[hub<-]` / `[hub->]` lines truncate the printed snippet to 120 chars by
+default. Set `HUB_LOG_SNIPPET_CHARS` in `.env` to a different number, or
+`0` to print the full message.
+
 ### Approving a bash command
 
 When the model proposes a bash command, the local terminal prints:
@@ -294,7 +303,7 @@ scrubbed answer is posted.
 | `RUNPOD_CHAT_URL` | *(empty)* | Hub endpoint (required when `AGENT_MODE=runpod`). |
 | `RUNPOD_CHAT_PASSWORD` | *(empty)* | Hub password. `RUNPOD_CHAT_TOKEN` accepted as fallback. |
 | `RUNPOD_CHAT_POLL_INTERVAL` | `4` | Seconds between GETs (hub rate-limits at 1 req/s). |
-| `LLM_PROVIDER_ORDER` | `groq,openai` | Forwarded to Part 2's `llm_client`. |
+| `LLM_PROVIDER_ORDER` | `groq,openai` | Forwarded to Part 2's `llm_client`. Local Docker demos should prefer `local,groq` to avoid visible Groq rate-limit stalls. |
 | `GROQ_API_KEY` / `OPENAI_API_KEY` | *(empty)* | Required when using the hosted Groq/OpenAI providers. |
 | `GROQ_MODEL` | `llama-3.1-8b-instant` | Model id for Groq. |
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model id for OpenAI. |
@@ -317,6 +326,14 @@ For Docker agents on Windows/Mac, the containers usually need the host alias:
 LLM_PROVIDER_ORDER=local
 LOCAL_LLM_BASE_URL=http://host.docker.internal:8080
 LOCAL_HUB_PORT=8090
+```
+
+For the two-agent Docker demo, keep Bob local-first unless you are testing
+cloud-provider fallback:
+
+```env
+ALICE_LLM_PROVIDER_ORDER=local
+BOB_LLM_PROVIDER_ORDER=local,groq
 ```
 
 ---
@@ -382,6 +399,7 @@ assignment2_part3/
 ├─ budget.py             rate limit + token cap + persistence
 ├─ peer.py               PeerMessage + refusal + scrubber
 ├─ reply_policy.py       should_reply gate (pure function)
+├─ coordination.py        parses common coordinator assignment/handoff hints
 ├─ transport.py          Transport protocol + StubTransport + RunPodTransport
 ├─ console_control.py    background stdin reader for operator commands
 ├─ thread_safe_store.py  SQLite log usable from console + main threads
@@ -418,6 +436,8 @@ One-line responsibilities:
 - **`reply_policy.py`** — `should_reply(message, agent_id, display_name,
   recent_replies) -> ReplyDecision`. Pure function. English + Swedish
   broadcast keywords. No LLM cost.
+- **`coordination.py`** — parses simple multi-agent assignment and handoff
+  wording into runtime guidance before the LLM sees the turn.
 - **`transport.py`** — `Transport` Protocol; `StubTransport` (stdin/stdout
   JSON lines); `RunPodTransport` for the live hub; `_validate_hub_name`
   rejects placeholder names. Seen-message dedup persisted to JSON.

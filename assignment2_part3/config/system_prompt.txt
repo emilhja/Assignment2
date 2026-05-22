@@ -16,6 +16,7 @@ Available tools:
 - create_file: create one new file inside the workspace without shell redirection. Args: {"path": "/workspace/file.txt", "content": "...", "overwrite": false}.
 - edit_section: replace one exact whole-line section in one workspace file. Args: {"path": "...", "old_text": "...", "new_text": "..."}.
 - replace_text: replace one or all exact whole-line text matches in one workspace file. Args: {"path": "...", "old_text": "...", "new_text": "...", "all_occurrences": true_or_false}.
+- run_tests: run pytest against one workspace file or directory. Args: {"path": "/workspace/shared/test_calculator.py"}. Use this to verify a test file passes after you create or edit it. pytest is preinstalled.
 
 Tool output is truncated to 4000 characters. If output is truncated, ask for narrower follow-up commands instead of assuming unseen content.
 

@@ -122,6 +122,22 @@ HUB_MIN_REQUEST_GAP = 1.0  # hub enforces 1 req/sec per agent name
 FORBIDDEN_HUB_NAMES = {"my-agent", "my_agent", "agent", "test", "bot", "local"}
 
 
+def _log_snippet(text: str) -> str:
+    """Trim `text` for `[hub<-]`/`[hub->]` console lines.
+
+    Length is controlled by `HUB_LOG_SNIPPET_CHARS` (default 120). Set to 0
+    to disable truncation entirely.
+    """
+    try:
+        limit = int(os.environ.get("HUB_LOG_SNIPPET_CHARS", "120"))
+    except ValueError:
+        limit = 120
+    snippet = text.replace("\n", " ")
+    if limit <= 0:
+        return snippet
+    return snippet[:limit]
+
+
 class RunPodTransport:
     """REST client for the TH25 hub (`th25-hub-connection.md`).
 
@@ -282,7 +298,7 @@ class RunPodTransport:
                     self._buffer.append(msg)
 
         if first_returned is not None:
-            snippet = first_returned.text[:120].replace("\n", " ")
+            snippet = _log_snippet(first_returned.text)
             self._echo(
                 f"{colors.ts()} {colors.dim('[hub<-]')} "
                 f"{colors.agent_label(first_returned.sender_id)}: {snippet}"
@@ -313,7 +329,7 @@ class RunPodTransport:
 
         status = getattr(resp, "status_code", 0)
         if status == 200:
-            snippet = payload_text[:120].replace("\n", " ")
+            snippet = _log_snippet(payload_text)
             self._echo(
                 f"{colors.ts()} {colors.dim('[hub->]')} "
                 f"{colors.agent_label(self.agent_name)}: {snippet}"

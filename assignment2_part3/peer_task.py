@@ -271,6 +271,7 @@ def run_peer_task(
     recent_context: Optional[list[dict[str, str]]] = None,
     absorb_claims: bool = True,
     collision: Optional[CollisionInfo] = None,
+    runtime_guidance: Optional[list[str]] = None,
 ) -> str:
     # Late binding so monkey-patching `peer_task.complete_chat_with_metadata`
     # in tests works.
@@ -354,7 +355,13 @@ def run_peer_task(
         guidance_text = _mutual_defer_guidance_text(self_id, message.sender_id)
         _log("system", "mutual_defer_injection", guidance_text)
         messages.append(_runtime_guidance_message(guidance_text))
+    for guidance_text in runtime_guidance or []:
+        if not guidance_text:
+            continue
+        _log("system", "runtime_guidance_injection", guidance_text)
+        messages.append(_runtime_guidance_message(guidance_text))
 
+    empty_streak = 0
     for step in range(1, MAX_STEPS + 1):
         estimate = estimate_tokens(_json({"messages": messages}))
         try:
@@ -372,6 +379,33 @@ def run_peer_task(
         _log("assistant", "raw_json", raw_response, provider=provider, model=model)
         if budget_save_event is not None:
             budget_save_event.set()
+
+        if not (raw_response or "").strip():
+            empty_streak += 1
+            # Empty responses waste steps and don't help the model recover; bail
+            # after two in a row with a clearer reason than "step budget".
+            if empty_streak >= 2:
+                reason = (
+                    f"model returned empty response {empty_streak} times in a row "
+                    "(likely truncated output or token cap)"
+                )
+                _log("system", "empty_response_giveup", reason)
+                fallback = (
+                    "I had to stop: the model returned empty replies repeatedly. "
+                    "Try again, shorten the request, or raise LLM_MAX_TOKENS."
+                )
+                scrubbed, _ = scrub_outbound(fallback)
+                _log("assistant", "peer_reply_raw", fallback)
+                return scrubbed
+            # Don't pollute history with the empty turn; just re-prompt.
+            guidance = (
+                "Your previous response was empty. Respond with exactly one JSON "
+                "object and no prose."
+            )
+            _log("system", "parser_guidance", guidance)
+            messages.append({"role": "user", "content": guidance})
+            continue
+        empty_streak = 0
 
         messages.append({"role": "assistant", "content": raw_response})
         parsed = parse_response(raw_response, allowed_tools=TOOL_REGISTRY.keys())

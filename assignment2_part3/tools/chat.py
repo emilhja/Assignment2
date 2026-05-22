@@ -102,9 +102,20 @@ def cmd_say(args, base: str, password: str) -> int:
         {"agent_name": args.as_, "content": text, "password": password},
     )
     if data.get("status") == "ok":
-        print(f"[hub->] seq={data.get('seq')} {args.as_}: {text[:120]}")
+        print(f"[hub->] seq={data.get('seq')} {args.as_}: {_log_snippet(text)}")
         return 0
     return 1
+
+
+def _log_snippet(text: str) -> str:
+    """Trim `say` echo. `HUB_LOG_SNIPPET_CHARS=0` disables truncation."""
+    try:
+        limit = int(os.environ.get("HUB_LOG_SNIPPET_CHARS", "120"))
+    except ValueError:
+        limit = 120
+    if limit <= 0:
+        return text
+    return text[:limit]
 
 
 def _short_time(ts: str) -> str:

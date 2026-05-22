@@ -213,6 +213,84 @@ def test_followup_receives_recent_group_chat_context(tmp_path, monkeypatch):
     assert "assigned: alice yes please" in second_call[2]["content"]
 
 
+def test_multi_agent_assignment_injects_own_scope_guidance(tmp_path, monkeypatch):
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": (
+                "@alice-swe and @bob-swe collaborate on /workspace/shared/calculator.py: "
+                "alice writes add+subtract, bob writes multiply + division"
+            ),
+        })
+        + "\n",
+    ]
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "I will handle the add and subtract scope.",
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(2.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert ctx["fake_chat"].calls == 1
+    contents = [message["content"] for message in ctx["fake_chat"].messages[0]]
+    runtime_msg = next(content for content in contents if "Coordinator assignment detected" in content)
+    assert "Your assigned work: add+subtract" in runtime_msg
+    assert "/workspace/shared/calculator.py#add-subtract" in runtime_msg
+    assert "@bob -> multiply + division (#multiply-division)" in runtime_msg
+
+
+def test_takeover_injects_handoff_guidance_from_recent_assignment(tmp_path, monkeypatch):
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": (
+                "@alice-swe and @bob-swe collaborate on /workspace/shared/calculator.py: "
+                "alice writes add+subtract, bob writes multiply + division"
+            ),
+        })
+        + "\n",
+        json.dumps({
+            "id": "m2",
+            "sender_id": "emil-user",
+            "text": "@alice-swe can you take over from @bob-swe instead",
+        })
+        + "\n",
+    ]
+    scripted = [
+        json.dumps({"type": "final", "answer": "I will handle add and subtract."}),
+        json.dumps({
+            "type": "final",
+            "answer": (
+                "@bob-swe please RELEASE /workspace/shared/calculator.py#multiply-division "
+                "so I can claim it."
+            ),
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(2.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert ctx["fake_chat"].calls == 2
+    second_call = ctx["fake_chat"].messages[1]
+    contents = [message["content"] for message in second_call]
+    runtime_msg = next(content for content in contents if "Handoff request detected" in content)
+    assert "/workspace/shared/calculator.py#multiply-division" in runtime_msg
+    assert "RELEASE /workspace/shared/calculator.py#multiply-division" in runtime_msg
+
+
 def test_skip_reason_silent_in_stub_mode(tmp_path, monkeypatch, capsys):
     peer_lines = [
         json.dumps({"id": "m1", "sender_id": "bob", "text": "random chatter, no mention"}) + "\n",

@@ -439,6 +439,56 @@ def test_read_file_via_tool_registry(tmp_path, monkeypatch):
     assert "hello" in output
 
 
+def test_run_tests_executes_passing_pytest_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    (tmp_path / "test_demo.py").write_text(
+        "def test_ok():\n    assert 1 + 1 == 2\n",
+        encoding="utf-8",
+    )
+
+    output = tools.run_tests("/workspace/test_demo.py")
+
+    assert "1 passed" in output
+    assert not output.startswith("pytest exited")
+
+
+def test_run_tests_reports_failure_with_exit_code(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    (tmp_path / "test_fail.py").write_text(
+        "def test_bad():\n    assert 0\n",
+        encoding="utf-8",
+    )
+
+    output = tools.run_tests("/workspace/test_fail.py")
+
+    assert output.startswith("pytest exited with code")
+    assert "1 failed" in output
+
+
+def test_run_tests_blocks_path_outside_workspace(tmp_path, monkeypatch):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("def test_x(): assert True\n", encoding="utf-8")
+    monkeypatch.setenv("AGENT_WORKSPACE", str(workspace))
+
+    output = tools.run_tests(str(outside))
+
+    assert output.startswith("Edit blocked:")
+
+
+def test_run_tests_via_tool_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    (tmp_path / "test_reg.py").write_text(
+        "def test_two():\n    assert 2 == 2\n",
+        encoding="utf-8",
+    )
+
+    output = tools.run_tool("run_tests", {"path": "/workspace/test_reg.py"})
+
+    assert "1 passed" in output
+
+
 def test_create_file_blocks_path_outside_both_roots(tmp_path, monkeypatch):
     private = tmp_path / "alice"
     shared = tmp_path / "shared"

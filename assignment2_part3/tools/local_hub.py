@@ -23,11 +23,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
+
+
+def _log_snippet(text: str) -> str:
+    """Trim hub log lines. `HUB_LOG_SNIPPET_CHARS=0` disables truncation."""
+    try:
+        limit = int(os.environ.get("HUB_LOG_SNIPPET_CHARS", "120"))
+    except ValueError:
+        limit = 120
+    if limit <= 0:
+        return text
+    return text[:limit]
 from urllib.parse import parse_qs, urlparse
 
 
@@ -136,7 +148,7 @@ def _make_handler(state: HubState, verbose: bool):
             result = state.post(agent_name, content)
             if verbose and result.get("_status") == 200:
                 sys.stderr.write(
-                    f"[hub] seq={result['seq']} {agent_name}: {content[:120]}\n"
+                    f"[hub] seq={result['seq']} {agent_name}: {_log_snippet(content)}\n"
                 )
             self._send_json(result)
 

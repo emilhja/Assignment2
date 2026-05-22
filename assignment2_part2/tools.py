@@ -1,4 +1,5 @@
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
@@ -10,7 +11,9 @@ from safety import safety_check
 # Limit returned command output so very large results do not overwhelm the agent.
 MAX_OUTPUT_CHARS = 4000
 COMMAND_TIMEOUT_SECONDS = 10
+PYTEST_TIMEOUT_SECONDS = 30
 BASH_NOT_FOUND_MESSAGE = "I could not find bash. Install Git Bash or WSL, or add bash to PATH."
+PYTEST_NOT_FOUND_MESSAGE = "Tool error: pytest is not installed in this environment."
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
@@ -214,6 +217,67 @@ def run_bash(command: str) -> str:
     return _truncate(output)
 
 
+def run_tests(path: str) -> str:
+    """Run pytest against a workspace path. Read-only execution, workspace-scoped.
+
+    The path must resolve inside an allowed workspace root. pytest runs with
+    the same minimal env as `run_bash` (no provider keys), and with the test
+    file's directory as cwd so `from <module> import ...` style tests resolve.
+    """
+
+    try:
+        target = _resolve_workspace_path(path)
+    except ValueError as exc:
+        return f"Edit blocked: {exc}"
+
+    if not target.exists():
+        return f"Edit blocked: path does not exist: {target}"
+
+    cwd = target.parent if target.is_file() else target
+
+    try:
+        import pytest  # noqa: F401  — presence check only
+    except ImportError:
+        return PYTEST_NOT_FOUND_MESSAGE
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", str(target), "-q", "--no-header", "-rN"],
+            shell=False,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=PYTEST_TIMEOUT_SECONDS,
+            env=_bash_subprocess_env(cwd),
+        )
+    except FileNotFoundError:
+        return PYTEST_NOT_FOUND_MESSAGE
+    except subprocess.TimeoutExpired as exc:
+        if isinstance(exc.stdout, str) and exc.stdout:
+            partial = exc.stdout.strip()
+        elif isinstance(exc.stderr, str) and exc.stderr:
+            partial = exc.stderr.strip()
+        else:
+            partial = ""
+        if partial:
+            return _truncate(
+                f"I stopped pytest after {PYTEST_TIMEOUT_SECONDS} seconds.\n{partial}"
+            )
+        return f"I stopped pytest after {PYTEST_TIMEOUT_SECONDS} seconds."
+
+    parts = []
+    if completed.stdout:
+        parts.append(completed.stdout.strip())
+    if completed.stderr:
+        parts.append(completed.stderr.strip())
+    output = "\n".join(p for p in parts if p) or "(no output)"
+
+    if completed.returncode != 0:
+        output = f"pytest exited with code {completed.returncode}.\n{output}"
+
+    return _truncate(output)
+
+
 def _whole_line_spans(text: str, needle: str) -> list[tuple[int, int]]:
     """Return exact match spans that cover complete line sections."""
 
@@ -406,6 +470,12 @@ TOOL_REGISTRY = {
             args["new_text"],
             args.get("all_occurrences", False),
         ),
+    ),
+    "run_tests": ToolSpec(
+        name="run_tests",
+        description="Run pytest against one workspace file or directory.",
+        required_args=("path",),
+        handler=lambda args: run_tests(args["path"]),
     ),
 }
 

@@ -27,6 +27,7 @@ from thread_safe_store import ThreadSafeSessionStore as SessionStore
 import colors
 from budget import Budget
 from claims import CLAIM_PATTERN, Claim, ClaimRegistry, split_claim_target
+from coordination import assignment_guidance, followup_assignment_guidance, handoff_guidance
 from console_control import ConsoleControl
 from peer import PeerMessage
 from peer_task import run_peer_task
@@ -192,6 +193,30 @@ def run_group_chat(
         prior_context: list[dict[str, str]] | None = None,
         collision: CollisionInfo | None = None,
     ) -> str | None:
+        runtime_guidance = []
+        guidance = assignment_guidance(
+            message.text,
+            agent_id=agent_id,
+            display_name=display_name,
+        )
+        if guidance:
+            runtime_guidance.append(guidance)
+        guidance = followup_assignment_guidance(
+            message.text,
+            agent_id=agent_id,
+            display_name=display_name,
+            recent_context=prior_context or [],
+        )
+        if guidance:
+            runtime_guidance.append(guidance)
+        guidance = handoff_guidance(
+            message.text,
+            agent_id=agent_id,
+            display_name=display_name,
+            recent_context=prior_context or [],
+        )
+        if guidance:
+            runtime_guidance.append(guidance)
         try:
             return run_peer_task(
                 message,
@@ -204,6 +229,7 @@ def run_group_chat(
                 recent_context=prior_context,
                 absorb_claims=False,
                 collision=collision,
+                runtime_guidance=runtime_guidance,
             )
         except RuntimeError as exc:
             # Most often: every LLM provider was rate-limited or unreachable.
