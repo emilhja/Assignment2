@@ -28,8 +28,13 @@ from thread_safe_store import ThreadSafeSessionStore as SessionStore
 
 import colors
 from budget import Budget, format_usage_summary
-from claims import CLAIM_PATTERN, Claim, ClaimRegistry, split_claim_target
-from coordination import assignment_guidance, followup_assignment_guidance, handoff_guidance
+from claims import CLAIM_PATTERN, DEFER_PATTERN, RELEASE_PATTERN, Claim, ClaimRegistry, split_claim_target
+from coordination import (
+    assignment_guidance,
+    followup_assignment_guidance,
+    handoff_guidance,
+    status_request_guidance,
+)
 from console_control import ConsoleControl
 from peer import PeerMessage
 from peer_task import run_peer_task
@@ -40,9 +45,9 @@ from transport import Transport, build_transport
 CONFIG_DIR = Path(__file__).resolve().parent / "config"
 DATA_DIR = Path(__file__).resolve().parent / "data"
 SYSTEM_PROMPT_FILE = CONFIG_DIR / "system_prompt.txt"
-DEFAULT_TPM = 20_000
+DEFAULT_TPM = 100_000
 DEFAULT_RPM = 30
-DEFAULT_TOTAL = 200_000
+DEFAULT_TOTAL = 2_000_000
 DEFAULT_CLAIM_CONTINUATION_GRACE_SECONDS = 1.5
 DEFAULT_PENDING_FOLLOWUP_SECONDS = 120.0
 MAX_RECENT_CONTEXT_ENTRIES = 64
@@ -340,9 +345,23 @@ def run_group_chat(
         )
         if guidance:
             runtime_guidance.append(guidance)
-        guidance = _stale_claim_guidance(claims.unsatisfied_claims_for(agent_id))
-        if guidance:
-            runtime_guidance.append(guidance)
+        unsatisfied = claims.unsatisfied_claims_for(agent_id)
+        status_guidance = status_request_guidance(
+            message.text,
+            agent_id=agent_id,
+            display_name=display_name,
+            recent_context=prior_context or [],
+            open_claim_targets=[claim.target for claim in unsatisfied] or None,
+        )
+        if status_guidance:
+            runtime_guidance.append(status_guidance)
+            # Status guidance already folds open claims into the Blockers line,
+            # so skip the separate stale-claim nudge that would otherwise push
+            # the agent toward RELEASE (the collision the previous run hit).
+        else:
+            stale_guidance = _stale_claim_guidance(unsatisfied)
+            if stale_guidance:
+                runtime_guidance.append(stale_guidance)
         guidance = _released_without_write_guidance(
             claims.recently_released_unsatisfied_for(agent_id)
         )
@@ -507,6 +526,28 @@ def run_group_chat(
             if continuation_answer is not None:
                 _send_answer(continuation_answer, continuation.id)
                 _continue_claims(continuation, continuation_answer, depth + 1)
+            # If the agent still holds this claim AND it hasn't been satisfied by
+            # a successful write, AND the continuation answer was neither a
+            # legitimate DEFER/RELEASE nor a follow-on CLAIM, the continuation
+            # just died silently — the peer-task reprompt loop didn't fire
+            # (e.g. prose final that didn't match the pending-write detector).
+            # Surface that in audit so the stall is visible without timeline
+            # cross-referencing.
+            answer_text = continuation_answer or ""
+            silent_final = not (
+                CLAIM_PATTERN.search(answer_text)
+                or RELEASE_PATTERN.search(answer_text)
+                or DEFER_PATTERN.search(answer_text)
+            )
+            still_unsatisfied = any(
+                c.target == claim.target for c in claims.unsatisfied_claims_for(agent_id)
+            )
+            if still_unsatisfied and silent_final:
+                _log(
+                    store,
+                    "claim_continuation_ended_without_progress",
+                    f"target={claim.target} from_msg={original.id}",
+                )
 
     try:
         while not stop_event.is_set():

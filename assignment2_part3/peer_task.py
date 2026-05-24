@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import threading
 from typing import Optional
 
@@ -27,15 +28,18 @@ from session_store import SessionStore
 from tools import MAX_OUTPUT_CHARS, TOOL_REGISTRY, _resolve_workspace_path, run_tool
 
 from budget import Budget, BudgetExceeded, estimate_tokens
-from claims import CLAIM_PATTERN, RELEASE_PATTERN, ClaimRegistry, split_claim_target
+from claims import CLAIM_PATTERN, DEFER_PATTERN, RELEASE_PATTERN, ClaimRegistry, split_claim_target
 from console_control import ConsoleControl
 from peer import PeerMessage, peer_intent_refusal, scrub_outbound
 from reply_policy import CollisionInfo
 
 
 MAX_STEPS = 8
-MAX_CLAIM_CONTINUATION_STEPS = 5
-MAX_CONTINUATION_REPROMPTS_PER_REASON = 1
+MAX_CLAIM_CONTINUATION_STEPS = 8
+# Two nudges before giveup: "describe instead of call" is a common LLM failure
+# mode and one reprompt often isn't enough to course-correct. See plan
+# i-think-this-went-serene-manatee.md for the calculator session that motivated this.
+MAX_CONTINUATION_REPROMPTS_PER_REASON = 2
 MAX_CONTEXT_MESSAGES = 24
 MAX_CONTEXT_CHARS = 2000
 
@@ -287,6 +291,27 @@ def _claim_continuation_target(message: PeerMessage) -> str | None:
     return f"{path}#{scope}" if scope else path
 
 
+_PYTEST_REQUEST_RE = re.compile(r"(?i)\b(?:pytest|tests?)\b")
+
+
+def _pytest_was_requested(text: str) -> bool:
+    return bool(_PYTEST_REQUEST_RE.search(text or ""))
+
+
+def _test_target_for_claim(target: str | None) -> str | None:
+    if not target:
+        return None
+    path, scope = split_claim_target(target)
+    if not path.startswith(SHARED_PATH_PREFIX) or not path.endswith(".py"):
+        return None
+    directory, _separator, filename = path.rpartition("/")
+    stem = filename[:-3]
+    test_path = path if stem.startswith("test_") else f"{directory}/test_{stem}.py"
+    if scope:
+        return f"{test_path}#{scope}-tests"
+    return f"{test_path}#tests"
+
+
 def _claim_targets_from_text(text: str) -> set[str]:
     targets: set[str] = set()
     for match in CLAIM_PATTERN.finditer(text or ""):
@@ -296,9 +321,22 @@ def _claim_targets_from_text(text: str) -> set[str]:
 
 
 def _looks_like_pending_shared_write(answer: str) -> bool:
-    """Detect declarative no-op finals during a shared-claim continuation."""
+    """Detect declarative no-op finals during a shared-claim continuation.
+
+    The reprompt loop already short-circuits CLAIM-repeats, RELEASE, and DEFER
+    before reaching this check (see the RELEASE branch around line 736 and the
+    repeated-CLAIM branch above). So any *other* prose final that names the
+    shared path during an unsatisfied claim is a stall — including
+    "I need to re-read X" or "I'll review X" prose that doesn't yet mention a
+    write verb. See plan this-was-quite-a-refactored-balloon.md for the alice
+    stall that motivated dropping the write-verb conjunction.
+    """
 
     if SHARED_PATH_PREFIX not in (answer or ""):
+        return False
+    if RELEASE_PATTERN.search(answer) or DEFER_PATTERN.search(answer):
+        # RELEASE has its own reprompt branch downstream; DEFER is a legitimate
+        # collision response. Neither should be misread as a write stall.
         return False
     lowered = answer.lower()
     pending_markers = (
@@ -315,10 +353,34 @@ def _looks_like_pending_shared_write(answer: str) -> bool:
         "ready to create",
         "does not exist",
         "doesn't exist",
+        "re-read",
+        "reread",
+        "look at",
+        "review",
+        "need to read",
+        "have to read",
+        "should read",
     )
-    write_verbs = ("create", "write", "implement", "add", "update", "edit")
+    return any(marker in lowered for marker in pending_markers)
+
+
+def _looks_like_pending_test_work(answer: str) -> bool:
+    lowered = (answer or "").lower()
+    if "claim /workspace/shared/" in lowered:
+        return False
+    pending_markers = (
+        "i will",
+        "i'll",
+        "i need to",
+        "i am going to",
+        "i'm going to",
+        "going to",
+        "next steps",
+        "now i will",
+    )
+    test_markers = ("pytest", "test", "tests")
     return any(marker in lowered for marker in pending_markers) and any(
-        verb in lowered for verb in write_verbs
+        marker in lowered for marker in test_markers
     )
 
 
@@ -458,6 +520,17 @@ def run_peer_task(
         count = continuation_reprompt_counts.get(kind, 0)
         if count >= MAX_CONTINUATION_REPROMPTS_PER_REASON:
             _log("system", "claim_continuation_giveup", f"{kind}: {fallback}")
+            if (
+                kind == "claim_continuation_pending_write_reprompt"
+                and _pytest_was_requested(message.text)
+            ):
+                target = _claim_continuation_target(message)
+                test_target = _test_target_for_claim(target) or ""
+                _log(
+                    "system",
+                    "pytest_skipped_due_to_impl_failure",
+                    _json({"impl_target": target or "", "test_target": test_target}),
+                )
             scrubbed, _hits = scrub_outbound(fallback)
             _log("assistant", "peer_reply_raw", fallback)
             return scrubbed
@@ -612,14 +685,62 @@ def run_peer_task(
                 if stopped is not None:
                     return stopped
                 continue
-            if _is_claim_continuation(message) and _looks_like_pending_shared_write(answer):
+            if (
+                _is_claim_continuation(message)
+                and saw_successful_shared_write
+                and _looks_like_pending_test_work(answer)
+            ):
+                test_target = _test_target_for_claim(_claim_continuation_target(message))
+                target_guidance = (
+                    f" Post exactly this CLAIM target if you will write tests: {test_target}."
+                    if test_target
+                    else ""
+                )
+                guidance = (
+                    "A successful shared implementation write already happened in this "
+                    "runtime continuation. If the original request also asked for pytest "
+                    "coverage, do not describe test work as a future step. Either emit a "
+                    "new CLAIM for the shared test file so the runtime can continue into "
+                    "the test write, or send a final summary that explicitly says tests "
+                    f"were not written/run.{target_guidance}"
+                )
+                stopped = _continuation_reprompt_or_stop(
+                    "claim_continuation_pending_tests_reprompt",
+                    guidance,
+                    "I had to stop because I kept describing test work instead of claiming or writing tests.",
+                )
+                if stopped is not None:
+                    return stopped
+                continue
+            if (
+                _is_claim_continuation(message)
+                and not saw_successful_shared_write
+                and _looks_like_pending_shared_write(answer)
+            ):
+                claim_target = _claim_continuation_target(message)
+                example_path = (
+                    split_claim_target(claim_target)[0]
+                    if claim_target
+                    else "/workspace/shared/<file>"
+                )
+                example_call = _json(
+                    {
+                        "type": "tool_call",
+                        "tool": "create_file",
+                        "args": {
+                            "path": example_path,
+                            "content": "<file contents here>",
+                        },
+                    }
+                )
                 guidance = (
                     "This is still the runtime continuation for your active shared-file claim. "
-                    "Do not send a final answer describing what you will do next. If the shared "
-                    "file does not exist, call create_file now. If it exists, call read_file if "
-                    "needed and then append_text for additive work, or edit_section/replace_text "
-                    "for exact replacements. Only send a final answer after a successful "
-                    "shared-file write tool observation."
+                    "Do not send a final answer describing what you will do next. Emit a tool_call "
+                    "JSON object now. For a new file, the response MUST look exactly like this "
+                    f"(replace the content placeholder): {example_call}. If the file already "
+                    "exists, call read_file first and then append_text for additive work, or "
+                    "edit_section/replace_text for exact replacements. Only send a final answer "
+                    "after a successful shared-file write tool observation."
                 )
                 stopped = _continuation_reprompt_or_stop(
                     "claim_continuation_pending_write_reprompt",

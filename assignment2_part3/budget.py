@@ -33,9 +33,9 @@ class BudgetExceeded(RuntimeError):
 
 @dataclass
 class Budget:
-    tokens_per_minute: int = 20_000
+    tokens_per_minute: int = 100_000
     requests_per_minute: int = 30
-    lifetime_tokens: int = 200_000
+    lifetime_tokens: int = 2_000_000
     lifetime_tokens_used: int = 0
     prompt_tokens_used: int = 0
     completion_tokens_used: int = 0

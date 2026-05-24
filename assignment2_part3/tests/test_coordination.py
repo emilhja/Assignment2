@@ -3,6 +3,7 @@ from coordination import (
     followup_assignment_guidance,
     handoff_guidance,
     parse_coordination_plan,
+    status_request_guidance,
 )
 
 
@@ -186,6 +187,91 @@ def test_followup_assignment_guidance_infers_pytest_file_to_fix():
     assert "Pytest follow-up detected" in guidance
     assert "Shared test path: /workspace/shared/test_calculator.py" in guidance
     assert "call read_file" in guidance
+
+
+def test_status_request_guidance_matches_are_you_done():
+    guidance = status_request_guidance(
+        "@alice-swe are you done?",
+        agent_id="alice",
+        display_name="alice-swe",
+    )
+
+    assert guidance is not None
+    assert "completion status" in guidance.lower()
+    assert "Done:" in guidance
+    assert "Tests:" in guidance
+    assert "Blockers:" in guidance
+
+
+def test_status_request_guidance_matches_short_status_question():
+    guidance = status_request_guidance(
+        "status?",
+        agent_id="bob",
+        display_name="bob-swe",
+    )
+
+    assert guidance is not None
+    assert "Done:" in guidance
+
+
+def test_status_request_guidance_skips_unrelated_chatter():
+    assert (
+        status_request_guidance(
+            "let's pick up tomorrow",
+            agent_id="alice",
+            display_name="alice-swe",
+        )
+        is None
+    )
+
+
+def test_status_request_guidance_folds_open_claims_into_blockers():
+    """When the operator asks for status while the agent holds unsatisfied
+    claims, the guidance must steer the agent to list them in Blockers — not
+    to RELEASE just to get the status reply out the door."""
+
+    guidance = status_request_guidance(
+        "@alice-swe are you done?",
+        agent_id="alice",
+        display_name="alice-swe",
+        open_claim_targets=["/workspace/shared/calculator.py#add-subtract"],
+    )
+
+    assert guidance is not None
+    assert "Blockers" in guidance
+    assert "/workspace/shared/calculator.py#add-subtract" in guidance
+    assert "unsatisfied CLAIM" in guidance
+    # The whole point: do not push RELEASE just because status was requested.
+    assert "instead of posting RELEASE" in guidance
+
+
+def test_status_request_guidance_omits_blocker_hint_when_no_open_claims():
+    guidance = status_request_guidance(
+        "are you done?",
+        agent_id="alice",
+        display_name="alice-swe",
+        open_claim_targets=None,
+    )
+
+    assert guidance is not None
+    assert "unsatisfied CLAIM" not in guidance
+
+
+def test_status_request_guidance_recommends_recent_test_path():
+    guidance = status_request_guidance(
+        "are you done?",
+        agent_id="alice",
+        display_name="alice-swe",
+        recent_context=[
+            {
+                "sender_id": "alice-swe",
+                "text": "CLAIM /workspace/shared/test_calculator.py#add-subtract-tests: Add pytest",
+            }
+        ],
+    )
+
+    assert guidance is not None
+    assert "run_tests on /workspace/shared/test_calculator.py" in guidance
 
 
 def test_handoff_guidance_falls_back_to_recent_assignment():

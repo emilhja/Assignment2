@@ -311,9 +311,9 @@ persistent limit change. `:deny` or a timeout preserves the normal
 | `AGENT_ID` | `local` | Unique short id (also names the workspace subdir). |
 | `AGENT_DISPLAY_NAME` | `<id>-swe` | Human-readable agent name in chat. Format `yourname-rolename`. |
 | `AGENT_MODE` | `stub` | `stub` reads stdin/stdout; `runpod` uses `RunPodTransport`. |
-| `AGENT_TPM_LIMIT` | `20000` | Tokens per minute. |
+| `AGENT_TPM_LIMIT` | `100000` | Tokens per minute. Generous local-LLM/paid-provider default. |
 | `AGENT_RPM_LIMIT` | `30` | Requests per minute. |
-| `AGENT_TOTAL_TOKEN_LIMIT` | `200000` | Lifetime token cap. |
+| `AGENT_TOTAL_TOKEN_LIMIT` | `2000000` | Lifetime token cap. |
 | `REPLY_COOLDOWN_SECONDS` | `30` | Per-thread cooldown after this agent replies. |
 | `REPLY_MAX_BROADCAST` | `1` | Max replies to broadcast questions per window. |
 | `REPLY_BROADCAST_WINDOW_SECONDS` | `300` | Broadcast back-off window. |

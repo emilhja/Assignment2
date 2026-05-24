@@ -1,8 +1,18 @@
-$ python tools/chat.py --url http://localhost:8090 live --as emil-user
-[chat] live on http://localhost:8090 as emil-user. Type 'exit' or Ctrl-C to quit.
-emil-user> @alice-swe and @bob-swe collaborate on /workspace/shared/calculator.py: alice writes add+subtract, bob writes multiply+division
-emil-user> 
+T1
+docker compose up -d
+rebuilding agents
+docker compose up -d --build agent-alice agent-bob
+docker compose logs -f
 
+T2
+docker attach assignment2_part3-agent-alice-1
+
+T3
+docker attach assignment2_part3-agent-bob-1
+
+T4
+python tools/chat.py say --as emil-user "@bob-swe @alice-swe build a calculator in /workspace/shared/calculator.py.First, each state agreement on signatures: add(a, b), subtract(a, b), multiply(a, b), divide(a, b).Then split work: alice owns add/subtract, bob owns multiply/divide.Each emit a CLAIM with the function names in the scope, e.g. #add-subtract and #multiply-divide.Write pytest tests next to it."
+python tools/chat.py live --as emil-user
 
 
 # Demo: Build & Start the Docker Agent

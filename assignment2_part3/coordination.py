@@ -29,6 +29,12 @@ SIGNATURE_AGREEMENT_PATTERN = re.compile(
 PYTEST_REQUEST_PATTERN = re.compile(r"(?i)\b(?:pytest|tests?)\b")
 PYTEST_FIX_PATTERN = re.compile(r"(?i)\b(?:fix|repair|update|debug)\b.*\b(?:pytest|tests?)\b")
 SHARED_TEST_PATH_PATTERN = re.compile(r"(?P<path>/workspace/shared/(?:test_[^\s:;,]+|[^\s:;,]+_test)\.py)")
+STATUS_REQUEST_PATTERN = re.compile(
+    r"(?i)(?:\bare\s+you\s+(?:done|finished)\b"
+    r"|\b(?:did|have)\s+you\s+(?:finish|complete)(?:ed)?\b"
+    r"|\bdone\s+yet\b|\bany\s+update\b"
+    r"|\b(?:done|finished|status)\s*\?)"
+)
 
 
 @dataclass(frozen=True)
@@ -320,4 +326,51 @@ def handoff_guidance(
         f"Ask @{peer} to post `RELEASE {claim_target}` before writing. "
         f"After release, {target_label} should post `CLAIM {claim_target}: take over handoff scope`. "
         f"Current agent aliases: {', '.join(sorted(aliases))}."
+    )
+
+
+def status_request_guidance(
+    text: str,
+    *,
+    agent_id: str,
+    display_name: str,
+    recent_context: list[dict[str, str]] | None = None,
+    open_claim_targets: list[str] | None = None,
+) -> str | None:
+    """Return guidance when the operator asks for completion status.
+
+    The reply gate decides whether to respond at all; this helper only
+    shapes the response so the agent emits a structured Done/Tests/Blockers
+    line instead of free-form prose.
+
+    When `open_claim_targets` is non-empty, the caller is signalling that the
+    agent still holds unsatisfied claim(s) — fold them into the Blockers
+    sentence so the operator sees them, and stop the caller from layering a
+    separate stale-claim nudge that pushes the agent toward RELEASE.
+    """
+
+    if not isinstance(text, str) or STATUS_REQUEST_PATTERN.search(text) is None:
+        return None
+    test_path = _latest_shared_test_path(recent_context or [])
+    test_hint = (
+        f" If you have not yet run pytest for your scope, call run_tests on {test_path} first."
+        if test_path
+        else " If you wrote tests but have not run them, call run_tests on the shared test file first."
+    )
+    if open_claim_targets:
+        targets = ", ".join(open_claim_targets)
+        blocker_hint = (
+            f" You still hold unsatisfied CLAIM(s): {targets}. List them in the Blockers field "
+            "instead of posting RELEASE just because status was requested."
+        )
+    else:
+        blocker_hint = ""
+    return (
+        "The operator is asking for completion status. Reply with one short message in this exact "
+        "shape (substitute the bracketed parts): "
+        "'Done: <one-line summary of what you implemented> at </workspace/shared/...>. "
+        "Tests: <ran and passed | ran and failed | not run> (include the test file path if you ran them). "
+        "Blockers: <none | brief description>.' "
+        "Do not invent results — only report tests as ran if a successful run_tests observation exists "
+        f"in this round.{test_hint}{blocker_hint}"
     )

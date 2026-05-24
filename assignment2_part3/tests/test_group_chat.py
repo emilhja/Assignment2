@@ -691,7 +691,11 @@ def test_stale_unsatisfied_claim_injects_nudge_on_next_turn(tmp_path, monkeypatc
     a CLAIM on a previous turn but never wrote, so her claim sits in the
     registry. On the next inbound message addressed to alice, the runtime
     must inject a guidance line listing the unsatisfied target so the model
-    is reminded to either write or RELEASE."""
+    is reminded to either write or RELEASE.
+
+    Uses a non-status prompt so the stale-claim nudge fires standalone (when
+    the message is a status request, the nudge is folded into the status
+    guidance instead — see the next test)."""
 
     claims = ClaimRegistry()
     claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
@@ -699,7 +703,7 @@ def test_stale_unsatisfied_claim_injects_nudge_on_next_turn(tmp_path, monkeypatc
     assert len(claims.unsatisfied_claims_for("alice")) == 1
 
     peer_lines = [
-        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe what's the status?"}) + "\n",
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe please continue"}) + "\n",
     ]
     scripted = [json.dumps({"type": "final", "answer": "Working on it."})]
     ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted, claims=claims)
@@ -719,6 +723,46 @@ def test_stale_unsatisfied_claim_injects_nudge_on_next_turn(tmp_path, monkeypatc
     assert nudge is not None, "stale-claim guidance was not injected"
     assert "/workspace/shared/calculator.py#add-subtract" in nudge
     assert "RELEASE" in nudge
+
+
+def test_status_request_with_open_claim_suppresses_stale_nudge(tmp_path, monkeypatch):
+    """When the operator asks for status while an unsatisfied claim is open,
+    the runtime must NOT layer the standalone stale-claim guidance (which
+    invites RELEASE). The status guidance carries the claim into the
+    Blockers field instead — see plan
+    this-was-quite-a-refactored-balloon.md."""
+
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
+
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe are you done?"}) + "\n",
+    ]
+    scripted = [json.dumps({"type": "final", "answer": "Done: nothing yet. Tests: not run. Blockers: still working."})]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted, claims=claims)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.5)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert ctx["fake_chat"].calls == 1
+    contents = [message["content"] for message in ctx["fake_chat"].messages[0]]
+    status_guidance = next(
+        (content for content in contents if "completion status" in content.lower()),
+        None,
+    )
+    assert status_guidance is not None, "status_request_guidance not injected"
+    assert "/workspace/shared/calculator.py#add-subtract" in status_guidance
+    assert "instead of posting RELEASE" in status_guidance
+    # Standalone stale-claim guidance must be suppressed; only the status-folded
+    # version is allowed to mention unsatisfied claims.
+    stale_alone = [
+        content for content in contents
+        if "unsatisfied active CLAIM" in content and "completion status" not in content.lower()
+    ]
+    assert stale_alone == [], f"stale-claim guidance leaked alongside status: {stale_alone}"
 
 
 def test_satisfied_claim_does_not_re_inject_nudge(tmp_path, monkeypatch):
