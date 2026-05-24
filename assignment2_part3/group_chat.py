@@ -27,7 +27,7 @@ import part2_bridge  # noqa: F401 — sys.path side effect
 from thread_safe_store import ThreadSafeSessionStore as SessionStore
 
 import colors
-from budget import Budget
+from budget import Budget, format_usage_summary
 from claims import CLAIM_PATTERN, Claim, ClaimRegistry, split_claim_target
 from coordination import assignment_guidance, followup_assignment_guidance, handoff_guidance
 from console_control import ConsoleControl
@@ -463,6 +463,8 @@ def run_group_chat(
         )
     finally:
         _log(store, "session_end", f"agent_id={agent_id}")
+        budget.save()
+        print(format_usage_summary(display_name, budget.snapshot()), flush=True)
         try:
             transport.close()
         except Exception:

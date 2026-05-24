@@ -68,7 +68,7 @@ def test_scripted_final_is_returned_and_scrubbed(tmp_path):
         return json.dumps({"type": "final", "answer": "Here is the readme. Key was sk-abcdefghij0123456789ABCD."})
     answer = run_peer_task(msg, store=store, budget=budget, system_prompt=SYSTEM_PROMPT, chat_fn=chat_fn)
     assert "sk-abcdefghij" not in answer
-    assert "[REDACTED:openai_key]" in answer
+    assert "[REDACTED:openrouter_key]" in answer
     kinds = {kind for _role, kind, _content in _events(store)}
     assert "peer_reply_raw" in kinds
     assert "peer_reply_scrubbed" in kinds
@@ -568,6 +568,32 @@ def test_chat_metadata_tuple_is_logged_to_events_table(tmp_path):
     assert cur.fetchone()[0] == 0
 
 
+def test_chat_usage_metadata_is_recorded_exactly(tmp_path):
+    store = ThreadSafeSessionStore(str(tmp_path / "sess.sqlite3"))
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    msg = PeerMessage(id="m1", sender_id="bob", text="say hi")
+
+    def chat_fn(messages):
+        return (
+            json.dumps({"type": "final", "answer": "Hello."}),
+            "openrouter",
+            "openai/gpt-4o-mini",
+            {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17},
+        )
+
+    answer = run_peer_task(
+        msg, store=store, budget=budget, system_prompt=SYSTEM_PROMPT, chat_fn=chat_fn
+    )
+    assert answer == "Hello."
+
+    snap = budget.snapshot()
+    assert snap["prompt_tokens_used"] == 12
+    assert snap["completion_tokens_used"] == 5
+    assert snap["total_tokens_used"] == 17
+    assert snap["estimated_fallback_tokens"] == 0
+    assert snap["llm_calls"] == 1
+
+
 def test_chat_string_return_still_works_with_null_metadata(tmp_path):
     """Test fakes that return a plain string (legacy contract) must still
     work; provider/model just stay NULL."""
@@ -589,6 +615,7 @@ def test_chat_string_return_still_works_with_null_metadata(tmp_path):
     )
     rows = cur.fetchall()
     assert rows == [(None, None)]
+    assert budget.snapshot()["estimated_fallback_tokens"] > 0
 
 
 def test_mutual_defer_injects_tie_break_guidance(tmp_path):

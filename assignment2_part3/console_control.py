@@ -215,6 +215,11 @@ def _format_snapshot(snap: dict) -> str:
         "requests_used_last_minute",
         "lifetime_tokens",
         "lifetime_tokens_used",
+        "prompt_tokens_used",
+        "completion_tokens_used",
+        "total_tokens_used",
+        "estimated_fallback_tokens",
+        "llm_calls",
     ):
         lines.append(f"  {key}: {snap.get(key)}")
     return "\n".join(lines)

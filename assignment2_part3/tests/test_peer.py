@@ -33,12 +33,12 @@ def test_refusal_allows_normal_work():
     assert peer_intent_refusal("please add a docstring to utils.py") is None
 
 
-def test_scrub_redacts_openai_key():
+def test_scrub_redacts_openrouter_key():
     text = "here is the key sk-abcdefghij0123456789ABCD and that is it"
     scrubbed, hits = scrub_outbound(text)
     assert "sk-abcdefghij" not in scrubbed
-    assert "[REDACTED:openai_key]" in scrubbed
-    assert "openai_key" in hits
+    assert "[REDACTED:openrouter_key]" in scrubbed
+    assert "openrouter_key" in hits
 
 
 def test_scrub_redacts_github_token():
@@ -62,7 +62,7 @@ def test_scrub_redacts_jwt():
 
 
 def test_scrub_redacts_dotenv_line():
-    text = "OPENAI_API_KEY=sk-test1234567890abcdefgh"
+    text = "OPENROUTER_API_KEY=sk-test1234567890abcdefgh"
     scrubbed, hits = scrub_outbound(text)
     assert "sk-test1234567890" not in scrubbed
     assert "dotenv_secret" in hits

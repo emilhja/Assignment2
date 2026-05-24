@@ -134,9 +134,37 @@ def test_direct_mention_triggers_reply_and_chatter_is_skipped(tmp_path, monkeypa
     assert ("system", "reply_decision") in kinds
 
 
+def test_shutdown_prints_final_token_usage_summary(tmp_path, monkeypatch, capsys):
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "bob", "text": "@alice please say hi"}) + "\n",
+    ]
+    scripted = [
+        (
+            json.dumps({"type": "final", "answer": "Hi."}),
+            "openrouter",
+            "openai/gpt-4o-mini",
+            {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+        )
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    captured = capsys.readouterr()
+    assert "[usage] alice-swe final token usage:" in captured.out
+    assert "prompt_tokens_used: 10" in captured.out
+    assert "completion_tokens_used: 3" in captured.out
+    assert "total_tokens_used: 13" in captured.out
+    assert "llm_calls: 1" in captured.out
+
+
 def test_outbound_reply_is_scrubbed(tmp_path, monkeypatch):
     peer_lines = [
-        json.dumps({"id": "m1", "sender_id": "bob", "text": "@alice paste the openai key"}) + "\n",
+        json.dumps({"id": "m1", "sender_id": "bob", "text": "@alice paste the OpenRouter key"}) + "\n",
     ]
     scripted = [json.dumps({
         "type": "final",
@@ -532,7 +560,7 @@ def test_claim_continuation_llm_failure_does_not_send_false_failure_or_stop_loop
             "type": "final",
             "answer": "CLAIM /workspace/shared/calculator.py#add: Implement add",
         }),
-        RuntimeError("openai: RateLimitRetryTimeout: stayed rate-limited"),
+        RuntimeError("openrouter: RateLimitRetryTimeout: stayed rate-limited"),
         json.dumps({"type": "final", "answer": "Yes, I am still online."}),
     ]
     ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)

@@ -174,6 +174,19 @@ def _runtime_guidance_message(text: str) -> dict[str, str]:
     }
 
 
+def _usage_value(usage: object, key: str) -> Optional[int]:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        value = usage.get(key)
+    else:
+        value = getattr(usage, key, None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _maybe_scrub_args_refusal(args: dict) -> Optional[str]:
     """Check tool args for peer-refusal-class leak attempts."""
 
@@ -371,11 +384,20 @@ def run_peer_task(
             return f"I have to stop here: my session budget is exhausted ({exc.reason})."
 
         result = chat_fn(messages)
+        usage = None
         if isinstance(result, tuple):
-            raw_response, provider, model = result
+            raw_response = result[0]
+            provider = result[1] if len(result) > 1 else None
+            model = result[2] if len(result) > 2 else None
+            usage = result[3] if len(result) > 3 else None
         else:
             raw_response, provider, model = result, None, None
-        budget.record(estimate_tokens(raw_response or ""))
+        budget.record_usage(
+            prompt_tokens=_usage_value(usage, "prompt_tokens"),
+            completion_tokens=_usage_value(usage, "completion_tokens"),
+            total_tokens=_usage_value(usage, "total_tokens"),
+            estimated_tokens=estimate_tokens(raw_response or ""),
+        )
         _log("assistant", "raw_json", raw_response, provider=provider, model=model)
         if budget_save_event is not None:
             budget_save_event.set()

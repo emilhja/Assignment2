@@ -8,9 +8,13 @@ import time.
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 
 def _bootstrap_env() -> None:
     """Pin AGENT_ID/AGENT_WORKSPACE before importing Part 2's tools."""
+
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
     agent_id = os.environ.setdefault("AGENT_ID", "local")
     os.environ.setdefault("AGENT_DISPLAY_NAME", f"{agent_id}-swe")

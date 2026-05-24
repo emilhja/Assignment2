@@ -55,14 +55,14 @@ def test_run_bash_executes_from_workspace(tmp_path, monkeypatch):
     # subprocess env must not carry provider API keys or secrets
     env = seen["kwargs"]["env"]
     assert "GROQ_API_KEY" not in env
-    assert "OPENAI_API_KEY" not in env
+    assert "OPENROUTER_API_KEY" not in env
     assert "PATH" in env
 
 
 def test_run_bash_subprocess_env_strips_api_keys(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
     monkeypatch.setenv("GROQ_API_KEY", "leak-me-if-you-can")
-    monkeypatch.setenv("OPENAI_API_KEY", "another-secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "another-secret")
 
     output = tools.run_bash("echo done")
 

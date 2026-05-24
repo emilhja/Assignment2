@@ -77,6 +77,34 @@ def test_save_and_load_round_trip(tmp_path):
     assert b.requests_per_minute == 7
     assert b.lifetime_tokens == 999
     assert b.lifetime_tokens_used == 50
+    assert b.total_tokens_used == 50
+    assert b.estimated_fallback_tokens == 50
+    assert b.llm_calls == 1
+
+
+def test_record_usage_tracks_exact_provider_tokens():
+    b = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    b.record_usage(prompt_tokens=80, completion_tokens=20, total_tokens=100)
+
+    snap = b.snapshot()
+    assert snap["prompt_tokens_used"] == 80
+    assert snap["completion_tokens_used"] == 20
+    assert snap["total_tokens_used"] == 100
+    assert snap["estimated_fallback_tokens"] == 0
+    assert snap["lifetime_tokens_used"] == 100
+    assert snap["llm_calls"] == 1
+
+
+def test_record_usage_falls_back_to_estimate_when_exact_usage_missing():
+    b = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    b.record_usage(estimated_tokens=33)
+
+    snap = b.snapshot()
+    assert snap["prompt_tokens_used"] == 0
+    assert snap["completion_tokens_used"] == 0
+    assert snap["total_tokens_used"] == 33
+    assert snap["estimated_fallback_tokens"] == 33
+    assert snap["llm_calls"] == 1
 
 
 def test_snapshot_has_expected_keys():
@@ -90,6 +118,11 @@ def test_snapshot_has_expected_keys():
         "tokens_used_last_minute",
         "requests_used_last_minute",
         "lifetime_tokens_used",
+        "prompt_tokens_used",
+        "completion_tokens_used",
+        "total_tokens_used",
+        "estimated_fallback_tokens",
+        "llm_calls",
     ):
         assert key in snap
 

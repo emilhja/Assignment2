@@ -315,6 +315,30 @@ def test_claim_collision_decides_tie_break_self_loses():
     assert decision.collision.peer_id == "alice"
 
 
+def test_claim_collision_whole_file_vs_scoped_peer():
+    """We own the whole file; peer scopes their CLAIM — must still collide."""
+
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calc.py")
+
+    incoming = _msg(
+        "CLAIM /workspace/shared/calc.py#multiply-divide: drafting",
+        sender="bob",
+    )
+    decision = should_reply(
+        incoming,
+        "alice",
+        "alice-swe",
+        recent_replies=[(999.5, "prev")],
+        now=1000.0,
+        claims=claims,
+    )
+    assert decision.respond is True
+    assert "claim collision" in decision.reason
+    assert decision.collision is not None
+    assert decision.collision.outcome == "self-wins"
+
+
 def test_claim_collision_only_fires_on_self_claim():
     """A peer CLAIM for a path we do not own should not bypass cooldown."""
 

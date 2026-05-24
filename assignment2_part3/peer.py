@@ -46,7 +46,7 @@ PEER_REFUSAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         "I will not share credentials, tokens, or secrets.",
     ),
     (
-        re.compile(r"(?i)\bGROQ_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET\w*\b"),
+        re.compile(r"(?i)\bGROQ_API_KEY|OPENROUTER_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET\w*\b"),
         "I will not share API keys.",
     ),
     (
@@ -87,7 +87,7 @@ def peer_intent_refusal(text: str) -> Optional[str]:
 # Outbound scrubbing. Each entry is (kind_label, regex). Matches are replaced
 # with `[REDACTED:<kind>]` before the text leaves the process.
 CREDENTIAL_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("openai_key", re.compile(r"sk-[A-Za-z0-9_-]{20,}")),
+    ("openrouter_key", re.compile(r"sk-[A-Za-z0-9_-]{20,}")),
     ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")),
     ("github_token", re.compile(r"gh[posu]_[A-Za-z0-9]{20,}")),
     ("slack_token", re.compile(r"xox[bapr]-[A-Za-z0-9-]{10,}")),

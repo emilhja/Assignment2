@@ -36,6 +36,11 @@ class Budget:
     requests_per_minute: int = 30
     lifetime_tokens: int = 200_000
     lifetime_tokens_used: int = 0
+    prompt_tokens_used: int = 0
+    completion_tokens_used: int = 0
+    total_tokens_used: int = 0
+    estimated_fallback_tokens: int = 0
+    llm_calls: int = 0
     paused: bool = False
     persist_path: Optional[Path] = None
     _events: deque = field(default_factory=deque)
@@ -54,6 +59,11 @@ class Budget:
             budget.requests_per_minute = int(data.get("requests_per_minute", budget.requests_per_minute))
             budget.lifetime_tokens = int(data.get("lifetime_tokens", budget.lifetime_tokens))
             budget.lifetime_tokens_used = int(data.get("lifetime_tokens_used", 0))
+            budget.prompt_tokens_used = int(data.get("prompt_tokens_used", 0))
+            budget.completion_tokens_used = int(data.get("completion_tokens_used", 0))
+            budget.total_tokens_used = int(data.get("total_tokens_used", budget.lifetime_tokens_used))
+            budget.estimated_fallback_tokens = int(data.get("estimated_fallback_tokens", 0))
+            budget.llm_calls = int(data.get("llm_calls", 0))
             budget.paused = bool(data.get("paused", False))
         return budget
 
@@ -66,6 +76,11 @@ class Budget:
                 "requests_per_minute": self.requests_per_minute,
                 "lifetime_tokens": self.lifetime_tokens,
                 "lifetime_tokens_used": self.lifetime_tokens_used,
+                "prompt_tokens_used": self.prompt_tokens_used,
+                "completion_tokens_used": self.completion_tokens_used,
+                "total_tokens_used": self.total_tokens_used,
+                "estimated_fallback_tokens": self.estimated_fallback_tokens,
+                "llm_calls": self.llm_calls,
                 "paused": self.paused,
             }
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -108,11 +123,44 @@ class Budget:
     def record(self, actual_tokens: int, *, now: Optional[float] = None) -> None:
         if actual_tokens < 0:
             raise ValueError("actual_tokens must be non-negative")
+        self.record_usage(estimated_tokens=actual_tokens, now=now)
+
+    def record_usage(
+        self,
+        *,
+        prompt_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
+        total_tokens: Optional[int] = None,
+        estimated_tokens: Optional[int] = None,
+        now: Optional[float] = None,
+    ) -> None:
+        """Record one completed LLM call.
+
+        Prefer provider-reported `total_tokens`. When it is missing, use the
+        caller's estimate and track that separately so summaries stay honest.
+        """
+
+        values = (prompt_tokens, completion_tokens, total_tokens, estimated_tokens)
+        if any(value is not None and value < 0 for value in values):
+            raise ValueError("token counts must be non-negative")
+        exact_total = total_tokens
+        if exact_total is None and prompt_tokens is not None and completion_tokens is not None:
+            exact_total = prompt_tokens + completion_tokens
+        fallback = 0 if exact_total is not None else int(estimated_tokens or 0)
+        used = int(exact_total if exact_total is not None else fallback)
         now = time.time() if now is None else now
         with self._lock:
             self._evict_old(now)
-            self._events.append((now, actual_tokens, 1))
-            self.lifetime_tokens_used += actual_tokens
+            self._events.append((now, used, 1))
+            self.lifetime_tokens_used += used
+            self.total_tokens_used += used
+            self.llm_calls += 1
+            if prompt_tokens is not None:
+                self.prompt_tokens_used += int(prompt_tokens)
+            if completion_tokens is not None:
+                self.completion_tokens_used += int(completion_tokens)
+            if fallback:
+                self.estimated_fallback_tokens += fallback
 
     def set_limit(self, name: str, value: int) -> None:
         if name not in LIMIT_NAMES:
@@ -148,6 +196,11 @@ class Budget:
                 "tokens_used_last_minute": tokens_used,
                 "requests_used_last_minute": requests_used,
                 "lifetime_tokens_used": self.lifetime_tokens_used,
+                "prompt_tokens_used": self.prompt_tokens_used,
+                "completion_tokens_used": self.completion_tokens_used,
+                "total_tokens_used": self.total_tokens_used,
+                "estimated_fallback_tokens": self.estimated_fallback_tokens,
+                "llm_calls": self.llm_calls,
             }
 
 
@@ -155,3 +208,16 @@ def estimate_tokens(text: str) -> int:
     """Crude character/4 estimate. Good enough for budget gating."""
 
     return max(1, len(text) // 4)
+
+
+def format_usage_summary(agent_label: str, snap: dict) -> str:
+    lines = [f"[usage] {agent_label} final token usage:"]
+    for key in (
+        "prompt_tokens_used",
+        "completion_tokens_used",
+        "total_tokens_used",
+        "estimated_fallback_tokens",
+        "llm_calls",
+    ):
+        lines.append(f"  {key}: {snap.get(key, 0)}")
+    return "\n".join(lines)

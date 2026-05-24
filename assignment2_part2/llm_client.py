@@ -12,7 +12,7 @@ from openai import OpenAI, RateLimitError
 import colors
 
 
-DEFAULT_PROVIDER_ORDER = "groq,openai"
+DEFAULT_PROVIDER_ORDER = "groq,openrouter"
 LOCAL_PROVIDER_DUMMY_API_KEY = "local-llm"
 RATE_LIMIT_RETRY_WAIT = 10  # fallback when the provider gives no hint
 RATE_LIMIT_MAX_WAIT = 60    # cap any single sleep
@@ -116,11 +116,11 @@ PROVIDERS = {
         "default_model": "llama-3.1-8b-instant",
         "base_url": "https://api.groq.com/openai/v1",
     },
-    "openai": {
-        "api_key_env": "OPENAI_API_KEY",
-        "model_env": "OPENAI_MODEL",
-        "default_model": "gpt-4o-mini",
-        "base_url": None,
+    "openrouter": {
+        "api_key_env": "OPENROUTER_API_KEY",
+        "model_env": "OPENROUTER_MODEL",
+        "default_model": "openai/gpt-4o-mini",
+        "base_url": "https://openrouter.ai/api/v1",
         "requires_api_key": True,
     },
     "local": {
@@ -378,6 +378,33 @@ def _create_with_rate_limit_retry(client, model, messages, *, use_json_mode, pro
             waited += wait
 
 
+def _usage_dict(response):
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+
+    def _get(name):
+        if isinstance(usage, dict):
+            value = usage.get(name)
+        else:
+            value = getattr(usage, name, None)
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    prompt_tokens = _get("prompt_tokens")
+    completion_tokens = _get("completion_tokens")
+    total_tokens = _get("total_tokens")
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
 def complete_chat_with_metadata(messages):
     errors = []
 
@@ -401,7 +428,7 @@ def complete_chat_with_metadata(messages):
         except Exception as exc:
             recovered = _failed_generation_json(exc)
             if recovered:
-                return recovered, provider_name, model
+                return recovered, provider_name, model, None
 
             if not _looks_like_json_mode_rejection(exc):
                 errors.append(f"{provider_name}: {type(exc).__name__}: {exc}")
@@ -418,7 +445,7 @@ def complete_chat_with_metadata(messages):
             except Exception as retry_exc:
                 recovered = _failed_generation_json(retry_exc)
                 if recovered:
-                    return recovered, provider_name, model
+                    return recovered, provider_name, model, None
 
                 errors.append(
                     f"{provider_name}: {type(retry_exc).__name__}: {retry_exc}"
@@ -426,12 +453,12 @@ def complete_chat_with_metadata(messages):
                 continue
 
         content = response.choices[0].message.content
-        return content or "", provider_name, model
+        return content or "", provider_name, model, _usage_dict(response)
 
     detail = "; ".join(errors) if errors else "no providers were tried"
     raise RuntimeError(f"I could not get a reply from any LLM provider ({detail})")
 
 
 def complete_chat(messages):
-    content, _provider, _model = complete_chat_with_metadata(messages)
+    content, *_metadata = complete_chat_with_metadata(messages)
     return content

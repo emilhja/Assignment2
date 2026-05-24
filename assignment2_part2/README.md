@@ -40,13 +40,13 @@ python -m pip install -r requirements.txt
 Create `.env` with one or more hosted provider keys:
 
 ```env
-LLM_PROVIDER_ORDER=groq,openai
+LLM_PROVIDER_ORDER=groq,openrouter
 
 GROQ_API_KEY=your_groq_key_here
 GROQ_MODEL=llama-3.1-8b-instant
 
-OPENAI_API_KEY=your_openai_key_here
-OPENAI_MODEL=gpt-4o-mini
+OPENROUTER_API_KEY=your_openrouter_key_here
+OPENROUTER_MODEL=openai/gpt-4o-mini
 ```
 
 To use a local OpenAI-compatible server such as `llama-server`:

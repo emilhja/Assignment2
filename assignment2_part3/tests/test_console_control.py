@@ -133,9 +133,9 @@ def test_say_scrubs_credentials_before_send():
     cc, budget, stop, stdout = _start_console(
         ":say leak sk-abc123def456ghi789jkl0\n", send_fn=sent.append
     )
-    assert _wait_for(lambda: sent and "[REDACTED:openai_key]" in sent[0])
+    assert _wait_for(lambda: sent and "[REDACTED:openrouter_key]" in sent[0])
     assert "sk-abc123def456ghi789jkl0" not in sent[0]
-    assert "openai_key" in stdout.getvalue()
+    assert "openrouter_key" in stdout.getvalue()
     stop.set()
 
 

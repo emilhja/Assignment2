@@ -6,8 +6,12 @@ import llm_client
 
 
 def _response(content):
+    usage = None
+    if isinstance(content, tuple):
+        content, usage = content
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+        usage=usage,
     )
 
 
@@ -47,9 +51,9 @@ def _rate_limit_error(message="rate limit", retry_after=None):
     return exc
 
 
-def _use_openai_provider(monkeypatch, client):
-    monkeypatch.setenv("LLM_PROVIDER_ORDER", "openai")
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+def _use_openrouter_provider(monkeypatch, client):
+    monkeypatch.setenv("LLM_PROVIDER_ORDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setattr(llm_client, "_client_for_provider", lambda _config: client)
 
 
@@ -61,13 +65,13 @@ def _use_local_provider(monkeypatch, client):
 
 def test_json_mode_is_sent_on_first_request(monkeypatch):
     client, completions = _client_with(["ok"])
-    _use_openai_provider(monkeypatch, client)
+    _use_openrouter_provider(monkeypatch, client)
 
     assert llm_client.complete_chat([{"role": "user", "content": "Return JSON"}]) == "ok"
 
     assert completions.calls == [
         {
-            "model": llm_client.PROVIDERS["openai"]["default_model"],
+            "model": llm_client.PROVIDERS["openrouter"]["default_model"],
             "messages": [{"role": "user", "content": "Return JSON"}],
             "max_tokens": llm_client.DEFAULT_MAX_TOKENS,
             "timeout": llm_client.DEFAULT_REQUEST_TIMEOUT_SECONDS,
@@ -98,7 +102,7 @@ def test_local_provider_does_not_require_api_key(monkeypatch):
 
 def test_max_tokens_and_timeout_are_forwarded_per_request(monkeypatch):
     client, completions = _client_with(["ok"])
-    _use_openai_provider(monkeypatch, client)
+    _use_openrouter_provider(monkeypatch, client)
     monkeypatch.setenv("LLM_MAX_TOKENS", "4096")
     monkeypatch.setenv("LLM_REQUEST_TIMEOUT_SECONDS", "42")
 
@@ -110,7 +114,7 @@ def test_max_tokens_and_timeout_are_forwarded_per_request(monkeypatch):
 
 def test_zero_disables_max_tokens_and_timeout(monkeypatch):
     client, completions = _client_with(["ok"])
-    _use_openai_provider(monkeypatch, client)
+    _use_openrouter_provider(monkeypatch, client)
     monkeypatch.setenv("LLM_MAX_TOKENS", "0")
     monkeypatch.setenv("LLM_REQUEST_TIMEOUT_SECONDS", "0")
 
@@ -128,13 +132,59 @@ def test_local_base_url_accepts_server_root(monkeypatch):
     )
 
 
+def test_openrouter_provider_uses_openai_compatible_endpoint(monkeypatch):
+    calls = []
+
+    def fake_openai(**kwargs):
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(llm_client, "OpenAI", fake_openai)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    llm_client._client_for_provider(llm_client.PROVIDERS["openrouter"])
+
+    assert calls == [
+        {
+            "api_key": "test-key",
+            "base_url": "https://openrouter.ai/api/v1",
+            "max_retries": 0,
+        }
+    ]
+
+
 def test_json_mode_success_uses_returned_content(monkeypatch):
     client, _completions = _client_with(['{"type":"final","answer":"done"}'])
-    _use_openai_provider(monkeypatch, client)
+    _use_openrouter_provider(monkeypatch, client)
 
     content = llm_client.complete_chat([{"role": "user", "content": "Return JSON"}])
 
     assert content == '{"type":"final","answer":"done"}'
+
+
+def test_complete_chat_with_metadata_returns_usage(monkeypatch):
+    client, _completions = _client_with(
+        [
+            (
+                '{"type":"final","answer":"done"}',
+                SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+            )
+        ]
+    )
+    _use_openrouter_provider(monkeypatch, client)
+
+    content, provider, model, usage = llm_client.complete_chat_with_metadata(
+        [{"role": "user", "content": "Return JSON"}]
+    )
+
+    assert content == '{"type":"final","answer":"done"}'
+    assert provider == "openrouter"
+    assert model == llm_client.PROVIDERS["openrouter"]["default_model"]
+    assert usage == {
+        "prompt_tokens": 11,
+        "completion_tokens": 7,
+        "total_tokens": 18,
+    }
 
 
 def test_json_mode_rejection_retries_same_provider_without_response_format(monkeypatch):
@@ -144,7 +194,7 @@ def test_json_mode_rejection_retries_same_provider_without_response_format(monke
             "plain ok",
         ]
     )
-    _use_openai_provider(monkeypatch, client)
+    _use_openrouter_provider(monkeypatch, client)
 
     assert llm_client.complete_chat([{"role": "user", "content": "Return JSON"}]) == "plain ok"
 
@@ -382,7 +432,7 @@ def test_plain_retry_error_is_reported_if_both_calls_fail(monkeypatch):
             RuntimeError("plain failed"),
         ]
     )
-    _use_openai_provider(monkeypatch, client)
+    _use_openrouter_provider(monkeypatch, client)
 
     with pytest.raises(RuntimeError) as excinfo:
         llm_client.complete_chat([{"role": "user", "content": "Return JSON"}])
@@ -400,33 +450,33 @@ def test_provider_fallback_still_works_after_plain_retry_fails(monkeypatch):
             RuntimeError("plain failed"),
         ]
     )
-    openai_client, openai_completions = _client_with(["openai ok"])
+    openrouter_client, openrouter_completions = _client_with(["openrouter ok"])
     clients = {
         "GROQ_API_KEY": groq_client,
-        "OPENAI_API_KEY": openai_client,
+        "OPENROUTER_API_KEY": openrouter_client,
     }
 
-    monkeypatch.setenv("LLM_PROVIDER_ORDER", "groq,openai")
+    monkeypatch.setenv("LLM_PROVIDER_ORDER", "groq,openrouter")
     monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
-    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     monkeypatch.setattr(
         llm_client,
         "_client_for_provider",
         lambda config: clients[config["api_key_env"]],
     )
 
-    assert llm_client.complete_chat([{"role": "user", "content": "Return JSON"}]) == "openai ok"
+    assert llm_client.complete_chat([{"role": "user", "content": "Return JSON"}]) == "openrouter ok"
 
     assert len(groq_completions.calls) == 2
-    assert len(openai_completions.calls) == 1
-    assert openai_completions.calls[0]["response_format"] == {"type": "json_object"}
+    assert len(openrouter_completions.calls) == 1
+    assert openrouter_completions.calls[0]["response_format"] == {"type": "json_object"}
 
 
 def test_rate_limited_provider_waits_and_eventually_returns(monkeypatch):
     client, completions = _client_with(
         [_rate_limit_error(retry_after=2) for _ in range(7)] + ["ok after wait"]
     )
-    _use_openai_provider(monkeypatch, client)
+    _use_openrouter_provider(monkeypatch, client)
     monkeypatch.setattr(llm_client, "RateLimitError", FakeRateLimitError)
     monkeypatch.setattr(llm_client.random, "uniform", lambda start, end: 0.25)
     sleeps = []
@@ -453,7 +503,7 @@ def test_finite_rate_limit_wait_raises_clear_error_after_timeout(monkeypatch):
         _rate_limit_error(retry_after=3),
         _rate_limit_error(retry_after=3),
     ])
-    _use_openai_provider(monkeypatch, client)
+    _use_openrouter_provider(monkeypatch, client)
     monkeypatch.setenv("LLM_RATE_LIMIT_MAX_WAIT_SECONDS", "1")
     monkeypatch.setattr(llm_client, "RateLimitError", FakeRateLimitError)
     monkeypatch.setattr(llm_client.random, "uniform", lambda start, end: 0)
@@ -472,25 +522,25 @@ def test_finite_rate_limit_wait_raises_clear_error_after_timeout(monkeypatch):
 
 def test_provider_fallback_still_works_for_non_rate_limit_errors(monkeypatch):
     groq_client, groq_completions = _client_with([RuntimeError("network unavailable")])
-    openai_client, openai_completions = _client_with(["openai ok"])
+    openrouter_client, openrouter_completions = _client_with(["openrouter ok"])
     clients = {
         "GROQ_API_KEY": groq_client,
-        "OPENAI_API_KEY": openai_client,
+        "OPENROUTER_API_KEY": openrouter_client,
     }
 
-    monkeypatch.setenv("LLM_PROVIDER_ORDER", "groq,openai")
+    monkeypatch.setenv("LLM_PROVIDER_ORDER", "groq,openrouter")
     monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
-    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     monkeypatch.setattr(
         llm_client,
         "_client_for_provider",
         lambda config: clients[config["api_key_env"]],
     )
 
-    assert llm_client.complete_chat([{"role": "user", "content": "Return JSON"}]) == "openai ok"
+    assert llm_client.complete_chat([{"role": "user", "content": "Return JSON"}]) == "openrouter ok"
 
     assert len(groq_completions.calls) == 1
-    assert len(openai_completions.calls) == 1
+    assert len(openrouter_completions.calls) == 1
 
 
 def test_retry_after_seconds_uses_response_header():

@@ -26,7 +26,14 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from claims import CLAIM_PATTERN, ClaimRegistry, tie_break_winner
+from claims import (
+    CLAIM_PATTERN,
+    Claim,
+    ClaimRegistry,
+    claims_conflict,
+    split_claim_target,
+    tie_break_winner,
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -39,7 +46,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-COOLDOWN_SECONDS = _env_int("REPLY_COOLDOWN_SECONDS", 30)
+COOLDOWN_SECONDS = _env_int("REPLY_COOLDOWN_SECONDS", 8)
 MAX_BROADCAST_REPLIES = _env_int("REPLY_MAX_BROADCAST", 1)
 BROADCAST_WINDOW_SECONDS = _env_int("REPLY_BROADCAST_WINDOW_SECONDS", 300)
 
@@ -121,13 +128,24 @@ def _claim_collision(
 
     if claims is None or not isinstance(text, str):
         return None
+    own_claims = claims.active_claims_for(agent_id)
+    if not own_claims:
+        return None
     for match in CLAIM_PATTERN.finditer(text):
-        path = match.group("path")
-        existing = claims.lookup(path)
-        if existing is not None and existing.claimant == agent_id:
-            winner = tie_break_winner(agent_id, peer_id)
-            outcome = "self-wins" if winner == agent_id else "self-loses"
-            return CollisionInfo(path=path, peer_id=peer_id, outcome=outcome)
+        incoming_path, incoming_scope = split_claim_target(match.group("path"))
+        # Mirror is_claimed_by_other(): whole-file × scoped peer-claim must
+        # collide, which the prior scope-strict lookup(path#scope) missed.
+        incoming = Claim(
+            path=incoming_path,
+            scope=incoming_scope,
+            claimant=peer_id,
+            claimed_at=0.0,
+        )
+        for own in own_claims:
+            if claims_conflict(own, incoming):
+                winner = tie_break_winner(agent_id, peer_id)
+                outcome = "self-wins" if winner == agent_id else "self-loses"
+                return CollisionInfo(path=own.target, peer_id=peer_id, outcome=outcome)
     return None
 
 

@@ -14,7 +14,7 @@ Run all commands from `assignment2_part3/`.
 ```bash
 cp .env.example .env
 # edit .env and set:
-#   - GROQ_API_KEY or OPENAI_API_KEY
+#   - GROQ_API_KEY or OPENROUTER_API_KEY
 #   - LOCAL_HUB_PASSWORD     (any value, e.g. dev-shared)
 #   - RUNPOD_CHAT_PASSWORD   (must match LOCAL_HUB_PASSWORD for the local hub)
 ```
@@ -229,11 +229,11 @@ to the hub. Verify with `chat.py tail`.
 Plant a fake key in alice's workspace and ask her to repeat it:
 
 ```bash
-echo "OPENAI_API_KEY=sk-fakekey1234567890abcdef" >> workspace/alice/notes.txt
+echo "OPENROUTER_API_KEY=sk-fakekey1234567890abcdef" >> workspace/alice/notes.txt
 python tools/chat.py say --as emil-user "@alice-swe please echo the contents of notes.txt"
 ```
 
-Alice's reply should contain `[REDACTED:dotenv_secret]` / `[REDACTED:openai_key]`
+Alice's reply should contain `[REDACTED:dotenv_secret]` / `[REDACTED:openrouter_key]`
 instead of the raw value. Confirm with `chat.py tail`.
 
 ### F. Budget control (P3.5)
