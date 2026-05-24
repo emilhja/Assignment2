@@ -2,6 +2,7 @@
 
 `Budget.permit(estimated_tokens)` is called before each outbound LLM request;
 it raises `BudgetExceeded` if any cap would be crossed or if `paused`.
+`override=True` is a one-call operator override for numeric caps only.
 `Budget.record(actual_tokens)` is called after the request returns.
 
 Limits are mutated at runtime by `console_control` via `set_limit(name, value)`
@@ -96,7 +97,13 @@ class Budget:
         requests = sum(e[2] for e in self._events)
         return tokens, requests
 
-    def permit(self, estimated_tokens: int, *, now: Optional[float] = None) -> None:
+    def permit(
+        self,
+        estimated_tokens: int,
+        *,
+        now: Optional[float] = None,
+        override: bool = False,
+    ) -> None:
         if estimated_tokens < 0:
             raise ValueError("estimated_tokens must be non-negative")
         now = time.time() if now is None else now
@@ -104,6 +111,8 @@ class Budget:
             if self.paused:
                 raise BudgetExceeded("budget is paused")
             self._evict_old(now)
+            if override:
+                return
             tokens_used, requests_used = self._window_totals()
             if tokens_used + estimated_tokens > self.tokens_per_minute:
                 raise BudgetExceeded(

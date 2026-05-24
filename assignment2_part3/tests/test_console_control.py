@@ -90,6 +90,68 @@ def test_deny_releases_pending_bash():
     stop.set()
 
 
+def test_approve_releases_pending_budget_override():
+    cc, budget, stop, stdout = _build_console(":approve\n")
+    result_holder = {}
+
+    def worker():
+        result_holder["approved"] = cc.request_budget_approval(
+            "would exceed tokens-per-minute", 123, timeout=2.0
+        )
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert _wait_for(lambda: cc._pending_budget is not None)
+    cc.start()
+    t.join(timeout=3.0)
+    assert result_holder.get("approved") is True
+    stop.set()
+
+
+def test_deny_releases_pending_budget_override():
+    cc, budget, stop, stdout = _build_console(":deny\n")
+    result_holder = {}
+
+    def worker():
+        result_holder["approved"] = cc.request_budget_approval(
+            "would exceed tokens-per-minute", 123, timeout=2.0
+        )
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert _wait_for(lambda: cc._pending_budget is not None)
+    cc.start()
+    t.join(timeout=3.0)
+    assert result_holder.get("approved") is False
+    stop.set()
+
+
+def test_approve_resolves_bash_before_budget_override():
+    cc, budget, stop, stdout = _build_console(":approve\n:deny\n")
+    result_holder = {}
+
+    def bash_worker():
+        result_holder["bash"] = cc.request_bash_approval("ls -la /workspace", timeout=2.0)
+
+    def budget_worker():
+        result_holder["budget"] = cc.request_budget_approval(
+            "would exceed tokens-per-minute", 123, timeout=2.0
+        )
+
+    bash_thread = threading.Thread(target=bash_worker)
+    budget_thread = threading.Thread(target=budget_worker)
+    bash_thread.start()
+    budget_thread.start()
+    assert _wait_for(lambda: cc._pending is not None)
+    assert _wait_for(lambda: cc._pending_budget is not None)
+    cc.start()
+    bash_thread.join(timeout=3.0)
+    budget_thread.join(timeout=3.0)
+    assert result_holder.get("bash") is True
+    assert result_holder.get("budget") is False
+    stop.set()
+
+
 def test_unknown_command_prints_help():
     cc, budget, stop, stdout = _start_console(":bogus arg\n")
     assert _wait_for(lambda: "unknown command" in stdout.getvalue())

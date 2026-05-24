@@ -30,6 +30,8 @@ from claims import (
     CLAIM_PATTERN,
     Claim,
     ClaimRegistry,
+    DEFER_PATTERN,
+    RELEASE_PATTERN,
     claims_conflict,
     split_claim_target,
     tie_break_winner,
@@ -80,6 +82,21 @@ class ReplyDecision:
     reason: str
     delay_seconds: float = 0.0
     collision: Optional[CollisionInfo] = None
+
+
+def _strip_protocol_lines(text: str) -> str:
+    """Remove DEFER/RELEASE lines so their @mentions don't trigger a reply.
+
+    A peer's "DEFER to @you" is a one-way acknowledgment; treating the @
+    inside it as a real address creates a tight ping-pong loop between
+    two agents that exhausts their token budgets.
+    """
+
+    if not isinstance(text, str) or not text:
+        return text
+    stripped = DEFER_PATTERN.sub("", text)
+    stripped = RELEASE_PATTERN.sub("", stripped)
+    return stripped
 
 
 def _mentions(text: str, names: tuple[str, ...]) -> bool:
@@ -181,7 +198,7 @@ def should_reply(
     if _coordinator_handoff(message.text, names):
         return ReplyDecision(True, "coordinator handoff", delay_seconds=0.0)
 
-    if _mentions(message.text, names):
+    if _mentions(_strip_protocol_lines(message.text), names):
         delay = rng.uniform(0.5, 1.5)
         return ReplyDecision(True, "directly addressed", delay_seconds=delay)
 

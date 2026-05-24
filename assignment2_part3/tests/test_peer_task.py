@@ -60,6 +60,69 @@ def test_budget_exhausted_returns_explanation(tmp_path):
     assert "budget" in answer.lower()
 
 
+class _BudgetApprovalConsole:
+    def __init__(self, approved):
+        self.approved = approved
+        self.requests = []
+
+    def request_budget_approval(self, reason, estimated_tokens):
+        self.requests.append((reason, estimated_tokens))
+        return self.approved
+
+
+def test_budget_override_denial_stops_without_llm_call(tmp_path):
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=1)
+    console = _BudgetApprovalConsole(approved=False)
+    msg = PeerMessage(id="m1", sender_id="bob", text="add docs to utils.py")
+
+    def chat_fn(messages):
+        raise AssertionError("should not be called when budget override is denied")
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        console=console,
+    )
+
+    assert "budget" in answer.lower()
+    assert console.requests
+    kinds = {kind for _role, kind, _content in _events(store)}
+    assert "budget_override_requested" in kinds
+    assert "budget_override_denied" in kinds
+
+
+def test_budget_override_approval_allows_llm_call(tmp_path):
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=1)
+    console = _BudgetApprovalConsole(approved=True)
+    msg = PeerMessage(id="m1", sender_id="bob", text="add docs to utils.py")
+    calls = []
+
+    def chat_fn(messages):
+        calls.append(messages)
+        return json.dumps({"type": "final", "answer": "Continuing after approval."})
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        console=console,
+    )
+
+    assert answer == "Continuing after approval."
+    assert len(calls) == 1
+    assert console.requests
+    kinds = {kind for _role, kind, _content in _events(store)}
+    assert "budget_override_requested" in kinds
+    assert "budget_override_approved" in kinds
+
+
 def test_scripted_final_is_returned_and_scrubbed(tmp_path):
     store = _store(tmp_path)
     budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
@@ -451,6 +514,598 @@ def test_non_conflicting_scoped_claims_allow_patch_without_losing_peer_work(tmp_
     assert "claim_block" not in kinds
 
 
+def test_claim_continuation_recovers_from_empty_old_text_append(tmp_path, monkeypatch):
+    private = tmp_path / "bob"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    original = (
+        "def add(a, b):\n"
+        "    return a + b\n\n"
+        "def subtract(a, b):\n"
+        "    return a - b\n"
+    )
+    updated = (
+        original
+        + "\n"
+        + "def multiply(a, b):\n"
+        + "    return a * b\n\n"
+        + "def divide(a, b):\n"
+        + "    if b == 0:\n"
+        + "        raise ValueError('Cannot divide by zero')\n"
+        + "    return a / b\n"
+    )
+    (shared / "calculator.py").write_text(original, encoding="utf-8")
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    claims.record_observed("bob", "/workspace/shared/calculator.py#multiply-divide")
+    msg = PeerMessage(
+        id="m1:claim-continuation:/workspace/shared/calculator.py#multiply-divide",
+        sender_id="runtime",
+        text="Continue the active shared-file claim you already posted.",
+    )
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "edit_section",
+            "args": {
+                "path": "/workspace/shared/calculator.py",
+                "old_text": "",
+                "new_text": "\ndef multiply(a, b):\n    return a * b\n",
+            },
+        }),
+        json.dumps({
+            "type": "tool_call",
+            "tool": "read_file",
+            "args": {"path": "/workspace/shared/calculator.py"},
+        }),
+        json.dumps({
+            "type": "tool_call",
+            "tool": "edit_section",
+            "args": {
+                "path": "/workspace/shared/calculator.py",
+                "old_text": original,
+                "new_text": updated,
+            },
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Updated /workspace/shared/calculator.py with multiply and divide.",
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="bob",
+    )
+
+    assert "Updated" in answer
+    assert (shared / "calculator.py").read_text(encoding="utf-8") == updated
+    kinds = {kind for _role, kind, _content in _events(store)}
+    assert "edit_recovery_guidance" in kinds
+
+
+def test_claim_continuation_appends_to_existing_shared_file(tmp_path, monkeypatch):
+    private = tmp_path / "bob"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    original = "def add(a, b):\n    return a + b\n"
+    addition = "\n\ndef multiply(a, b):\n    return a * b\n"
+    (shared / "calculator.py").write_text(original, encoding="utf-8")
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    claims.record_observed("bob", "/workspace/shared/calculator.py#multiply")
+    msg = PeerMessage(
+        id="m1:claim-continuation:/workspace/shared/calculator.py#multiply",
+        sender_id="runtime",
+        text="Continue the active shared-file claim you already posted.",
+    )
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "append_text",
+            "args": {
+                "path": "/workspace/shared/calculator.py",
+                "content": addition,
+            },
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Updated /workspace/shared/calculator.py with multiply.",
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="bob",
+    )
+
+    assert answer == "Updated /workspace/shared/calculator.py with multiply."
+    assert (shared / "calculator.py").read_text(encoding="utf-8") == original + addition
+
+
+def test_failed_shared_write_flag_clears_on_subsequent_success(tmp_path, monkeypatch):
+    """Reproduces alice's SQL trace (events 1518-1526): first create_file is
+    blocked because a peer's write got there first, then edit_section
+    recovers and succeeds. The model's truthful final answer MUST reach the
+    hub unchanged — the runtime must not rewrite it as "I could not
+    complete the shared-file write"."""
+
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    existing = "def multiply(a, b):\n    return a * b\n"
+    updated = (
+        "def add(a, b):\n"
+        "    return a + b\n\n"
+        "def multiply(a, b):\n"
+        "    return a * b\n"
+    )
+    (shared / "calculator.py").write_text(existing, encoding="utf-8")
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
+    msg = PeerMessage(id="m1", sender_id="runtime", text="continue claim")
+    responses = iter([
+        # 1) create_file is blocked (file already exists) → sets the flag.
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {
+                "path": "/workspace/shared/calculator.py",
+                "content": updated,
+                "overwrite": False,
+            },
+        }),
+        # 2) edit_section succeeds → flag must reset.
+        json.dumps({
+            "type": "tool_call",
+            "tool": "edit_section",
+            "args": {
+                "path": "/workspace/shared/calculator.py",
+                "old_text": existing,
+                "new_text": updated,
+            },
+        }),
+        # 3) Truthful success report. Mentions "/workspace/shared/" and
+        #    "updated", which is exactly what _looks_like_write_success_claim
+        #    matches — so the rewrite must NOT fire here.
+        json.dumps({
+            "type": "final",
+            "answer": "Updated /workspace/shared/calculator.py with add.",
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert answer == "Updated /workspace/shared/calculator.py with add."
+    assert (shared / "calculator.py").read_text(encoding="utf-8") == updated
+    kinds = {kind for _role, kind, _content in _events(store)}
+    assert "claim_block" in kinds  # the initial create_file was indeed blocked
+    assert "peer_reply_corrected" not in kinds  # but the rewrite did NOT fire
+
+
+def test_failed_shared_write_flag_persists_when_no_recovery(tmp_path, monkeypatch):
+    """Counterpart to the previous test: when there is no later successful
+    shared write, the rewrite at peer_task.py:441-447 MUST still fire so the
+    model can't falsely claim it created a file it never wrote. Locks in
+    that the flag-reset only loosens the override for genuine recoveries."""
+
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    msg = PeerMessage(id="m1", sender_id="runtime", text="continue claim")
+    responses = iter([
+        # No active claim → blocked, sets the flag.
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/calculator.py", "content": "x = 1\n"},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Created /workspace/shared/calculator.py successfully.",
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert "could not complete" in answer.lower()
+    assert not (shared / "calculator.py").exists()
+    assert "peer_reply_corrected" in {kind for _role, kind, _content in _events(store)}
+
+
+def test_claim_continuation_reprompts_repeated_claim_then_writes(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
+    msg = PeerMessage(
+        id="m1:claim-continuation:/workspace/shared/calculator.py#add-subtract",
+        sender_id="runtime",
+        text="Continue the active shared-file claim you already posted.",
+    )
+    content = "def add(a, b):\n    return a + b\n"
+    responses = iter([
+        json.dumps({
+            "type": "final",
+            "answer": "CLAIM /workspace/shared/calculator.py#add-subtract#add-subtract: Implement add",
+        }),
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/calculator.py", "content": content},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Created /workspace/shared/calculator.py with add.",
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert answer == "Created /workspace/shared/calculator.py with add."
+    assert (shared / "calculator.py").read_text(encoding="utf-8") == content
+    assert "claim_continuation_reprompt" in {kind for _role, kind, _content in _events(store)}
+
+
+def test_claim_continuation_allows_new_claim_for_sidecar_test_file(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
+    msg = PeerMessage(
+        id="m1:claim-continuation:/workspace/shared/calculator.py#add-subtract",
+        sender_id="runtime",
+        text="Continue the active shared-file claim you already posted.",
+    )
+
+    def chat_fn(messages):
+        return json.dumps({
+            "type": "final",
+            "answer": "CLAIM /workspace/shared/test_calculator.py#tests: Add pytest coverage",
+        })
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert answer == "CLAIM /workspace/shared/test_calculator.py#tests: Add pytest coverage"
+    assert any(
+        claim.target == "/workspace/shared/test_calculator.py#tests"
+        for claim in claims.active_claims_for("alice")
+    )
+    assert "claim_continuation_reprompt" not in {
+        kind for _role, kind, _content in _events(store)
+    }
+
+
+def test_claim_continuation_stops_after_repeated_release_without_write(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add")
+    msg = PeerMessage(
+        id="m1:claim-continuation:/workspace/shared/calculator.py#add",
+        sender_id="runtime",
+        text="Continue the active shared-file claim you already posted.",
+    )
+    responses = iter([
+        json.dumps({
+            "type": "final",
+            "answer": "RELEASE /workspace/shared/calculator.py#add",
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "RELEASE /workspace/shared/calculator.py#add",
+        }),
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/calculator.py", "content": "x = 1\n"},
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert "release the claim before completing the write" in answer
+    assert not (shared / "calculator.py").exists()
+    kinds = {kind for _role, kind, _content in _events(store)}
+    assert "claim_release_without_write_reprompt" in kinds
+    assert "claim_continuation_giveup" in kinds
+
+
+def test_claim_continuation_reprompts_declarative_missing_file_then_writes(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
+    msg = PeerMessage(
+        id="m1:claim-continuation:/workspace/shared/calculator.py#add-subtract",
+        sender_id="runtime",
+        text="Continue the active shared-file claim you already posted.",
+    )
+    content = "def add(a, b):\n    return a + b\n"
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "read_file",
+            "args": {"path": "/workspace/shared/calculator.py"},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": (
+                "The file /workspace/shared/calculator.py does not exist. "
+                "I will create it and implement add and subtract."
+            ),
+        }),
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/calculator.py", "content": content},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Created /workspace/shared/calculator.py with add.",
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert answer == "Created /workspace/shared/calculator.py with add."
+    assert (shared / "calculator.py").read_text(encoding="utf-8") == content
+    assert "claim_continuation_pending_write_reprompt" in {
+        kind for _role, kind, _content in _events(store)
+    }
+
+
+def test_claim_continuation_reprompts_release_without_write_then_writes(tmp_path, monkeypatch):
+    """Reproduces the alice/bob calculator stall: agent posts RELEASE in the
+    runtime continuation without ever calling a write tool. The runtime must
+    refuse to send that as the final answer and reprompt for a real write.
+    Once the write happens, the success report goes through unchanged."""
+
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
+    msg = PeerMessage(
+        id="m1:claim-continuation:/workspace/shared/calculator.py#add-subtract",
+        sender_id="runtime",
+        text="Continue the active shared-file claim you already posted.",
+    )
+    content = "def add(a, b):\n    return a + b\n"
+    responses = iter([
+        # 1) Buggy model returns RELEASE in the continuation without any write.
+        json.dumps({
+            "type": "final",
+            "answer": "RELEASE /workspace/shared/calculator.py#add-subtract",
+        }),
+        # 2) After the reprompt, model does the write.
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/calculator.py", "content": content},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Created /workspace/shared/calculator.py with add.",
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert answer == "Created /workspace/shared/calculator.py with add."
+    assert (shared / "calculator.py").read_text(encoding="utf-8") == content
+    kinds = {kind for _role, kind, _content in _events(store)}
+    assert "claim_release_without_write_reprompt" in kinds
+
+
+def test_claim_continuation_allows_release_after_successful_write(tmp_path, monkeypatch):
+    """The reprompt must NOT fire when a successful shared write has already
+    happened in this round — RELEASE after a real write is the correct
+    end-of-work signal."""
+
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
+    msg = PeerMessage(
+        id="m1:claim-continuation:/workspace/shared/calculator.py#add-subtract",
+        sender_id="runtime",
+        text="Continue the active shared-file claim you already posted.",
+    )
+    content = "def add(a, b):\n    return a + b\n"
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/calculator.py", "content": content},
+        }),
+        # Final answer combines a success line with a RELEASE — must go
+        # through unchanged.
+        json.dumps({
+            "type": "final",
+            "answer": (
+                "Created /workspace/shared/calculator.py with add.\n"
+                "RELEASE /workspace/shared/calculator.py#add-subtract"
+            ),
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert "Created" in answer
+    assert "RELEASE /workspace/shared/calculator.py#add-subtract" in answer
+    kinds = {kind for _role, kind, _content in _events(store)}
+    assert "claim_release_without_write_reprompt" not in kinds
+
+
 def test_collision_self_wins_injects_proceed_guidance(tmp_path):
     """When the runtime hands us a self-wins collision, the LLM must see
     deterministic 'proceed, do not DEFER' guidance before its first round."""
@@ -616,6 +1271,102 @@ def test_chat_string_return_still_works_with_null_metadata(tmp_path):
     rows = cur.fetchall()
     assert rows == [(None, None)]
     assert budget.snapshot()["estimated_fallback_tokens"] > 0
+
+
+def test_successful_shared_write_marks_claim_satisfied(tmp_path, monkeypatch):
+    """A successful create_file on the claimed shared path must flip the
+    satisfaction bit so the next-turn nudge in group_chat goes quiet.
+    Otherwise the agent would be told to "finish or release" a claim they
+    already wrote."""
+
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
+    assert len(claims.unsatisfied_claims_for("alice")) == 1
+
+    msg = PeerMessage(id="m1", sender_id="runtime", text="continue claim")
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/calculator.py", "content": "def add(a,b):\n    return a+b\n"},
+        }),
+        json.dumps({"type": "final", "answer": "Created /workspace/shared/calculator.py."}),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert claims.unsatisfied_claims_for("alice") == []
+
+
+def test_failed_shared_write_leaves_claim_unsatisfied(tmp_path, monkeypatch):
+    """A blocked write must NOT mark satisfaction — the agent still owes
+    that write and should be nudged on the next turn."""
+
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    # Pre-existing file forces create_file with overwrite=false to fail.
+    (shared / "calculator.py").write_text("def multiply(a, b):\n    return a*b\n", encoding="utf-8")
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
+
+    msg = PeerMessage(id="m1", sender_id="runtime", text="continue claim")
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {
+                "path": "/workspace/shared/calculator.py",
+                "content": "def add(a,b):\n    return a+b\n",
+                "overwrite": False,
+            },
+        }),
+        json.dumps({"type": "final", "answer": "The write was blocked."}),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    unsatisfied = claims.unsatisfied_claims_for("alice")
+    assert len(unsatisfied) == 1
+    assert unsatisfied[0].target == "/workspace/shared/calculator.py#add-subtract"
 
 
 def test_mutual_defer_injects_tie_break_guidance(tmp_path):

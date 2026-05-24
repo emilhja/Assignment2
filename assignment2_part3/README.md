@@ -54,8 +54,9 @@ narrower follow-up command instead of guessing.
 - **Budget gating.** Every LLM call passes through `Budget.permit`
   first. Three caps are enforced on a sliding 60-second window:
   tokens-per-minute, requests-per-minute, and a lifetime token total.
-  Going over any of them raises `BudgetExceeded` and the agent posts a
-  short "I have to stop here" message instead of calling the API.
+  Going over any of them raises `BudgetExceeded`; the local operator can
+  approve one over-cap LLM call with `:approve`, otherwise the agent posts
+  a short "I have to stop here" message instead of calling the API.
 - **Cooperation norms.** `config/cooperation_norms.md` is loaded into
   the system prompt and asks the agent to announce intent before edits,
   summarise after, respect ownership, and decline non-SWE topics.
@@ -239,7 +240,7 @@ While the agent is running, the local console accepts one-line commands
 | `:limit rpm <N>` | Set requests-per-minute. |
 | `:limit total <N>` | Set lifetime token cap. |
 | `:pause` / `:resume` | Stop / resume outbound LLM calls. Persisted to disk. |
-| `:approve` / `:deny` | Answer the pending bash approval. |
+| `:approve` / `:deny` | Answer the pending bash or one-shot budget approval. |
 | `:say <text>` | Post `<text>` to the group chat as this agent. Scrubbed for credentials before send. |
 | `:stop` | Shut down cleanly. |
 | `:help` | Print this list. |
@@ -258,6 +259,8 @@ written to `data/budget_<AGENT_ID>.json` so a restart preserves it.
   broadcast appears to go unanswered.
 - `[approval needed] bash> ...` — local-only bash approval prompt.
   Never sent to the hub.
+- `[budget approval needed] budget> ...` — local-only one-shot approval
+  for an over-cap LLM call. Never sent to the hub.
 - `[say scrubbed: [...]]` — operator's `:say` text had credentials
   redacted before posting.
 
@@ -284,6 +287,20 @@ docker attach assignment2_part3-agent-alice-1
 
 The hub never sees the bash command or the approval — only the final
 scrubbed answer is posted.
+
+### Approving one over-budget LLM call
+
+When an agent would exceed a token/rate cap, the local terminal prints:
+
+```
+[budget approval needed] budget> would exceed tokens-per-minute (...) estimated_tokens=5739
+Type :approve to allow this one LLM call, or :deny to stop.
+```
+
+Type `:approve` in that agent's attached console to allow only the blocked
+LLM call. This does not change `:budget` limits; use `:limit` for a
+persistent limit change. `:deny` or a timeout preserves the normal
+"I have to stop here" response.
 
 ---
 
@@ -347,7 +364,7 @@ BOB_LLM_PROVIDER_ORDER=local,groq
 | Outbound scrubber | `peer.scrub_outbound` (`peer.py:105-121`) | Credentials in any outbound text, incl. `:say`. |
 | Bash safety check | Part 2's `safety.safety_check` | Destructive bash patterns before the operator is even asked. |
 | Bash operator approval | `console_control.request_bash_approval` | Every accepted bash command waits for `:approve`. |
-| Budget gate | `Budget.permit` (`budget.py:84-106`) | Rate / token-cap exceeded → no API call. |
+| Budget gate | `Budget.permit` (`budget.py:84-106`) | Rate / token-cap exceeded → no API call unless the local operator approves a one-shot override. |
 | Reply gate | `reply_policy.should_reply` | Off-topic / cooldown / broadcast back-off → no API call. |
 | Workspace sandbox | `AGENT_WORKSPACE=workspace/<AGENT_ID>` | All tool I/O confined to one directory per agent. |
 | Shared-write claim gate | `peer_task._maybe_claim_block` + `claims.ClaimRegistry` | Double-write on `/workspace/shared/<path>` when a peer already claimed it. |
@@ -383,7 +400,7 @@ See `demo.md` for the long-form walkthroughs.
 | P3.2 no-leak system prompt + scrubber | `config/system_prompt.txt`, `peer.peer_intent_refusal`, `peer.scrub_outbound` |
 | P3.3 responsible team-player | `config/cooperation_norms.md` + "Team-player norms" in `system_prompt.txt` |
 | P3.4 hub-only communication | All outbound text via `transport.Transport.send`; console is operator-only |
-| P3.5 rate-limit + token cap + real-time control | `budget.Budget` + `console_control.ConsoleControl` (`:limit`, `:budget`, `:pause`, `:resume`) |
+| P3.5 rate-limit + token cap + real-time control | `budget.Budget` + `console_control.ConsoleControl` (`:limit`, `:budget`, `:pause`, `:resume`, one-shot `:approve`) |
 | P3.6 N×M reply gate | `reply_policy.should_reply` (pure function, no LLM cost) |
 | P3.7 unique agent name | `AGENT_ID` + `AGENT_DISPLAY_NAME`; placeholder names rejected in `transport._validate_hub_name` |
 
@@ -412,7 +429,7 @@ assignment2_part3/
 │  ├─ local_hub.py            mock TH25 hub for offline development
 │  ├─ chat.py                 REST client (say / tail / stats)
 │  └─ audit.py                cross-agent SQLite log inspector (read-only)
-├─ tests/                pytest suite (101 tests)
+├─ tests/                pytest suite (168 tests)
 ├─ workspace/<AGENT_ID>/ each agent's isolated workspace
 └─ data/                 budget_<id>.json, session_history.sqlite3, seen_messages_*.json
 ```
@@ -429,7 +446,8 @@ One-line responsibilities:
   gating, peer refusal on every round, refusal on tool args, outbound scrub
   before return.
 - **`budget.py`** — sliding-window rate limit + lifetime cap + JSON
-  persistence. Thread-safe via internal lock. Raises `BudgetExceeded`.
+  persistence. Thread-safe via internal lock. Raises `BudgetExceeded`;
+  supports explicit one-call overrides for local operator approval.
 - **`peer.py`** — `PeerMessage` (frozen dataclass), `peer_intent_refusal`
   (per-round leak-attempt gate, stricter than Part 2's `intent_refusal`),
   `scrub_outbound` (credential redaction).
@@ -443,7 +461,7 @@ One-line responsibilities:
   rejects placeholder names. Seen-message dedup persisted to JSON.
 - **`console_control.py`** — daemon thread reads `:`-prefixed operator
   commands from stdin and mutates the live `Budget`, scrubs `:say` text,
-  or resolves a pending bash approval. Never touches the LLM.
+  or resolves a pending bash/budget approval. Never touches the LLM.
 - **`thread_safe_store.py`** — `ThreadSafeSessionStore` subclasses Part 2's
   SQLite log with `check_same_thread=False` and a write lock.
 - **`part2_bridge.py`** — one `sys.path.insert` for `../assignment2_part2/`.
@@ -454,7 +472,7 @@ One-line responsibilities:
 ## Testing
 
 ```bash
-python -m pytest assignment2_part3 -q     # Part 3 suite (101 tests)
+python -m pytest assignment2_part3/tests -q     # Part 3 suite (168 tests)
 python -m pytest assignment2_part2 -q     # Part 2 suite (95 tests)
 ```
 

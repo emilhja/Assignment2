@@ -15,8 +15,8 @@ Commands (one per line, `:` prefix):
     :limit total <N>            set lifetime token cap
     :pause                      stop outbound LLM calls
     :resume                     undo :pause
-    :approve                    approve the pending bash command (if any)
-    :deny                       deny the pending bash command
+    :approve                    approve the pending bash/budget request (if any)
+    :deny                       deny the pending bash/budget request
     :say <text>                 post a message to the group chat as this agent
     :stop                       signal the orchestrator to exit
     :help                       print this list
@@ -42,7 +42,7 @@ HELP_TEXT = (
     "  :budget                       show current usage and limits\n"
     "  :limit tpm|rpm|total <N>      set a runtime limit\n"
     "  :pause / :resume              stop or resume outbound LLM calls\n"
-    "  :approve / :deny              answer the pending bash approval\n"
+    "  :approve / :deny              answer the pending bash/budget approval\n"
     "  :say <text>                   post a message to the group chat as this agent\n"
     "  :stop                         exit cleanly\n"
     "  :help                         print this list\n"
@@ -52,6 +52,13 @@ HELP_TEXT = (
 @dataclass
 class BashApproval:
     command: str
+    response: queue.Queue  # holds True (approve) / False (deny)
+
+
+@dataclass
+class BudgetApproval:
+    reason: str
+    estimated_tokens: int
     response: queue.Queue  # holds True (approve) / False (deny)
 
 
@@ -71,6 +78,7 @@ class ConsoleControl:
         self.send_fn = send_fn
         self._approval_lock = threading.Lock()
         self._pending: Optional[BashApproval] = None
+        self._pending_budget: Optional[BudgetApproval] = None
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
@@ -99,7 +107,39 @@ class ConsoleControl:
             self._print(colors.paint("[approval timed out] command denied.", colors.RED))
         finally:
             with self._approval_lock:
-                self._pending = None
+                if self._pending is not None and self._pending.response is response:
+                    self._pending = None
+        return bool(approved)
+
+    def request_budget_approval(
+        self,
+        reason: str,
+        estimated_tokens: int,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Block until operator approves one over-budget LLM call."""
+
+        response: queue.Queue = queue.Queue(maxsize=1)
+        pending = BudgetApproval(
+            reason=reason,
+            estimated_tokens=estimated_tokens,
+            response=response,
+        )
+        with self._approval_lock:
+            self._pending_budget = pending
+        tag = colors.paint("[budget approval needed]", colors.BOLD, colors.YELLOW)
+        prompt = colors.paint("budget>", colors.BOLD)
+        hint = colors.dim("Type :approve to allow this one LLM call, or :deny to stop.")
+        self._print(f"\n{tag} {prompt} {reason} estimated_tokens={estimated_tokens}\n{hint}")
+        try:
+            approved = response.get(timeout=timeout)
+        except queue.Empty:
+            approved = False
+            self._print(colors.paint("[approval timed out] budget override denied.", colors.RED))
+        finally:
+            with self._approval_lock:
+                if self._pending_budget is pending:
+                    self._pending_budget = None
         return bool(approved)
 
     def _print(self, text: str) -> None:
@@ -112,9 +152,16 @@ class ConsoleControl:
     def _resolve_pending(self, approved: bool) -> bool:
         with self._approval_lock:
             pending = self._pending
+            pending_budget = self._pending_budget
         if pending is None:
-            self._print(colors.dim("[no pending bash approval]"))
-            return False
+            if pending_budget is None:
+                self._print(colors.dim("[no pending approval]"))
+                return False
+            try:
+                pending_budget.response.put_nowait(approved)
+            except queue.Full:
+                return False
+            return True
         try:
             pending.response.put_nowait(approved)
         except queue.Full:

@@ -143,3 +143,135 @@ def test_clear_defers_between_targets_pair():
     assert registry.mutual_defer_detected("alice", "bob") is False
     # Unrelated defers remain.
     assert registry.mutual_defer_detected("alice", "carol") is False  # carol hasn't deferred back
+
+
+def test_mark_satisfied_excludes_claim_from_unsatisfied_list():
+    """A write to the base path satisfies the scoped claim too — the agent
+    only owes one successful write per scoped claim, so the unsatisfied
+    nudge in group_chat should disappear once the write lands."""
+
+    registry = ClaimRegistry()
+    registry.record_observed("alice", "/workspace/shared/calc.py#add")
+
+    unsatisfied = registry.unsatisfied_claims_for("alice")
+    assert len(unsatisfied) == 1
+    assert unsatisfied[0].target == "/workspace/shared/calc.py#add"
+
+    # The write tool fires on the base path — the scope is implicit.
+    assert registry.mark_satisfied("alice", "/workspace/shared/calc.py") is True
+    assert registry.unsatisfied_claims_for("alice") == []
+
+
+def test_mark_satisfied_only_affects_matching_claimant():
+    """Alice's write must not silence bob's open claim — otherwise bob would
+    get no nudge for work he still owes."""
+
+    registry = ClaimRegistry()
+    registry.record_observed("alice", "/workspace/shared/calc.py#add")
+    registry.record_observed("bob", "/workspace/shared/calc.py#multiply")
+
+    registry.mark_satisfied("alice", "/workspace/shared/calc.py")
+    assert registry.unsatisfied_claims_for("alice") == []
+    bob_unsatisfied = registry.unsatisfied_claims_for("bob")
+    assert len(bob_unsatisfied) == 1
+    assert bob_unsatisfied[0].target == "/workspace/shared/calc.py#multiply"
+
+
+def test_mark_satisfied_no_matching_claim_returns_false():
+    registry = ClaimRegistry()
+    assert registry.mark_satisfied("alice", "/workspace/shared/calc.py") is False
+
+
+def test_release_clears_satisfaction_so_reclaim_is_unsatisfied():
+    """After RELEASE the path is free; a fresh claim on the same path must
+    appear in unsatisfied — otherwise the new write would be skipped by the
+    nudge logic because the prior satisfaction lingered."""
+
+    registry = ClaimRegistry()
+    registry.record_observed("alice", "/workspace/shared/calc.py#add")
+    registry.mark_satisfied("alice", "/workspace/shared/calc.py")
+    assert registry.release("alice", "/workspace/shared/calc.py#add") is True
+
+    registry.record_observed("alice", "/workspace/shared/calc.py#add")
+    unsatisfied = registry.unsatisfied_claims_for("alice")
+    assert len(unsatisfied) == 1
+    assert unsatisfied[0].target == "/workspace/shared/calc.py#add"
+
+
+def test_ttl_expiry_clears_satisfaction_so_reclaim_is_unsatisfied():
+    times = iter([10.0, 11.0, 80.0, 81.0, 82.0])
+    registry = ClaimRegistry(ttl_seconds=30.0, clock=lambda: next(times))
+    registry.record_observed("alice", "/workspace/shared/calc.py#add")   # claimed_at=10
+    registry.mark_satisfied("alice", "/workspace/shared/calc.py")        # satisfied_at=11
+    # Lookup at t=80 is past the 30s TTL, so the claim (and its
+    # satisfaction entry) must be swept.
+    assert registry.lookup("/workspace/shared/calc.py#add") is None
+
+    registry.record_observed("alice", "/workspace/shared/calc.py#add")   # claimed_at=81
+    unsatisfied = registry.unsatisfied_claims_for("alice")               # now=82
+    assert len(unsatisfied) == 1
+
+
+def test_release_without_satisfaction_is_tracked_for_next_turn_nudge():
+    """The bug we're fixing: alice posts CLAIM then RELEASE in the same
+    exchange without ever calling a write tool. The registry has nothing to
+    nudge with on her next turn unless we remember the abandonment."""
+
+    registry = ClaimRegistry()
+    registry.record_observed("alice", "/workspace/shared/calc.py#add")
+    assert registry.release("alice", "/workspace/shared/calc.py#add") is True
+
+    released = registry.recently_released_unsatisfied_for("alice")
+    assert len(released) == 1
+    assert released[0].target == "/workspace/shared/calc.py#add"
+
+
+def test_release_after_satisfaction_is_not_tracked_as_abandoned():
+    """If alice actually wrote the file, RELEASE is the correct end-of-work
+    signal — the nudge must NOT fire on her next turn."""
+
+    registry = ClaimRegistry()
+    registry.record_observed("alice", "/workspace/shared/calc.py#add")
+    registry.mark_satisfied("alice", "/workspace/shared/calc.py")
+    assert registry.release("alice", "/workspace/shared/calc.py#add") is True
+
+    assert registry.recently_released_unsatisfied_for("alice") == []
+
+
+def test_recently_released_unsatisfied_window_expires():
+    times = iter([10.0, 11.0, 12.0, 200.0])
+    registry = ClaimRegistry(
+        released_unsatisfied_window_seconds=60.0,
+        clock=lambda: next(times),
+    )
+    registry.record_observed("alice", "/workspace/shared/calc.py#add")   # t=10
+    registry.release("alice", "/workspace/shared/calc.py#add")           # released_at=11
+
+    # Within window we see it; far beyond, it's gone.
+    assert len(registry.recently_released_unsatisfied_for("alice")) == 1  # t=12
+    assert registry.recently_released_unsatisfied_for("alice") == []      # t=200
+
+
+def test_reclaiming_same_target_clears_released_unsatisfied_record():
+    """Re-CLAIMing the same path means the agent intends to do the work
+    again — the prior abandonment record is stale and should not nudge."""
+
+    registry = ClaimRegistry()
+    registry.record_observed("alice", "/workspace/shared/calc.py#add")
+    registry.release("alice", "/workspace/shared/calc.py#add")
+    assert len(registry.recently_released_unsatisfied_for("alice")) == 1
+
+    registry.record_observed("alice", "/workspace/shared/calc.py#add")
+    assert registry.recently_released_unsatisfied_for("alice") == []
+
+
+def test_released_unsatisfied_is_scoped_per_claimant():
+    """Bob abandoning his multiply-divide scope must not show up as alice's
+    abandoned work."""
+
+    registry = ClaimRegistry()
+    registry.record_observed("bob", "/workspace/shared/calc.py#multiply")
+    registry.release("bob", "/workspace/shared/calc.py#multiply")
+
+    assert registry.recently_released_unsatisfied_for("alice") == []
+    assert len(registry.recently_released_unsatisfied_for("bob")) == 1

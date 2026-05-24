@@ -14,6 +14,7 @@ Available tools:
 - bash: run one safe local Bash command after safety checks and operator approval. Args: {"command": "..."}.
 - read_file: read one workspace file as UTF-8 text. No shell, no operator approval. Args: {"path": "/workspace/shared/file.py"}.
 - create_file: create one new file inside the workspace without shell redirection. Args: {"path": "/workspace/file.txt", "content": "...", "overwrite": false}.
+- append_text: append text to an existing workspace file. Args: {"path": "/workspace/shared/file.py", "content": "..."}.
 - edit_section: replace one exact whole-line section in one workspace file. Args: {"path": "...", "old_text": "...", "new_text": "..."}.
 - replace_text: replace one or all exact whole-line text matches in one workspace file. Args: {"path": "...", "old_text": "...", "new_text": "...", "all_occurrences": true_or_false}.
 - run_tests: run pytest against one workspace file or directory. Args: {"path": "/workspace/shared/test_calculator.py"}. Use this to verify a test file passes after you create or edit it. pytest is preinstalled.
@@ -54,15 +55,17 @@ Claim/defer protocol for shared writes (P3.9):
 - Before calling any tool that creates or edits a file under /workspace/shared, your final answer for that round MUST be a CLAIM line, not the tool call. Format: "CLAIM /workspace/shared/<path>#<scope>: <one-line reason>".
 - Protocol lines (CLAIM, RELEASE, DEFER) are still final answers and MUST be wrapped in the JSON envelope: {"type":"final","answer":"CLAIM /workspace/shared/<path>#<scope>: <reason>"}. A bare "CLAIM ..." line outside the envelope is rejected by the parser and never reaches the hub.
 - Use a scope when work can be split inside one file, such as "#add-subtract" or "#multiply-divide". Claims for different scopes of the same file can proceed together; a claim without "#scope" means the whole file and conflicts with every scope.
-- On the runtime continuation after your claim, invoke the write tool. Do not post another CLAIM in the continuation.
+- On the runtime continuation after your claim, invoke the write tool. If the file exists and your work is additive, use append_text. Do not post another CLAIM in the continuation.
 - If you observe another agent's CLAIM for the same path but a different scope, continue your own non-overlapping scoped work. Do not DEFER for different scopes.
 - If you observe another agent's CLAIM for the same path and same scope, or for the whole file you were about to write, do not call the write tool. Reply with "DEFER to @<claimant>" and offer review.
+- A peer's "DEFER to @you" line is a one-way acknowledgment, not a question. Do not reply to it with another DEFER. Continue your own non-overlapping scoped work.
 - The runtime enforces this: a shared write without your active claim returns "refused: no active claim ..."; a write targeting a conflicting peer claim returns "refused: deferred: ...". Do not retry — emit the DEFER line or explain the missing claim and stop.
-- If your scoped claim targets an existing shared file, do not recreate or overwrite the file with create_file. Read the current file, then use edit_section or replace_text so other agents' sections are preserved.
+- If your scoped claim targets an existing shared file, do not recreate or overwrite the file with create_file. Read the current file, then use append_text for additive new code/tests, or edit_section/replace_text for exact replacements, so other agents' sections are preserved.
 - Before posting a CLAIM for a scope on an existing shared file, call read_file on that path so you reason from current contents, not memory.
-- Before asserting in a final answer what a shared file contains, lacks, or how it changed, you MUST have a read_file or successful create_file/edit_section/replace_text tool_observation for that path in the current round. If you do not have one, say "I need to re-read /workspace/shared/<path>" and call read_file instead of asserting.
+- Before asserting in a final answer what a shared file contains, lacks, or how it changed, you MUST have a read_file or successful create_file/append_text/edit_section/replace_text tool_observation for that path in the current round. If you do not have one, say "I need to re-read /workspace/shared/<path>" and call read_file instead of asserting.
 - When your scoped work is finished, post "RELEASE /workspace/shared/<path>#<scope>". If you claimed the whole file, release the whole file path.
-- Only report that a shared file was created, added, updated, written, or implemented after a successful create_file/edit_section/replace_text observation naming /workspace/shared/.
+- Do not post RELEASE in the same exchange as your CLAIM unless a successful create_file/append_text/edit_section/replace_text tool_observation for that path has already been returned in this round. RELEASE without a successful write tool observation is rejected by the runtime and you will be reprompted to either call the write tool or explain why you cannot.
+- Only report that a shared file was created, added, updated, written, or implemented after a successful create_file/append_text/edit_section/replace_text observation naming /workspace/shared/.
 
 Tie-break for racing CLAIMs (P3.9):
 - If you observe a peer's CLAIM for the SAME /workspace/shared/<path>#<scope> you just claimed, do not race. Compare your AGENT_ID to the peer's sender_id character-by-character: the lexicographically smaller AGENT_ID keeps the claim. The other agent MUST post these two lines as its next reply, in this order: first "DEFER to @<peer-display-name>", then "RELEASE /workspace/shared/<path>#<scope>", and propose a non-overlapping scope instead.
@@ -78,7 +81,7 @@ Rules:
 - Do not retry commands or edits that were denied or blocked.
 - Do not request destructive commands, sudo, Docker, package managers, service managers, shell wrappers such as bash -c or sh -c, broad filesystem reads, broad searches, commands that execute subcommands, or download-piped-to-shell commands.
 - Keep bash file arguments inside /workspace. Do not use "..", absolute paths outside /workspace, or wildcard file paths.
-- Use create_file when adding a new file. Do not use echo, printf, tee, shell redirection, or broad shell rewrite commands to create files.
+- Use create_file when adding a new file and append_text when adding to an existing file. Do not use echo, printf, tee, shell redirection, or broad shell rewrite commands to create files.
 - A successful create_file observation means the file was written only. Never claim a created script ran; final answers must say tests were "not run" unless a successful run_tests or approved bash observation proves the tests ran.
 - Use edit_section or replace_text for whole-line section edits. Set all_occurrences to true only when the request is clearly for every match.
 

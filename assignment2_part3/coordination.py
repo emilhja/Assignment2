@@ -9,14 +9,26 @@ from typing import Iterable
 from claims import CLAIM_PATTERN, split_claim_target
 
 
-SHARED_PATH_PATTERN = re.compile(r"(?P<path>/workspace/shared/[^\s:;,]+)")
+SHARED_PATH_PATTERN = re.compile(
+    r"(?P<path>/workspace/shared/[^\s:;,]+?)"
+    r"(?=(?:\.(?:First|Then|Next|Each|After|Before|Finally)\b)|[\s:;,]|$)"
+)
 WRITES_PATTERN = re.compile(
     r"(?i)\b(?P<agent>[A-Za-z0-9_.-]+)\s+writes?\s+(?P<task>[^,.;\n]+)"
+)
+OWNS_PATTERN = re.compile(
+    r"(?i)\b(?P<agent>[A-Za-z0-9_.-]+)\s+owns?\s+(?P<task>[^,.;\n]+)"
 )
 YOU_WRITES_PATTERN = re.compile(r"(?i)\byou\s+(?:also\s+)?writes?\s+(?P<task>[^,.;\n]+)")
 TAKEOVER_PATTERN = re.compile(
     r"(?i)\b(?:take\s+over|handoff|hand\s+off)\b(?:\s+from\s+@?(?P<peer>[A-Za-z0-9_.-]+))?"
 )
+SIGNATURE_AGREEMENT_PATTERN = re.compile(
+    r"(?i)\bagree\s+on\s+(?:the\s+)?function\s+signatures?\b"
+)
+PYTEST_REQUEST_PATTERN = re.compile(r"(?i)\b(?:pytest|tests?)\b")
+PYTEST_FIX_PATTERN = re.compile(r"(?i)\b(?:fix|repair|update|debug)\b.*\b(?:pytest|tests?)\b")
+SHARED_TEST_PATH_PATTERN = re.compile(r"(?P<path>/workspace/shared/(?:test_[^\s:;,]+|[^\s:;,]+_test)\.py)")
 
 
 @dataclass(frozen=True)
@@ -52,8 +64,19 @@ def _scope_from_task(task: str) -> str:
     return normalized or "task"
 
 
+def _assignments_from_pattern(pattern: re.Pattern[str], text: str) -> list[Assignment]:
+    assignments: list[Assignment] = []
+    for match in pattern.finditer(text):
+        agent = match.group("agent").strip().lstrip("@")
+        task = match.group("task").strip()
+        if not agent or not task:
+            continue
+        assignments.append(Assignment(agent=agent, task=task, scope=_scope_from_task(task)))
+    return assignments
+
+
 def parse_coordination_plan(text: str) -> CoordinationPlan | None:
-    """Parse simple coordinator messages: shared path + "alice writes X" slices."""
+    """Parse simple coordinator messages with a shared path and agent slices."""
 
     if not isinstance(text, str):
         return None
@@ -61,17 +84,58 @@ def parse_coordination_plan(text: str) -> CoordinationPlan | None:
     if not path_match:
         return None
 
-    assignments: list[Assignment] = []
-    for match in WRITES_PATTERN.finditer(text):
-        agent = match.group("agent").strip().lstrip("@")
-        task = match.group("task").strip()
-        if not agent or not task:
-            continue
-        assignments.append(Assignment(agent=agent, task=task, scope=_scope_from_task(task)))
+    assignments = [
+        *_assignments_from_pattern(WRITES_PATTERN, text),
+        *_assignments_from_pattern(OWNS_PATTERN, text),
+    ]
 
     if not assignments:
         return None
-    return CoordinationPlan(path=path_match.group("path").rstrip("."), assignments=tuple(assignments))
+    path, _scope = split_claim_target(path_match.group("path").rstrip("."))
+    return CoordinationPlan(path=path, assignments=tuple(assignments))
+
+
+def _signature_agreement_guidance(text: str, own: Assignment) -> str:
+    if SIGNATURE_AGREEMENT_PATTERN.search(text) is None:
+        return ""
+    operation_names = [
+        part
+        for part in re.split(r"[^A-Za-z0-9_]+", own.task.lower())
+        if part
+    ]
+    examples = ", ".join(f"def {name}(a, b)" for name in operation_names)
+    if examples:
+        examples = f" Suggested signatures for your scope: {examples}."
+    return (
+        " Function-signature agreement was requested before implementation. "
+        "Do not wait indefinitely: state agreement on simple two-argument Python "
+        "function signatures, then emit the required CLAIM in the same final answer "
+        "so the runtime continuation can implement the assigned scope."
+        f"{examples}"
+    )
+
+
+def _test_path_for_source(path: str) -> str | None:
+    if not path.startswith("/workspace/shared/") or not path.endswith(".py"):
+        return None
+    directory, _separator, filename = path.rpartition("/")
+    stem = filename[:-3]
+    if stem.startswith("test_"):
+        return path
+    return f"{directory}/test_{stem}.py"
+
+
+def _pytest_sidecar_guidance(text: str, path: str, own: Assignment) -> str:
+    if PYTEST_REQUEST_PATTERN.search(text) is None:
+        return ""
+    test_path = _test_path_for_source(path)
+    if not test_path:
+        return ""
+    return (
+        " Pytest coverage was requested next to the shared file. After completing "
+        f"the implementation write, use a separate CLAIM for {test_path}#{own.scope}-tests "
+        "before creating or editing tests for your scope."
+    )
 
 
 def assignment_guidance(
@@ -106,6 +170,8 @@ def assignment_guidance(
         f"Required CLAIM target: {claim_target}. "
         f"Other assigned scopes: {peers}. "
         "Do not claim or write another agent's assigned scope."
+        f"{_signature_agreement_guidance(text, own)}"
+        f"{_pytest_sidecar_guidance(text, plan.path, own)}"
     )
 
 
@@ -122,7 +188,17 @@ def followup_assignment_guidance(
         return None
     match = YOU_WRITES_PATTERN.search(text)
     if not match:
-        return None
+        if PYTEST_FIX_PATTERN.search(text) is None:
+            return None
+        test_path = _latest_shared_test_path(recent_context)
+        if not test_path:
+            return None
+        return (
+            "Pytest follow-up detected. "
+            f"Shared test path: {test_path}. "
+            "Before asking for more context, call read_file on that path, then "
+            "CLAIM the relevant test-file scope before editing it."
+        )
 
     path_match = SHARED_PATH_PATTERN.search(text)
     path = path_match.group("path").rstrip(".") if path_match else ""
@@ -150,6 +226,24 @@ def _latest_coordination_plan(recent_context: Iterable[dict[str, str]]) -> Coord
         if plan is not None:
             return plan
     return None
+
+
+def _latest_shared_test_path(recent_context: Iterable[dict[str, str]]) -> str | None:
+    for entry in reversed(list(recent_context)):
+        text = str(entry.get("text") or "")
+        match = SHARED_TEST_PATH_PATTERN.search(text)
+        if match:
+            return match.group("path").rstrip(".")
+
+        for claim_match in CLAIM_PATTERN.finditer(text):
+            path, _scope = split_claim_target(claim_match.group("path"))
+            if SHARED_TEST_PATH_PATTERN.fullmatch(path):
+                return path
+
+    plan = _latest_coordination_plan(recent_context)
+    if plan is None:
+        return None
+    return _test_path_for_source(plan.path)
 
 
 def _claim_sender_matches(sender: str, peer: str) -> bool:

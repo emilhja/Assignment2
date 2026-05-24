@@ -61,6 +61,29 @@ def test_set_limit_takes_effect_immediately():
     b.permit(100)  # would have failed at tpm=100
 
 
+def test_permit_override_allows_one_over_cap_call_without_mutating_limits():
+    b = Budget(tokens_per_minute=100, requests_per_minute=10, lifetime_tokens=1000)
+    b.record(80)
+
+    with pytest.raises(BudgetExceeded):
+        b.permit(30)
+
+    b.permit(30, override=True)
+    snap = b.snapshot()
+    assert snap["tokens_per_minute"] == 100
+    assert snap["tokens_used_last_minute"] == 80
+
+
+def test_permit_override_does_not_bypass_pause():
+    b = Budget(tokens_per_minute=100, requests_per_minute=10, lifetime_tokens=1000)
+    b.pause()
+
+    with pytest.raises(BudgetExceeded) as exc:
+        b.permit(30, override=True)
+
+    assert "paused" in exc.value.reason
+
+
 def test_set_limit_rejects_unknown_name():
     b = Budget()
     with pytest.raises(ValueError):

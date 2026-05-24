@@ -27,17 +27,19 @@ from session_store import SessionStore
 from tools import MAX_OUTPUT_CHARS, TOOL_REGISTRY, _resolve_workspace_path, run_tool
 
 from budget import Budget, BudgetExceeded, estimate_tokens
-from claims import ClaimRegistry
+from claims import CLAIM_PATTERN, RELEASE_PATTERN, ClaimRegistry, split_claim_target
 from console_control import ConsoleControl
 from peer import PeerMessage, peer_intent_refusal, scrub_outbound
 from reply_policy import CollisionInfo
 
 
 MAX_STEPS = 8
+MAX_CLAIM_CONTINUATION_STEPS = 5
+MAX_CONTINUATION_REPROMPTS_PER_REASON = 1
 MAX_CONTEXT_MESSAGES = 24
 MAX_CONTEXT_CHARS = 2000
 
-CLAIM_GATED_TOOLS = {"create_file", "edit_section", "replace_text"}
+CLAIM_GATED_TOOLS = {"create_file", "append_text", "edit_section", "replace_text"}
 SHARED_PATH_PREFIX = "/workspace/shared/"
 
 
@@ -270,6 +272,98 @@ def _looks_like_write_success_claim(answer: str) -> bool:
     )
 
 
+def _is_claim_continuation(message: PeerMessage) -> bool:
+    return message.sender_id == "runtime" and ":claim-continuation:" in message.id
+
+
+def _claim_continuation_target(message: PeerMessage) -> str | None:
+    if not _is_claim_continuation(message):
+        return None
+    _prefix, _marker, target = message.id.partition(":claim-continuation:")
+    target = target.strip()
+    if not target:
+        return None
+    path, scope = split_claim_target(target)
+    return f"{path}#{scope}" if scope else path
+
+
+def _claim_targets_from_text(text: str) -> set[str]:
+    targets: set[str] = set()
+    for match in CLAIM_PATTERN.finditer(text or ""):
+        path, scope = split_claim_target(match.group("path"))
+        targets.add(f"{path}#{scope}" if scope else path)
+    return targets
+
+
+def _looks_like_pending_shared_write(answer: str) -> bool:
+    """Detect declarative no-op finals during a shared-claim continuation."""
+
+    if SHARED_PATH_PREFIX not in (answer or ""):
+        return False
+    lowered = answer.lower()
+    pending_markers = (
+        "i will",
+        "i'll",
+        "i need to",
+        "i am going to",
+        "i'm going to",
+        "going to",
+        "will create",
+        "will implement",
+        "will write",
+        "need to create",
+        "ready to create",
+        "does not exist",
+        "doesn't exist",
+    )
+    write_verbs = ("create", "write", "implement", "add", "update", "edit")
+    return any(marker in lowered for marker in pending_markers) and any(
+        verb in lowered for verb in write_verbs
+    )
+
+
+def _edit_recovery_guidance(tool: str, observation: str) -> str | None:
+    if tool not in {"edit_section", "replace_text"}:
+        return None
+    if not observation.startswith("Edit blocked:"):
+        return None
+    if (
+        "old_text must be a non-empty string" not in observation
+        and "old_text was not found as a complete line section" not in observation
+    ):
+        return None
+    return (
+        "The edit failed because old_text did not identify an existing whole-line "
+        "section. Do not retry the same edit. To append new code or tests to an "
+        "existing shared file, call append_text with only the text to add. If you "
+        "must rewrite existing content, call read_file first and then use "
+        "edit_section with old_text equal to an exact complete section from that "
+        "observation."
+    )
+
+
+def _parser_guidance_text(raw_response: str, error: str | None) -> str:
+    try:
+        payload = json.loads(raw_response)
+    except (TypeError, ValueError):
+        return (
+            "Your previous response was invalid. Respond with exactly one JSON object and no prose. "
+            f"Parser error: {error}"
+        )
+
+    if isinstance(payload, dict) and payload.get("type") in TOOL_REGISTRY:
+        return (
+            "Your previous response used a tool name as the JSON type. For a tool call, "
+            'use {"type":"tool_call","tool":"<tool_name>","args":{...}} exactly. '
+            f"Parser error: {error}"
+        )
+
+    return (
+        "Your previous response was invalid. Respond with exactly one JSON object and no prose. "
+        f"Parser error: {error}"
+    )
+
+
 def run_peer_task(
     message: PeerMessage,
     *,
@@ -353,6 +447,24 @@ def run_peer_task(
     messages.append({"role": "user", "content": _peer_user_envelope(message)})
     peer_names = _peer_mention_names(recent_context, self_id, message.sender_id)
     saw_failed_shared_write = False
+    saw_successful_shared_write = False
+    continuation_reprompt_counts: dict[str, int] = {}
+
+    def _continuation_reprompt_or_stop(
+        kind: str,
+        guidance: str,
+        fallback: str,
+    ) -> str | None:
+        count = continuation_reprompt_counts.get(kind, 0)
+        if count >= MAX_CONTINUATION_REPROMPTS_PER_REASON:
+            _log("system", "claim_continuation_giveup", f"{kind}: {fallback}")
+            scrubbed, _hits = scrub_outbound(fallback)
+            _log("assistant", "peer_reply_raw", fallback)
+            return scrubbed
+        continuation_reprompt_counts[kind] = count + 1
+        _log("system", kind, guidance)
+        messages.append({"role": "user", "content": guidance})
+        return None
 
     if collision is not None:
         guidance_text = _collision_guidance_text(collision)
@@ -375,13 +487,41 @@ def run_peer_task(
         messages.append(_runtime_guidance_message(guidance_text))
 
     empty_streak = 0
-    for step in range(1, MAX_STEPS + 1):
+    max_steps = MAX_CLAIM_CONTINUATION_STEPS if _is_claim_continuation(message) else MAX_STEPS
+    for step in range(1, max_steps + 1):
         estimate = estimate_tokens(_json({"messages": messages}))
         try:
             budget.permit(estimate)
         except BudgetExceeded as exc:
             _log("system", "budget_exceeded", exc.reason)
-            return f"I have to stop here: my session budget is exhausted ({exc.reason})."
+            if console is None:
+                return f"I have to stop here: my session budget is exhausted ({exc.reason})."
+            _log(
+                "system",
+                "budget_override_requested",
+                _json({"reason": exc.reason, "estimated_tokens": estimate}),
+            )
+            approved = console.request_budget_approval(exc.reason, estimate)
+            if not approved:
+                _log(
+                    "system",
+                    "budget_override_denied",
+                    _json({"reason": exc.reason, "estimated_tokens": estimate}),
+                )
+                return f"I have to stop here: my session budget is exhausted ({exc.reason})."
+            _log(
+                "system",
+                "budget_override_approved",
+                _json({"reason": exc.reason, "estimated_tokens": estimate}),
+            )
+            try:
+                budget.permit(estimate, override=True)
+            except BudgetExceeded as override_exc:
+                _log("system", "budget_override_failed", override_exc.reason)
+                return (
+                    "I have to stop here: my session budget is exhausted "
+                    f"({override_exc.reason})."
+                )
 
         result = chat_fn(messages)
         usage = None
@@ -434,6 +574,82 @@ def run_peer_task(
 
         if parsed.kind == "final":
             answer = parsed.answer or ""
+            if _is_claim_continuation(message) and CLAIM_PATTERN.search(answer):
+                current_target = _claim_continuation_target(message)
+                claimed_targets = _claim_targets_from_text(answer)
+                if current_target is not None and claimed_targets - {current_target}:
+                    scrubbed, hits = scrub_outbound(answer)
+                    _log("assistant", "peer_reply_raw", answer)
+                    if hits:
+                        _log("assistant", "peer_reply_scrubbed", _json({"hits": hits, "text": scrubbed}))
+                    scrubbed = _ensure_peer_mentions(scrubbed, peer_names)
+                    if claims is not None and self_id:
+                        for claim in claims.absorb_text(self_id, scrubbed):
+                            _log(
+                                "system",
+                                "claim_self",
+                                _json(
+                                    {
+                                        "path": claim.path,
+                                        "scope": claim.scope,
+                                        "target": claim.target,
+                                        "reason": claim.reason,
+                                    }
+                                ),
+                            )
+                    return scrubbed
+                guidance = (
+                    "You already posted the CLAIM. This is the runtime continuation for that "
+                    "active claim, so do not reply with another CLAIM. Use a tool call now "
+                    "(read_file, create_file, append_text, edit_section, or replace_text), then "
+                    "report only after the tool observation succeeds."
+                )
+                stopped = _continuation_reprompt_or_stop(
+                    "claim_continuation_reprompt",
+                    guidance,
+                    "I had to stop because I repeated a CLAIM instead of using a write tool.",
+                )
+                if stopped is not None:
+                    return stopped
+                continue
+            if _is_claim_continuation(message) and _looks_like_pending_shared_write(answer):
+                guidance = (
+                    "This is still the runtime continuation for your active shared-file claim. "
+                    "Do not send a final answer describing what you will do next. If the shared "
+                    "file does not exist, call create_file now. If it exists, call read_file if "
+                    "needed and then append_text for additive work, or edit_section/replace_text "
+                    "for exact replacements. Only send a final answer after a successful "
+                    "shared-file write tool observation."
+                )
+                stopped = _continuation_reprompt_or_stop(
+                    "claim_continuation_pending_write_reprompt",
+                    guidance,
+                    "I had to stop because I kept describing the write instead of using a write tool.",
+                )
+                if stopped is not None:
+                    return stopped
+                continue
+            if (
+                _is_claim_continuation(message)
+                and RELEASE_PATTERN.search(answer)
+                and not saw_successful_shared_write
+            ):
+                guidance = (
+                    "You posted RELEASE but the runtime has no successful "
+                    "create_file/append_text/edit_section/replace_text observation for "
+                    "/workspace/shared in this round. RELEASE without a write abandons the "
+                    "claim and leaves the work undone. Either call the write tool now to "
+                    "complete the work, or send a final answer that explicitly explains "
+                    "why you cannot proceed (do not just repeat RELEASE)."
+                )
+                stopped = _continuation_reprompt_or_stop(
+                    "claim_release_without_write_reprompt",
+                    guidance,
+                    "I had to stop because I tried to release the claim before completing the write.",
+                )
+                if stopped is not None:
+                    return stopped
+                continue
             scrubbed, hits = scrub_outbound(answer)
             _log("assistant", "peer_reply_raw", answer)
             if hits:
@@ -484,9 +700,19 @@ def run_peer_task(
                 parsed.tool in CLAIM_GATED_TOOLS
                 and isinstance(parsed.args.get("path"), str)
                 and parsed.args["path"].startswith(SHARED_PATH_PREFIX)
-                and _looks_like_failed_write(observation)
             ):
-                saw_failed_shared_write = True
+                if _looks_like_failed_write(observation):
+                    saw_failed_shared_write = True
+                else:
+                    # A subsequent successful shared write supersedes an
+                    # earlier failure in this turn. Without this, a recovery
+                    # sequence (create_file blocked → read_file → edit_section
+                    # succeeded) still trips _looks_like_write_success_claim
+                    # and the model's truthful answer gets overwritten below.
+                    saw_failed_shared_write = False
+                    saw_successful_shared_write = True
+                    if claims is not None and self_id:
+                        claims.mark_satisfied(self_id, parsed.args["path"])
             _log(
                 "tool",
                 parsed.tool,
@@ -495,18 +721,29 @@ def run_peer_task(
             messages.append(
                 {"role": "user", "content": _tool_observation_message(parsed.tool, observation)}
             )
+            if _is_claim_continuation(message):
+                guidance = _edit_recovery_guidance(parsed.tool, observation)
+                if guidance:
+                    _log("system", "edit_recovery_guidance", guidance)
+                    messages.append(_runtime_guidance_message(guidance))
             continue
 
         if SHARED_PATH_PREFIX in raw_response and any(
             tool in raw_response for tool in CLAIM_GATED_TOOLS
         ):
             saw_failed_shared_write = True
-        guidance = (
-            "Your previous response was invalid. Respond with exactly one JSON object and no prose. "
-            f"Parser error: {parsed.error}"
-        )
-        _log("system", "parser_guidance", guidance)
-        messages.append({"role": "user", "content": guidance})
+        guidance = _parser_guidance_text(raw_response, parsed.error)
+        if _is_claim_continuation(message):
+            stopped = _continuation_reprompt_or_stop(
+                "parser_guidance",
+                guidance,
+                "I had to stop because I kept returning invalid JSON instead of a valid tool call.",
+            )
+            if stopped is not None:
+                return stopped
+        else:
+            _log("system", "parser_guidance", guidance)
+            messages.append({"role": "user", "content": guidance})
 
     fallback = "I could not complete this within my step budget. Please rephrase or split the task."
     scrubbed, _ = scrub_outbound(fallback)

@@ -175,9 +175,10 @@ flip the mode.
    ```
 
 Approvals stay local. If the LLM proposes a bash command, you'll see
-`[approval needed] bash> ...` in **your** terminal; reply with
-`:approve` or `:deny`. The hub never sees that exchange — only the
-final scrubbed answer is posted.
+`[approval needed] bash> ...` in **your** terminal; if an LLM call would
+exceed the token/rate budget, you'll see `[budget approval needed] budget> ...`.
+Reply with `:approve` or `:deny` in the agent console. The hub never
+sees that exchange — only the final scrubbed answer is posted.
 
 ## Use cases — concrete demos
 
@@ -249,6 +250,17 @@ In T2 (alice's attach terminal):
 T1 will show `agent-alice-1  | [budget paused]` / `[budget resumed]`.
 While paused, alice's `peer_task.run_peer_task` blocks before any LLM call.
 
+To test one-shot over-budget approval, set a low cap and then send Alice a
+task from T4:
+
+```
+:limit tpm 100
+```
+
+When T2 shows `[budget approval needed] budget> ...`, type `:approve` to
+allow only that blocked LLM call. Type `:deny` to keep the normal budget
+stop. Use `:limit` again if you want to persistently raise the cap.
+
 ### G. Local-only bash approval (P3.2 + safety)
 
 Send alice a task that requires a shell action (T4):
@@ -284,7 +296,7 @@ agents converse through the hub.
 ### I. Full test sweep (regression)
 
 ```bash
-python -m pytest assignment2_part3 -q     # 76 tests
+python -m pytest assignment2_part3/tests -q     # 168 tests
 python -m pytest assignment2_part2 -q     # 95 tests
 ```
 

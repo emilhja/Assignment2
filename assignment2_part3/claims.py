@@ -23,6 +23,7 @@ from typing import Optional
 
 DEFAULT_TTL_SECONDS = 300.0
 DEFAULT_DEFER_WINDOW_SECONDS = 120.0
+DEFAULT_RELEASED_UNSATISFIED_WINDOW_SECONDS = 120.0
 
 CLAIM_PATTERN = re.compile(
     r"(?im)^\s*CLAIM\s+(?P<path>/workspace/shared/[^\s:]+)\s*(?::\s*(?P<reason>.+))?$"
@@ -65,7 +66,15 @@ def split_claim_target(target: str) -> tuple[str, str | None]:
 
     normalized = target.strip().rstrip("/")
     path, marker, scope = normalized.partition("#")
+    for sentence_marker in (".First", ".Then", ".Next", ".Each", ".After", ".Before", ".Finally"):
+        if path.endswith(sentence_marker):
+            path = path[: -len(sentence_marker)]
+            break
     scope_norm = scope.strip() if marker else None
+    if scope_norm and "#" in scope_norm:
+        parts = [part for part in scope_norm.split("#") if part]
+        if parts and all(part == parts[0] for part in parts):
+            scope_norm = parts[0]
     return path.rstrip("/"), scope_norm or None
 
 
@@ -97,10 +106,21 @@ class ClaimRegistry:
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
         clock=time.monotonic,
         defer_window_seconds: float = DEFAULT_DEFER_WINDOW_SECONDS,
+        released_unsatisfied_window_seconds: float = DEFAULT_RELEASED_UNSATISFIED_WINDOW_SECONDS,
     ):
         self._ttl = float(ttl_seconds)
         self._clock = clock
         self._claims: dict[str, Claim] = {}
+        # Keyed by _claim_key(path, scope) — present iff a successful shared
+        # write has fulfilled the claim, so we can distinguish "still owes a
+        # write" from "claimed and done" without filesystem inspection.
+        self._satisfied: dict[str, float] = {}
+        # Keyed by _claim_key — claims that were RELEASEd without ever being
+        # satisfied by a write. Used to nudge the agent on the next inbound
+        # turn that it abandoned work, since the live registry no longer holds
+        # the claim.
+        self._released_unsatisfied: dict[str, tuple[Claim, float]] = {}
+        self._released_unsatisfied_window = float(released_unsatisfied_window_seconds)
         self._defer_window = float(defer_window_seconds)
         # (deferrer_id_lower, target_id_lower) -> last observed timestamp
         self._defers: dict[tuple[str, str], float] = {}
@@ -115,8 +135,14 @@ class ClaimRegistry:
             claimed_at=self._clock(),
             reason=reason,
         )
+        key = _claim_key(path_norm, scope)
         with self._lock:
-            self._claims[_claim_key(path_norm, scope)] = claim
+            self._claims[key] = claim
+            # Re-claiming the same target invalidates any prior
+            # released-without-write record for that claimant.
+            prior = self._released_unsatisfied.get(key)
+            if prior is not None and prior[0].claimant == claimant:
+                del self._released_unsatisfied[key]
         return claim
 
     def release(self, claimant: str, path: str) -> bool:
@@ -134,7 +160,10 @@ class ClaimRegistry:
             for key in keys:
                 existing = self._claims.get(key)
                 if existing is not None and existing.claimant == claimant:
+                    if key not in self._satisfied:
+                        self._released_unsatisfied[key] = (existing, self._clock())
                     del self._claims[key]
+                    self._satisfied.pop(key, None)
                     released = True
         return released
 
@@ -147,6 +176,7 @@ class ClaimRegistry:
                 return None
             if self._clock() - claim.claimed_at > self._ttl:
                 del self._claims[key]
+                self._satisfied.pop(key, None)
                 return None
             return claim
 
@@ -158,6 +188,7 @@ class ClaimRegistry:
         ]
         for key in expired:
             del self._claims[key]
+            self._satisfied.pop(key, None)
         return list(self._claims.values())
 
     def is_claimed_by_other(self, path: str, self_id: str) -> Optional[Claim]:
@@ -186,6 +217,54 @@ class ClaimRegistry:
         with self._lock:
             return [
                 claim for claim in self._active_claims_locked()
+                if claim.claimant == claimant
+            ]
+
+    def mark_satisfied(self, claimant: str, path: str) -> bool:
+        """Record that `claimant` successfully wrote `path`, satisfying any
+        active self-claim whose base path matches. A write to the base path
+        fulfills the obligation regardless of scope — the agent only owes one
+        successful write per scoped claim.
+        """
+
+        path_norm, _scope = split_claim_target(path)
+        marked = False
+        with self._lock:
+            for key, claim in self._claims.items():
+                if claim.path == path_norm and claim.claimant == claimant:
+                    self._satisfied[key] = self._clock()
+                    marked = True
+        return marked
+
+    def unsatisfied_claims_for(self, claimant: str) -> list[Claim]:
+        """Return this agent's active claims that have not yet been satisfied
+        by a successful shared write. Used by the runtime to nudge the model
+        about open obligations on the next turn.
+        """
+
+        with self._lock:
+            return [
+                claim for claim in self._active_claims_locked()
+                if claim.claimant == claimant
+                and _claim_key(claim.path, claim.scope) not in self._satisfied
+            ]
+
+    def recently_released_unsatisfied_for(self, claimant: str) -> list[Claim]:
+        """Return claims this agent RELEASEd within the window without ever
+        completing the write. Used to nudge the model that it abandoned work
+        and should re-claim if it still intends to do it.
+        """
+
+        now = self._clock()
+        with self._lock:
+            stale = [
+                key for key, (_, released_at) in self._released_unsatisfied.items()
+                if now - released_at > self._released_unsatisfied_window
+            ]
+            for key in stale:
+                del self._released_unsatisfied[key]
+            return [
+                claim for (claim, _) in self._released_unsatisfied.values()
                 if claim.claimant == claimant
             ]
 

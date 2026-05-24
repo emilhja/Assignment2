@@ -339,6 +339,43 @@ def test_claim_collision_whole_file_vs_scoped_peer():
     assert decision.collision.outcome == "self-wins"
 
 
+def test_defer_only_message_does_not_trigger_reply():
+    """A peer's `DEFER to @you` is one-way ack; the @mention inside it
+    must not wake the recipient and start a ping-pong loop."""
+
+    d = should_reply(
+        _msg("DEFER to @alice-swe", sender="bob"),
+        "alice",
+        "alice-swe",
+        [],
+        now=1000.0,
+    )
+    assert d.respond is False
+    assert "directly addressed" not in d.reason
+
+
+def test_release_only_message_does_not_trigger_reply():
+    """A bare RELEASE line should not trigger a reply on its own."""
+
+    d = should_reply(
+        _msg("RELEASE /workspace/shared/calc.py#multiply-divide", sender="bob"),
+        "alice",
+        "alice-swe",
+        [],
+        now=1000.0,
+    )
+    assert d.respond is False
+
+
+def test_real_mention_alongside_defer_still_triggers_reply():
+    """Real `@alice-swe` outside the DEFER line must still address alice."""
+
+    text = "@alice-swe please review my DEFER to @bob-swe"
+    d = should_reply(_msg(text, sender="charlie"), "alice", "alice-swe", [], now=1000.0)
+    assert d.respond is True
+    assert "addressed" in d.reason
+
+
 def test_claim_collision_only_fires_on_self_claim():
     """A peer CLAIM for a path we do not own should not bypass cooldown."""
 

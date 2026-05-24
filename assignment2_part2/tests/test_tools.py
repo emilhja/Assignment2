@@ -283,6 +283,51 @@ def test_create_file_refuses_parent_path_that_is_file(tmp_path, monkeypatch):
     assert parent.read_text(encoding="utf-8") == "not a directory"
 
 
+def test_append_text_appends_to_existing_workspace_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    target = tmp_path / "demo.txt"
+    target.write_text("one\n", encoding="utf-8")
+
+    output = tools.append_text("/workspace/demo.txt", "two\n")
+
+    assert output == "Appended text to /workspace/demo.txt."
+    assert target.read_text(encoding="utf-8") == "one\ntwo\n"
+
+
+def test_append_text_routes_workspace_shared_alias_to_shared_root(tmp_path, monkeypatch):
+    private = tmp_path / "private"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+    target = shared / "calc.py"
+    target.write_text("x = 1\n", encoding="utf-8")
+
+    output = tools.append_text("/workspace/shared/calc.py", "y = 2\n")
+
+    assert output == "Appended text to /workspace/shared/calc.py."
+    assert target.read_text(encoding="utf-8") == "x = 1\ny = 2\n"
+
+
+def test_append_text_blocks_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+
+    output = tools.append_text("/workspace/missing.txt", "text\n")
+
+    assert "file does not exist" in output
+
+
+def test_append_text_blocks_outside_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path / "workspace"))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+
+    output = tools.append_text(str(outside), "changed\n")
+
+    assert "path must stay inside" in output
+
+
 def test_replace_text_replaces_all_when_requested(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
     target = tmp_path / "demo.txt"

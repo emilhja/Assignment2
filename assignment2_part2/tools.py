@@ -408,6 +408,28 @@ def create_file(path: str, content: str, overwrite: bool = False) -> str:
     return _truncate(f"{action} file in {_display_workspace_path(target)}.")
 
 
+def append_text(path: str, content: str) -> str:
+    """Append text to an existing workspace file."""
+
+    if not isinstance(content, str):
+        return "Edit blocked: content must be a string."
+
+    try:
+        target = _resolve_workspace_path(path)
+    except ValueError as exc:
+        return f"Edit blocked: {exc}"
+
+    if not target.exists():
+        return f"Edit blocked: file does not exist: {target}"
+    if not target.is_file():
+        return f"Edit blocked: path is not a file: {target}"
+
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(content)
+
+    return _truncate(f"Appended text to {_display_workspace_path(target)}.")
+
+
 def replace_text(path: str, old_text: str, new_text: str, all_occurrences: bool = False) -> str:
     """Replace one or all whole-line exact text matches in a workspace file."""
 
@@ -468,6 +490,12 @@ TOOL_REGISTRY = {
             args["content"],
             args.get("overwrite", False),
         ),
+    ),
+    "append_text": ToolSpec(
+        name="append_text",
+        description="Append text to an existing workspace file.",
+        required_args=("path", "content"),
+        handler=lambda args: append_text(args["path"], args["content"]),
     ),
     "replace_text": ToolSpec(
         name="replace_text",

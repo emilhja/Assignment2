@@ -136,6 +136,10 @@ def _claim_continuation_message(original: PeerMessage, claim: Claim) -> PeerMess
     )
 
 
+def _is_claim_continuation_message(message: PeerMessage) -> bool:
+    return message.sender_id == "runtime" and ":claim-continuation:" in message.id
+
+
 def _context_entry(sender_id: str, text: str, message_id: str | None = None) -> dict[str, str]:
     entry = {
         "sender_id": sender_id,
@@ -170,6 +174,48 @@ def _looks_like_operator_sender(sender_id: str, agent_id: str) -> bool:
 def _answer_invites_followup(answer: str) -> bool:
     text = (answer or "").strip()
     return bool(text) and (text.endswith("?") or CONFIRMATION_REQUEST_PATTERN.search(text) is not None)
+
+
+def _stale_claim_guidance(active_claims: list[Claim]) -> str | None:
+    """Build a nudge for active claims that weren't satisfied on a prior turn.
+
+    The runtime's `_continue_claims` only fires for CLAIMs in the just-sent
+    reply, so an agent that posted CLAIM but then deferred or said "I will…"
+    has no built-in reminder. This guidance string is appended to
+    `runtime_guidance` before each task run so the model sees the open
+    obligation alongside the new inbound message.
+    """
+
+    if not active_claims:
+        return None
+    targets = ", ".join(claim.target for claim in active_claims)
+    return (
+        "You have unsatisfied active CLAIM(s) from a previous turn: "
+        f"{targets}. On this turn either complete the write with "
+        "create_file/append_text/edit_section/replace_text for each, or post "
+        "`RELEASE <target>` to give it up. Do not re-post the same CLAIM."
+    )
+
+
+def _released_without_write_guidance(released_claims: list[Claim]) -> str | None:
+    """Build a nudge for claims this agent RELEASEd before completing the write.
+
+    `claims.recently_released_unsatisfied_for` returns claims that were
+    released without ever being marked satisfied by a shared write. This
+    surfaces on the next inbound turn so the model knows it abandoned work
+    and should re-claim + write, rather than silently dropping the task.
+    """
+
+    if not released_claims:
+        return None
+    targets = ", ".join(claim.target for claim in released_claims)
+    return (
+        "You previously CLAIMed and then RELEASEd without a successful "
+        f"write: {targets}. The work was abandoned. If you still intend "
+        "to do it, post a fresh CLAIM for the target and then complete the "
+        "write on the runtime continuation. Otherwise explain in chat why "
+        "you are dropping the task."
+    )
 
 
 def run_group_chat(
@@ -270,13 +316,14 @@ def run_group_chat(
         collision: CollisionInfo | None = None,
     ) -> str | None:
         runtime_guidance = []
-        guidance = assignment_guidance(
-            message.text,
-            agent_id=agent_id,
-            display_name=display_name,
-        )
-        if guidance:
-            runtime_guidance.append(guidance)
+        if not _is_claim_continuation_message(message):
+            guidance = assignment_guidance(
+                message.text,
+                agent_id=agent_id,
+                display_name=display_name,
+            )
+            if guidance:
+                runtime_guidance.append(guidance)
         guidance = followup_assignment_guidance(
             message.text,
             agent_id=agent_id,
@@ -290,6 +337,14 @@ def run_group_chat(
             agent_id=agent_id,
             display_name=display_name,
             recent_context=prior_context or [],
+        )
+        if guidance:
+            runtime_guidance.append(guidance)
+        guidance = _stale_claim_guidance(claims.unsatisfied_claims_for(agent_id))
+        if guidance:
+            runtime_guidance.append(guidance)
+        guidance = _released_without_write_guidance(
+            claims.recently_released_unsatisfied_for(agent_id)
         )
         if guidance:
             runtime_guidance.append(guidance)
@@ -407,7 +462,10 @@ def run_group_chat(
         if allow_claim_continuation:
             _continue_claims(message, answer)
 
-    def _continue_claims(original: PeerMessage, answer: str) -> None:
+    def _continue_claims(original: PeerMessage, answer: str, depth: int = 0) -> None:
+        if depth >= 3:
+            _log(store, "claim_continuation_skipped", "maximum nested claim continuation depth reached")
+            return
         targets = _claimed_targets(answer)
         if not targets:
             return
@@ -448,6 +506,7 @@ def run_group_chat(
             continuation_answer = _run_task_for_message(continuation, prior_context)
             if continuation_answer is not None:
                 _send_answer(continuation_answer, continuation.id)
+                _continue_claims(continuation, continuation_answer, depth + 1)
 
     try:
         while not stop_event.is_set():

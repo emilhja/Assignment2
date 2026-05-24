@@ -21,8 +21,14 @@ import part2_bridge  # noqa: F401
 from thread_safe_store import ThreadSafeSessionStore as SessionStore
 
 from budget import Budget
+from claims import ClaimRegistry
 from console_control import ConsoleControl
-from group_chat import load_system_prompt, run_group_chat
+from group_chat import (
+    _released_without_write_guidance,
+    _stale_claim_guidance,
+    load_system_prompt,
+    run_group_chat,
+)
 from transport import StubTransport
 
 
@@ -50,7 +56,7 @@ def _patch_chat(monkeypatch, fake):
     monkeypatch.setattr(peer_task, "complete_chat_with_metadata", fake)
 
 
-def _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies):
+def _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies, claims=None):
     monkeypatch.setenv("AGENT_ID", "alice")
     monkeypatch.setenv("AGENT_DISPLAY_NAME", "alice-swe")
     monkeypatch.setenv("AGENT_MODE", "stub")
@@ -82,6 +88,7 @@ def _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies):
             store=store,
             stop_event=stop,
             idle_sleep=0.01,
+            claims=claims,
         )
 
     return {
@@ -107,6 +114,39 @@ def test_system_prompt_requires_not_run_without_test_observation():
     prompt = load_system_prompt("alice", "alice-swe")
     assert 'tests were "not run"' in prompt
     assert "successful run_tests or approved bash observation proves the tests ran" in prompt
+
+
+def test_stale_claim_guidance_is_none_when_no_active_claims():
+    assert _stale_claim_guidance([]) is None
+
+
+def test_stale_claim_guidance_names_each_target():
+    registry = ClaimRegistry()
+    registry.record_observed("alice", "/workspace/shared/calc.py#add")
+    registry.record_observed("alice", "/workspace/shared/notes.md")
+    guidance = _stale_claim_guidance(registry.unsatisfied_claims_for("alice"))
+    assert guidance is not None
+    assert "/workspace/shared/calc.py#add" in guidance
+    assert "/workspace/shared/notes.md" in guidance
+
+
+def test_released_without_write_guidance_is_none_when_empty():
+    assert _released_without_write_guidance([]) is None
+
+
+def test_released_without_write_guidance_nudges_to_reclaim():
+    """The next-turn guidance must name the abandoned target and tell the
+    model to either re-CLAIM or explicitly drop the task — otherwise alice
+    keeps repeating 'I need to create ...' without ever re-claiming."""
+
+    registry = ClaimRegistry()
+    registry.record_observed("alice", "/workspace/shared/calc.py#add-subtract")
+    registry.release("alice", "/workspace/shared/calc.py#add-subtract")
+    released = registry.recently_released_unsatisfied_for("alice")
+    guidance = _released_without_write_guidance(released)
+    assert guidance is not None
+    assert "/workspace/shared/calc.py#add-subtract" in guidance
+    assert "fresh CLAIM" in guidance.lower() or "re-claim" in guidance.lower() or "post a fresh claim" in guidance.lower()
 
 
 def test_direct_mention_triggers_reply_and_chatter_is_skipped(tmp_path, monkeypatch):
@@ -539,6 +579,69 @@ def test_claim_continuation_creates_shared_calculator(tmp_path, monkeypatch):
     assert any(kind == "claim_continuation" for _role, kind, _content in events)
 
 
+def test_claim_from_continuation_gets_its_own_continuation(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+    monkeypatch.setenv("CLAIM_CONTINUATION_GRACE_SECONDS", "0")
+
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": (
+                "@alice-swe build a calculator in /workspace/shared/calculator.py. "
+                "alice owns add/subtract. Write pytest tests next to it."
+            ),
+        })
+        + "\n",
+    ]
+    test_content = (
+        "from calculator import add, subtract\n\n"
+        "def test_add():\n"
+        "    assert add(2, 3) == 5\n\n"
+        "def test_subtract():\n"
+        "    assert subtract(5, 3) == 2\n"
+    )
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "CLAIM /workspace/shared/calculator.py#add-subtract: Implement add/subtract",
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "CLAIM /workspace/shared/test_calculator.py#tests: Add pytest coverage",
+        }),
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/test_calculator.py", "content": test_content},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Created /workspace/shared/test_calculator.py.",
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert [payload["text"] for payload in replies] == [
+        "CLAIM /workspace/shared/calculator.py#add-subtract: Implement add/subtract",
+        "CLAIM /workspace/shared/test_calculator.py#tests: Add pytest coverage",
+        "Created /workspace/shared/test_calculator.py.",
+    ]
+    assert (shared / "test_calculator.py").read_text(encoding="utf-8") == test_content
+
+
 def test_claim_continuation_llm_failure_does_not_send_false_failure_or_stop_loop(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAIM_CONTINUATION_GRACE_SECONDS", "0")
     peer_lines = [
@@ -581,3 +684,65 @@ def test_claim_continuation_llm_failure_does_not_send_false_failure_or_stop_loop
     events = _events(ctx["store"])
     assert any(kind == "claim_continuation" for _role, kind, _content in events)
     assert any(kind == "llm_failure" and "RateLimitRetryTimeout" in content for _role, kind, content in events)
+
+
+def test_stale_unsatisfied_claim_injects_nudge_on_next_turn(tmp_path, monkeypatch):
+    """Reproduces the "varför händer inget mera sen?" symptom: alice posted
+    a CLAIM on a previous turn but never wrote, so her claim sits in the
+    registry. On the next inbound message addressed to alice, the runtime
+    must inject a guidance line listing the unsatisfied target so the model
+    is reminded to either write or RELEASE."""
+
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
+    # Sanity: the seeded claim is unsatisfied at the start of the next turn.
+    assert len(claims.unsatisfied_claims_for("alice")) == 1
+
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe what's the status?"}) + "\n",
+    ]
+    scripted = [json.dumps({"type": "final", "answer": "Working on it."})]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted, claims=claims)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.5)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert ctx["fake_chat"].calls == 1
+    contents = [message["content"] for message in ctx["fake_chat"].messages[0]]
+    nudge = next(
+        (content for content in contents if "unsatisfied active CLAIM" in content),
+        None,
+    )
+    assert nudge is not None, "stale-claim guidance was not injected"
+    assert "/workspace/shared/calculator.py#add-subtract" in nudge
+    assert "RELEASE" in nudge
+
+
+def test_satisfied_claim_does_not_re_inject_nudge(tmp_path, monkeypatch):
+    """Once a claim is satisfied by a successful write, the next turn must
+    NOT contain the stale-claim nudge — otherwise the model would be told
+    to finish or RELEASE a claim it already wrote, encouraging spurious
+    edits or releases."""
+
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/calculator.py#add-subtract")
+    claims.mark_satisfied("alice", "/workspace/shared/calculator.py")
+
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe what's the status?"}) + "\n",
+    ]
+    scripted = [json.dumps({"type": "final", "answer": "Done."})]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted, claims=claims)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.5)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert ctx["fake_chat"].calls == 1
+    contents = [message["content"] for message in ctx["fake_chat"].messages[0]]
+    assert not any("unsatisfied active CLAIM" in content for content in contents)
