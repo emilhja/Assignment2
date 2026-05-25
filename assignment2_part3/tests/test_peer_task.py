@@ -1838,3 +1838,284 @@ def test_pending_write_giveup_skips_pytest_log_when_not_requested(tmp_path, monk
     kinds = {kind for _role, kind, _content in _events(store)}
     assert "claim_continuation_giveup" in kinds
     assert "pytest_skipped_due_to_impl_failure" not in kinds
+
+
+def test_pytest_required_reprompt_fires_when_done_without_tests(tmp_path, monkeypatch):
+    """When pytest was requested and the agent declares Done with 'Tests: not run'
+    after a successful shared write, the runtime must reprompt instead of
+    letting the unverified Done line reach the hub."""
+
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/test_calculator.py#add-subtract-tests")
+    msg = PeerMessage(
+        id="m1:claim-continuation:/workspace/shared/test_calculator.py#add-subtract-tests",
+        sender_id="runtime",
+        text=(
+            "Continue the active shared-file claim you already posted. "
+            "Original request: write pytest tests next to /workspace/shared/calculator.py."
+        ),
+    )
+    content = "from calculator import add\n\ndef test_add():\n    assert add(1, 2) == 3\n"
+    seen: list[list[dict]] = []
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/test_calculator.py", "content": content},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": (
+                "Done: Added pytest tests at /workspace/shared/test_calculator.py. "
+                "Tests: not run. Blockers: None."
+            ),
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": (
+                "Done: Added pytest tests at /workspace/shared/test_calculator.py. "
+                "Tests: ran and passed. Blockers: None."
+            ),
+        }),
+    ])
+
+    def chat_fn(messages):
+        seen.append(list(messages))
+        return next(responses)
+
+    # Short-circuit run_tests so we don't actually spawn pytest, but the model
+    # never gets to call it in this test — the second response is the verified
+    # final. We only need this guard in case the loop misbehaves.
+    import peer_task as _peer_task_mod
+    real_run_tool = _peer_task_mod.run_tool
+
+    def fake_run_tool(tool, args):
+        if tool == "run_tests":
+            return "1 passed in 0.01s"
+        return real_run_tool(tool, args)
+
+    monkeypatch.setattr("peer_task.run_tool", fake_run_tool)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert "ran and passed" in answer
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert "claim_continuation_pytest_required_reprompt" in kinds
+    # The reprompt is appended after the second LLM call (which produced the
+    # "Done: ... not run" final) and seen on the third call's message list.
+    reprompt_text = seen[2][-1]["content"]
+    assert "run_tests" in reprompt_text
+    assert "/workspace/shared/test_calculator.py" in reprompt_text
+
+
+def test_pytest_required_reprompt_skipped_when_run_tests_already_ran(tmp_path, monkeypatch):
+    """A run_tests observation in this round must satisfy the verification gate
+    even if the model's Done line phrases the result imprecisely."""
+
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/test_calculator.py#add-subtract-tests")
+    msg = PeerMessage(
+        id="m1:claim-continuation:/workspace/shared/test_calculator.py#add-subtract-tests",
+        sender_id="runtime",
+        text=(
+            "Continue the active shared-file claim you already posted. "
+            "Original request: write pytest tests next to /workspace/shared/calculator.py."
+        ),
+    )
+    content = "from calculator import add\n\ndef test_add():\n    assert add(1, 2) == 3\n"
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/test_calculator.py", "content": content},
+        }),
+        json.dumps({
+            "type": "tool_call",
+            "tool": "run_tests",
+            "args": {"path": "/workspace/shared/test_calculator.py"},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": (
+                "Done: Added pytest tests at /workspace/shared/test_calculator.py. "
+                "Tests: ran and passed. Blockers: None."
+            ),
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    import peer_task as _peer_task_mod
+    real_run_tool = _peer_task_mod.run_tool
+
+    def fake_run_tool(tool, args):
+        if tool == "run_tests":
+            return "1 passed in 0.01s"
+        return real_run_tool(tool, args)
+
+    monkeypatch.setattr("peer_task.run_tool", fake_run_tool)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert "ran and passed" in answer
+    kinds = {kind for _role, kind, _content in _events(store)}
+    assert "claim_continuation_pytest_required_reprompt" not in kinds
+
+
+def test_pytest_required_reprompt_skipped_when_pytest_not_requested(tmp_path, monkeypatch):
+    """Continuations whose original request did not mention pytest must not be
+    forced through the verification gate — `Tests: not run` is a legitimate
+    final answer there."""
+
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/notes.py#summary")
+    msg = PeerMessage(
+        id="m1:claim-continuation:/workspace/shared/notes.py#summary",
+        sender_id="runtime",
+        text=(
+            "Continue the active shared-file claim you already posted. "
+            "Original request: jot down the summary."
+        ),
+    )
+    content = "Summary: the project ships on Friday.\n"
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/notes.py", "content": content},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": (
+                "Done: Wrote the summary to /workspace/shared/notes.py. "
+                "Tests: not run. Blockers: None."
+            ),
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert answer.startswith("Done: Wrote the summary")
+    assert "Tests: not run" in answer
+    kinds = {kind for _role, kind, _content in _events(store)}
+    assert "claim_continuation_pytest_required_reprompt" not in kinds
+
+
+def test_pytest_required_reprompt_gives_up_after_cap(tmp_path, monkeypatch):
+    """When the model refuses to run pytest after MAX_CONTINUATION_REPROMPTS_PER_REASON
+    nudges, the runtime must return the configured fallback instead of leaking
+    the bogus 'Tests: not run' Done line to the hub."""
+
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    claims = ClaimRegistry()
+    claims.record_observed("alice", "/workspace/shared/test_calculator.py#add-subtract-tests")
+    msg = PeerMessage(
+        id="m1:claim-continuation:/workspace/shared/test_calculator.py#add-subtract-tests",
+        sender_id="runtime",
+        text=(
+            "Continue the active shared-file claim you already posted. "
+            "Original request: write pytest tests next to /workspace/shared/calculator.py."
+        ),
+    )
+    content = "def test_smoke():\n    assert True\n"
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/test_calculator.py", "content": content},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Done: wrote tests. Tests: not run. Blockers: none.",
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Done: wrote tests. Tests: not run. Blockers: none.",
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Done: wrote tests. Tests: not run. Blockers: none.",
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        claims=claims,
+        agent_id="alice",
+    )
+
+    assert "kept reporting Done without running" in answer
+    events = list(_events(store))
+    kinds = [kind for _role, kind, _content in events]
+    assert kinds.count("claim_continuation_pytest_required_reprompt") == 2
+    assert "claim_continuation_giveup" in kinds

@@ -31,8 +31,10 @@ from budget import Budget, format_usage_summary
 from claims import CLAIM_PATTERN, DEFER_PATTERN, RELEASE_PATTERN, Claim, ClaimRegistry, split_claim_target
 from coordination import (
     assignment_guidance,
+    fix_blockers_guidance,
     followup_assignment_guidance,
     handoff_guidance,
+    private_workspace_guidance,
     status_request_guidance,
 )
 from console_control import ConsoleControl
@@ -364,6 +366,21 @@ def run_group_chat(
                 runtime_guidance.append(stale_guidance)
         guidance = _released_without_write_guidance(
             claims.recently_released_unsatisfied_for(agent_id)
+        )
+        if guidance:
+            runtime_guidance.append(guidance)
+        guidance = fix_blockers_guidance(
+            message.text,
+            agent_id=agent_id,
+            display_name=display_name,
+            recent_context=prior_context or [],
+        )
+        if guidance:
+            runtime_guidance.append(guidance)
+        guidance = private_workspace_guidance(
+            message.text,
+            agent_id=agent_id,
+            display_name=display_name,
         )
         if guidance:
             runtime_guidance.append(guidance)

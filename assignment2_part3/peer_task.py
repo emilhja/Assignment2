@@ -35,7 +35,7 @@ from reply_policy import CollisionInfo
 
 
 MAX_STEPS = 8
-MAX_CLAIM_CONTINUATION_STEPS = 8
+MAX_CLAIM_CONTINUATION_STEPS = 12
 # Two nudges before giveup: "describe instead of call" is a common LLM failure
 # mode and one reprompt often isn't enough to course-correct. See plan
 # i-think-this-went-serene-manatee.md for the calculator session that motivated this.
@@ -312,6 +312,50 @@ def _test_target_for_claim(target: str | None) -> str | None:
     return f"{test_path}#tests"
 
 
+def _run_tests_path_for_target(target: str | None) -> str | None:
+    """Return the bare /workspace/shared/test_<stem>.py path (no #scope) for a claim target."""
+
+    if not target:
+        return None
+    path, _scope = split_claim_target(target)
+    if not path.startswith(SHARED_PATH_PREFIX) or not path.endswith(".py"):
+        return None
+    directory, _separator, filename = path.rpartition("/")
+    stem = filename[:-3]
+    if stem.startswith("test_"):
+        return path
+    return f"{directory}/test_{stem}.py"
+
+
+_TESTS_NOT_RUN_MARKERS = (
+    "tests: not run",
+    "tests not run",
+    "have not run",
+    "haven't run",
+    "did not run",
+    "didn't run",
+)
+
+
+def _looks_like_done_without_tests(answer: str) -> bool:
+    """Detect Done-style finals that admit pytest was never executed.
+
+    Returns False when the answer reports a real pytest outcome (`ran and
+    passed` / `ran and failed`) or when it is a legitimate continuation exit
+    (RELEASE/DEFER protocol lines).
+    """
+
+    text = answer or ""
+    lowered = text.lower()
+    if not lowered:
+        return False
+    if "ran and passed" in lowered or "ran and failed" in lowered:
+        return False
+    if RELEASE_PATTERN.search(text) or DEFER_PATTERN.search(text):
+        return False
+    return any(marker in lowered for marker in _TESTS_NOT_RUN_MARKERS)
+
+
 def _claim_targets_from_text(text: str) -> set[str]:
     targets: set[str] = set()
     for match in CLAIM_PATTERN.finditer(text or ""):
@@ -510,6 +554,7 @@ def run_peer_task(
     peer_names = _peer_mention_names(recent_context, self_id, message.sender_id)
     saw_failed_shared_write = False
     saw_successful_shared_write = False
+    saw_successful_test_run = False
     continuation_reprompt_counts: dict[str, int] = {}
 
     def _continuation_reprompt_or_stop(
@@ -714,6 +759,35 @@ def run_peer_task(
                 continue
             if (
                 _is_claim_continuation(message)
+                and _pytest_was_requested(message.text)
+                and saw_successful_shared_write
+                and not saw_successful_test_run
+                and _looks_like_done_without_tests(answer)
+            ):
+                test_path = (
+                    _run_tests_path_for_target(_claim_continuation_target(message))
+                    or "the shared test file path"
+                )
+                guidance = (
+                    "A successful shared-file write happened in this continuation and the "
+                    "original request asked for pytest coverage, but no run_tests observation "
+                    "exists yet in this round. Do not report Done with 'Tests: not run'. "
+                    'Call run_tests now with {"path": "' + test_path + '"} and only emit the '
+                    "final answer after the observation. Report the pytest result honestly: "
+                    "'Tests: ran and passed' on green, or 'Tests: ran and failed' followed "
+                    "by the first failure line on red. If the test file does not yet exist "
+                    "(peer hasn't written it), say so in Blockers instead of claiming Done."
+                )
+                stopped = _continuation_reprompt_or_stop(
+                    "claim_continuation_pytest_required_reprompt",
+                    guidance,
+                    "I had to stop because I kept reporting Done without running the requested pytest verification.",
+                )
+                if stopped is not None:
+                    return stopped
+                continue
+            if (
+                _is_claim_continuation(message)
                 and not saw_successful_shared_write
                 and _looks_like_pending_shared_write(answer)
             ):
@@ -735,11 +809,15 @@ def run_peer_task(
                 )
                 guidance = (
                     "This is still the runtime continuation for your active shared-file claim. "
-                    "Do not send a final answer describing what you will do next. Emit a tool_call "
-                    "JSON object now. For a new file, the response MUST look exactly like this "
+                    'Only {"type":"tool_call",...} JSON is valid on this turn. '
+                    '{"type":"final",...} replies — including RELEASE prose, "I will read first", '
+                    '"I need to implement", or any description of what you plan to do — are '
+                    "invalid and will be rejected until a successful write tool observation is "
+                    "recorded. For a new file, the response MUST look exactly like this "
                     f"(replace the content placeholder): {example_call}. If the file already "
-                    "exists, call read_file first and then append_text for additive work, or "
-                    "edit_section/replace_text for exact replacements. Only send a final answer "
+                    "exists (e.g. a peer wrote first), call read_file then append_text for "
+                    "additive work, or edit_section/replace_text for exact replacements — do not "
+                    "retry create_file on an existing shared file. Only send a final answer "
                     "after a successful shared-file write tool observation."
                 )
                 stopped = _continuation_reprompt_or_stop(
@@ -834,6 +912,12 @@ def run_peer_task(
                     saw_successful_shared_write = True
                     if claims is not None and self_id:
                         claims.mark_satisfied(self_id, parsed.args["path"])
+            if parsed.tool == "run_tests":
+                # Any reachable run_tests attempt counts as verification: a red
+                # pytest is still proof the agent tried, and the next final
+                # answer can honestly report `Tests: ran and failed` instead of
+                # being reprompted into a loop.
+                saw_successful_test_run = True
             _log(
                 "tool",
                 parsed.tool,

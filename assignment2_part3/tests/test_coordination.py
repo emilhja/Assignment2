@@ -1,8 +1,10 @@
 from coordination import (
     assignment_guidance,
+    fix_blockers_guidance,
     followup_assignment_guidance,
     handoff_guidance,
     parse_coordination_plan,
+    private_workspace_guidance,
     status_request_guidance,
 )
 
@@ -106,6 +108,34 @@ def test_assignment_guidance_mentions_pytest_sidecar_scope():
     assert guidance is not None
     assert "Pytest coverage was requested" in guidance
     assert "/workspace/shared/test_calculator.py#multiply-divide-tests" in guidance
+
+
+def test_pytest_sidecar_warns_about_extending_imports_when_peers_present():
+    guidance = assignment_guidance(
+        "@bob-swe @alice-swe build a calculator in /workspace/shared/calculator.py. "
+        "alice writes add+subtract, bob writes multiply+divide. Add pytest tests.",
+        agent_id="bob",
+        display_name="bob-swe",
+    )
+
+    assert guidance is not None
+    assert "/workspace/shared/test_calculator.py" in guidance
+    assert "replace_text" in guidance
+    assert "import" in guidance
+    assert "NameError" in guidance
+
+
+def test_pytest_sidecar_skips_import_warning_when_solo():
+    guidance = assignment_guidance(
+        "@bob-swe build a calculator in /workspace/shared/calculator.py. "
+        "bob writes add+subtract+multiply+divide. Add pytest tests next to it.",
+        agent_id="bob",
+        display_name="bob-swe",
+    )
+
+    assert guidance is not None
+    assert "Pytest coverage was requested" in guidance
+    assert "NameError" not in guidance
 
 
 def test_assignment_guidance_matches_display_name_prefix():
@@ -272,6 +302,132 @@ def test_status_request_guidance_recommends_recent_test_path():
 
     assert guidance is not None
     assert "run_tests on /workspace/shared/test_calculator.py" in guidance
+
+
+def test_fix_blockers_guidance_matches_can_you_fix():
+    guidance = fix_blockers_guidance(
+        "@alice-swe can you fix the blockers?",
+        agent_id="alice",
+        display_name="alice-swe",
+    )
+
+    assert guidance is not None
+    assert "run_tests" in guidance
+    assert "must report" in guidance
+    assert "fix the prior blocker" in guidance
+
+
+def test_fix_blockers_guidance_skips_unrelated_chatter():
+    assert (
+        fix_blockers_guidance(
+            "tomorrow we ship",
+            agent_id="alice",
+            display_name="alice-swe",
+        )
+        is None
+    )
+
+
+def test_fix_blockers_guidance_includes_latest_test_path():
+    guidance = fix_blockers_guidance(
+        "@alice-swe please fix the failing tests",
+        agent_id="alice",
+        display_name="alice-swe",
+        recent_context=[
+            {
+                "sender_id": "alice-swe",
+                "text": "CLAIM /workspace/shared/test_calc.py#add-subtract-tests: Add pytest",
+            }
+        ],
+    )
+
+    assert guidance is not None
+    assert "call run_tests on /workspace/shared/test_calc.py" in guidance
+
+
+def test_fix_blockers_guidance_surfaces_prior_blockers_line():
+    guidance = fix_blockers_guidance(
+        "@alice-swe fix the blockers",
+        agent_id="alice",
+        display_name="alice-swe",
+        recent_context=[
+            {
+                "sender_id": "alice-swe",
+                "text": (
+                    "Done: Implemented add and subtract in /workspace/shared/calculator.py. "
+                    "Tests: ran and failed. "
+                    "Blockers: NameError on add/subtract — missing import in test_calculator.py."
+                ),
+            }
+        ],
+    )
+
+    assert guidance is not None
+    assert "Your last status reply listed Blockers:" in guidance
+    assert "NameError on add/subtract" in guidance
+
+
+def test_fix_blockers_guidance_forbids_refuse_only_finals():
+    guidance = fix_blockers_guidance(
+        "@bob-swe make the tests pass",
+        agent_id="bob",
+        display_name="bob-swe",
+    )
+
+    assert guidance is not None
+    assert "Do not emit a final answer that refuses for lack of context" in guidance
+
+
+def test_fix_blockers_guidance_ignores_self_blockers_none():
+    guidance = fix_blockers_guidance(
+        "@alice-swe fix the blockers",
+        agent_id="alice",
+        display_name="alice-swe",
+        recent_context=[
+            {
+                "sender_id": "alice-swe",
+                "text": "Done: shipped. Tests: ran and passed. Blockers: none.",
+            }
+        ],
+    )
+
+    assert guidance is not None
+    # 'none' is not a real blocker — don't surface it as the prior issue.
+    assert "Your last status reply listed Blockers:" not in guidance
+
+
+def test_private_workspace_guidance_matches_explicit_path():
+    guidance = private_workspace_guidance(
+        "@alice-swe build it in /workspace/alice/calc.py with add and subtract",
+        agent_id="alice",
+        display_name="alice-swe",
+    )
+
+    assert guidance is not None
+    assert "/workspace/alice/calc.py" in guidance
+    assert "do not redirect to /workspace/shared/" in guidance
+
+
+def test_private_workspace_guidance_ignores_other_agents_paths():
+    assert (
+        private_workspace_guidance(
+            "@alice-swe peek at /workspace/bob/foo.py",
+            agent_id="alice",
+            display_name="alice-swe",
+        )
+        is None
+    )
+
+
+def test_private_workspace_guidance_ignores_shared_path():
+    assert (
+        private_workspace_guidance(
+            "@alice-swe write /workspace/shared/calculator.py",
+            agent_id="alice",
+            display_name="alice-swe",
+        )
+        is None
+    )
 
 
 def test_handoff_guidance_falls_back_to_recent_assignment():

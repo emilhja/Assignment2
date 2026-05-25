@@ -35,6 +35,22 @@ STATUS_REQUEST_PATTERN = re.compile(
     r"|\bdone\s+yet\b|\bany\s+update\b"
     r"|\b(?:done|finished|status)\s*\?)"
 )
+FIX_REQUEST_PATTERN = re.compile(
+    r"(?i)(?:"
+    r"\bfix\s+(?:the\s+|these\s+|those\s+|that\s+|all\s+|your\s+|any\s+|my\s+)?"
+    r"(?:failing\s+|broken\s+|failed\s+|red\s+|remaining\s+|open\s+)?"
+    r"(?:blocker|failure|issue|error|bug|problem|test|broken)s?\b"
+    r"|\baddress\s+(?:the\s+|your\s+|these\s+|those\s+|all\s+)?"
+    r"(?:blocker|failure|issue|error)s?\b"
+    r"|\bresolve\s+(?:the\s+|these\s+|those\s+|all\s+)?"
+    r"(?:blocker|failure|issue|error)s?\b"
+    r"|\bmake\s+(?:the\s+)?tests?\s+pass\b"
+    r"|\bget\s+(?:the\s+)?tests?\s+(?:to\s+)?(?:pass|passing|green)\b"
+    r")"
+)
+PRIVATE_WORKSPACE_PATH_PATTERN = re.compile(
+    r"(?P<path>/workspace/(?P<agent>[A-Za-z0-9_-]+)/[^\s:;,]+)"
+)
 
 
 @dataclass(frozen=True)
@@ -131,17 +147,38 @@ def _test_path_for_source(path: str) -> str | None:
     return f"{directory}/test_{stem}.py"
 
 
-def _pytest_sidecar_guidance(text: str, path: str, own: Assignment) -> str:
+def _pytest_sidecar_guidance(
+    text: str,
+    path: str,
+    own: Assignment,
+    peer_count: int = 0,
+) -> str:
     if PYTEST_REQUEST_PATTERN.search(text) is None:
         return ""
     test_path = _test_path_for_source(path)
     if not test_path:
         return ""
-    return (
+    base = (
         " Pytest coverage was requested next to the shared file. After completing "
         f"the implementation write, use a separate CLAIM for {test_path}#{own.scope}-tests "
         "before creating or editing tests for your scope."
     )
+    verify_instruction = (
+        " After the test-file write succeeds, call run_tests with "
+        f'{{"path": "{test_path}"}} in the same continuation before sending any '
+        "final answer. Your Done line must report 'Tests: ran and passed' or "
+        "'Tests: ran and failed' with the first failure summary — "
+        "'Tests: not run' is not acceptable when pytest coverage was requested."
+    )
+    if peer_count <= 0:
+        return base + verify_instruction
+    return base + (
+        f" If {test_path} already exists when you go to write, do not append-only. "
+        "Call read_file on it first, then use replace_text on the "
+        "`from <module> import ...` line to add the symbol(s) you are about to test "
+        "before adding your test functions — otherwise pytest fails with NameError "
+        "on the symbols your peer did not import."
+    ) + verify_instruction
 
 
 def assignment_guidance(
@@ -169,6 +206,13 @@ def assignment_guidance(
     ]
     peers = "; ".join(peer_bits) if peer_bits else "none"
     claim_target = f"{plan.path}#{own.scope}"
+    race_hint = (
+        f" A peer may create {plan.path} before you. If read_file shows the file already "
+        "exists, do not retry create_file — call append_text for additive work or "
+        "edit_section/replace_text for exact replacements so peer scopes are preserved."
+        if peer_bits
+        else ""
+    )
     return (
         "Coordinator assignment detected. "
         f"Shared path: {plan.path}. "
@@ -176,8 +220,9 @@ def assignment_guidance(
         f"Required CLAIM target: {claim_target}. "
         f"Other assigned scopes: {peers}. "
         "Do not claim or write another agent's assigned scope."
+        f"{race_hint}"
         f"{_signature_agreement_guidance(text, own)}"
-        f"{_pytest_sidecar_guidance(text, plan.path, own)}"
+        f"{_pytest_sidecar_guidance(text, plan.path, own, peer_count=len(peer_bits))}"
     )
 
 
@@ -373,4 +418,115 @@ def status_request_guidance(
         "Blockers: <none | brief description>.' "
         "Do not invent results — only report tests as ran if a successful run_tests observation exists "
         f"in this round.{test_hint}{blocker_hint}"
+    )
+
+
+def _latest_self_blockers_line(
+    recent_context: Iterable[dict[str, str]],
+    agent_aliases: set[str],
+) -> str | None:
+    """Return the most recent non-trivial 'Blockers: ...' text the agent itself
+    posted, so a follow-up fix-request can surface the prior self-reported
+    failure without relying on the per-task session carrying it forward.
+    """
+
+    for entry in reversed(list(recent_context)):
+        sender = str(entry.get("sender_id") or "").lower()
+        if sender not in agent_aliases:
+            continue
+        text = str(entry.get("text") or "")
+        match = re.search(r"(?i)Blockers:\s*(?P<blockers>[^\n]+)", text)
+        if not match:
+            continue
+        blockers = match.group("blockers").strip().rstrip(".").strip()
+        if blockers and blockers.lower() != "none":
+            return blockers
+    return None
+
+
+def fix_blockers_guidance(
+    text: str,
+    *,
+    agent_id: str,
+    display_name: str,
+    recent_context: list[dict[str, str]] | None = None,
+) -> str | None:
+    """Return guidance when the operator asks the agent to fix prior blockers.
+
+    Each peer turn is a fresh per-task session, so the agent typically does not
+    have the prior round's `run_tests` observation in context. Without this
+    helper the model tends to emit a bare `type:"final"` refusal ("I'm unable
+    to fix without knowing the exact issues") instead of re-running tests to
+    fetch the failure. This guidance forbids that path and forces the agent
+    to call `run_tests` or `read_file` before any final answer this turn.
+    """
+
+    if not isinstance(text, str) or FIX_REQUEST_PATTERN.search(text) is None:
+        return None
+
+    test_path = _latest_shared_test_path(recent_context or [])
+    aliases = _agent_aliases(agent_id, display_name)
+    prior_blockers = _latest_self_blockers_line(recent_context or [], aliases)
+
+    test_step = (
+        f"call run_tests on {test_path}"
+        if test_path
+        else "call run_tests on the latest shared test file"
+    )
+    prior_note = (
+        f" Your last status reply listed Blockers: {prior_blockers}."
+        if prior_blockers
+        else ""
+    )
+
+    return (
+        "The operator is asking you to fix the prior blocker(s)."
+        f"{prior_note}"
+        " Do not emit a final answer that refuses for lack of context — first "
+        f"{test_step} (or read_file on the relevant source) to recover the "
+        "actual failure this turn, then make the fix in your scope and re-run "
+        "run_tests. Your final answer must report either green tests with the "
+        "change you made, or — if still red — the exact error from this turn's "
+        "run_tests observation and the next concrete step."
+    )
+
+
+def private_workspace_guidance(
+    text: str,
+    *,
+    agent_id: str,
+    display_name: str,
+) -> str | None:
+    """Return guidance when the operator explicitly names this agent's private
+    workspace path. The system prompt nudges agents toward `/workspace/shared/`
+    for joint work; this helper overrides that nudge when the operator picked
+    a specific path under `/workspace/<this agent id>/...`.
+
+    Returns `None` for shared paths and for other agents' private paths so the
+    existing shared-coordination helpers stay authoritative there.
+    """
+
+    if not isinstance(text, str):
+        return None
+    agent_id_norm = (agent_id or "").lower()
+    if not agent_id_norm or agent_id_norm == "shared":
+        return None
+
+    paths: list[str] = []
+    for match in PRIVATE_WORKSPACE_PATH_PATTERN.finditer(text):
+        if match.group("agent").lower() != agent_id_norm:
+            continue
+        path = match.group("path").rstrip(".,;:")
+        if path not in paths:
+            paths.append(path)
+
+    if not paths:
+        return None
+
+    path_list = ", ".join(paths)
+    return (
+        f"Operator explicitly named your private workspace path: {path_list}. "
+        "Write to that exact path — do not redirect to /workspace/shared/. "
+        "You may still post `CLAIM <path>` for the registry, but private-"
+        "workspace writes do not require shared coordination."
     )
