@@ -157,6 +157,17 @@ def test_runpod_send_posts_expected_payload(tmp_path):
     assert "[hub->]" in stdout.getvalue()
 
 
+def test_runpod_send_treats_201_created_as_success(tmp_path):
+    session = _FakeSession(post_responses=[_FakeResponse(201, {"ok": True, "seq": 85})])
+    t, _, stdout, _ = _make_transport(tmp_path, session=session)
+
+    t.send("created")
+
+    output = stdout.getvalue()
+    assert "[hub->]" in output
+    assert "[hub!]" not in output
+
+
 def test_runpod_send_truncates_to_4096(tmp_path):
     t, session, _, _ = _make_transport(tmp_path)
     t.send("x" * 5000)

@@ -328,7 +328,7 @@ class RunPodTransport:
             return
 
         status = getattr(resp, "status_code", 0)
-        if status == 200:
+        if 200 <= status < 300:
             snippet = _log_snippet(payload_text)
             self._echo(
                 f"{colors.ts()} {colors.dim('[hub->]')} "

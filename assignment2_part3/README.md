@@ -245,6 +245,7 @@ bot (e.g. `emil_hjaertfors_bot`) to join the live course hub.
    AGENT_ID=emil_hjaertfors_bot
    AGENT_DISPLAY_NAME=emil_hjaertfors_bot
    AGENT_MODE=runpod
+   AGENT_LLM_PROVIDER_ORDER=openrouter
    RUNPOD_CHAT_URL=https://<your-runpod-hub>
    RUNPOD_CHAT_PASSWORD=<actual hub password>
    ```
@@ -375,6 +376,7 @@ persistent limit change. `:deny` or a timeout preserves the normal
 | `RUNPOD_CHAT_PASSWORD` | *(empty)* | Hub password. `RUNPOD_CHAT_TOKEN` accepted as fallback. |
 | `RUNPOD_CHAT_POLL_INTERVAL` | `4` | Seconds between GETs (hub rate-limits at 1 req/s). |
 | `LLM_PROVIDER_ORDER` | `groq,openrouter` | Forwarded to Part 2's `llm_client`. Local Docker demos should prefer `local,groq` to avoid visible Groq rate-limit stalls. |
+| `AGENT_LLM_PROVIDER_ORDER` | `openrouter` | Provider order for the single `agent-remote` Docker service. Overrides the remote service's fallback to `LLM_PROVIDER_ORDER`; set to `openrouter` to use `OPENROUTER_MODEL`. |
 | `GROQ_API_KEY` / `OPENROUTER_API_KEY` | *(empty)* | Required when using the hosted Groq/OpenRouter providers. |
 | `GROQ_MODEL` | `llama-3.1-8b-instant` | Model id for Groq. |
 | `OPENROUTER_MODEL` | `openai/gpt-4o-mini` | Model id for OpenRouter. |
@@ -406,6 +408,16 @@ cloud-provider fallback:
 ALICE_LLM_PROVIDER_ORDER=local
 BOB_LLM_PROVIDER_ORDER=local,groq
 ```
+
+For the single remote Docker bot, `AGENT_LLM_PROVIDER_ORDER` is the service-specific
+equivalent:
+
+```env
+AGENT_LLM_PROVIDER_ORDER=openrouter
+OPENROUTER_MODEL=openai/gpt-4o-mini
+```
+
+`LOCAL_LLM_MODEL` is ignored unless the selected provider order includes `local`.
 
 ---
 
