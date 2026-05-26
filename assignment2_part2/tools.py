@@ -408,6 +408,56 @@ def create_file(path: str, content: str, overwrite: bool = False) -> str:
     return _truncate(f"{action} file in {_display_workspace_path(target)}.")
 
 
+def rename_file(source_path: str, target_path: str, overwrite: bool = False) -> str:
+    """Rename one workspace file without shelling out to mv."""
+
+    if not isinstance(overwrite, bool):
+        return "Edit blocked: overwrite must be a boolean."
+
+    try:
+        source = _resolve_workspace_path(source_path)
+        target = _resolve_workspace_path(target_path)
+    except ValueError as exc:
+        return f"Edit blocked: {exc}"
+
+    if not source.exists():
+        return f"Edit blocked: source file does not exist: {source}"
+    if not source.is_file():
+        return f"Edit blocked: source path is not a file: {source}"
+    if target.exists() and target.is_dir():
+        return f"Edit blocked: target path is a directory: {target}"
+    if target.exists() and not overwrite:
+        return f"Edit blocked: target file already exists: {target}"
+    if target.parent.exists() and not target.parent.is_dir():
+        return f"Edit blocked: target parent path is not a directory: {target.parent}"
+
+    # Keep renames within one allowed root. This avoids silently moving files
+    # between private and shared workspaces under the same tool call.
+    source_root = target_root = None
+    for root in _allowed_roots():
+        try:
+            source.relative_to(root)
+        except ValueError:
+            pass
+        else:
+            source_root = root
+        try:
+            target.relative_to(root)
+        except ValueError:
+            pass
+        else:
+            target_root = root
+    if source_root != target_root:
+        return "Edit blocked: source and target must stay inside the same workspace root."
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source.replace(target)
+    return _truncate(
+        "Renamed file from "
+        f"{_display_workspace_path(source)} to {_display_workspace_path(target)}."
+    )
+
+
 def append_text(path: str, content: str) -> str:
     """Append text to an existing workspace file."""
 
@@ -496,6 +546,16 @@ TOOL_REGISTRY = {
         description="Append text to an existing workspace file.",
         required_args=("path", "content"),
         handler=lambda args: append_text(args["path"], args["content"]),
+    ),
+    "rename_file": ToolSpec(
+        name="rename_file",
+        description="Rename one workspace file without shelling out to mv.",
+        required_args=("source_path", "target_path"),
+        handler=lambda args: rename_file(
+            args["source_path"],
+            args["target_path"],
+            args.get("overwrite", False),
+        ),
     ),
     "replace_text": ToolSpec(
         name="replace_text",

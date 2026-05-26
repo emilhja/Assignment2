@@ -29,6 +29,7 @@ from thread_safe_store import ThreadSafeSessionStore as SessionStore
 import colors
 from budget import Budget, format_usage_summary
 from claims import CLAIM_PATTERN, DEFER_PATTERN, RELEASE_PATTERN, Claim, ClaimRegistry, split_claim_target
+from code_share import MAX_PROJECTS, most_recent_project_dir, next_project_dir, process_shared_code
 from coordination import (
     assignment_guidance,
     fix_blockers_guidance,
@@ -89,6 +90,82 @@ class PendingFollowup:
     timestamp: float
     message_id: str
     text: str
+
+
+@dataclass
+class _ProjectState:
+    active: Path | None = None
+
+
+def _remote_workspace_guidance(agent_id: str, project_name: str) -> str:
+    return (
+        f"Remote hub mode (no shared filesystem). Your active project is "
+        f"/workspace/{agent_id}/{project_name}/. Write every file you create or "
+        f"edit under /workspace/{agent_id}/{project_name}/<filename>. Never "
+        "say you wrote to /sandbox or /workspace/shared in remote hub mode; "
+        "those are wrong here. Do NOT write to /workspace/shared/ on this hub "
+        "— peers cannot see it and there is no point in claiming it. When you "
+        "share code in chat, put `# file: <filename>` as the first line inside "
+        "each Python/Markdown code block so peers save it under the intended "
+        "name. If the runtime says peer code was saved, reference the exact "
+        "saved /workspace/<agent>/<project>/<filename> path it reports, not a "
+        "filename you expected. Do NOT emit CLAIM, RELEASE, or DEFER protocol "
+        "lines on this hub; the system prompt's P3.9 protocol applies only to "
+        "the local docker-compose demo. The operator can switch active project "
+        "at any time with :project new or :project use N."
+    )
+
+
+def _build_project_handler(
+    project_state: _ProjectState,
+    agent_workspace: Path,
+):
+    def handler(action: str, rest: list[str]) -> str:
+        action = (action or "info").lower()
+        if action == "info":
+            if project_state.active is None:
+                return "active=<none>"
+            return f"active={project_state.active.name}"
+        if action == "new":
+            nxt = next_project_dir(agent_workspace)
+            if nxt is None:
+                return f"[project error] cap reached ({MAX_PROJECTS} projects)"
+            project_state.active = nxt
+            return f"active={nxt.name} (new)"
+        if action == "use":
+            if not rest:
+                return "usage: :project use <N>"
+            try:
+                n = int(rest[0])
+            except ValueError:
+                return f"[project error] N must be an integer, got {rest[0]!r}"
+            if n < 1 or n > MAX_PROJECTS:
+                return f"[project error] N must be 1..{MAX_PROJECTS}, got {n}"
+            target = agent_workspace / f"project{n}"
+            if not target.is_dir():
+                return f"[project error] {target.name} does not exist"
+            project_state.active = target
+            return f"active={target.name}"
+        if action == "list":
+            entries = []
+            for entry in sorted(
+                agent_workspace.iterdir() if agent_workspace.exists() else [],
+                key=lambda p: p.name,
+            ):
+                m = re.fullmatch(r"project(\d+)", entry.name)
+                if not entry.is_dir() or not m:
+                    continue
+                marker = "*" if (
+                    project_state.active is not None
+                    and entry.name == project_state.active.name
+                ) else " "
+                entries.append(f"  {marker} {entry.name}")
+            if not entries:
+                return "[no projects]"
+            return "\n".join(entries)
+        return "usage: :project [info|new|use <N>|list]"
+
+    return handler
 
 
 def _env_int(name: str, default: int) -> int:
@@ -199,7 +276,7 @@ def _stale_claim_guidance(active_claims: list[Claim]) -> str | None:
     return (
         "You have unsatisfied active CLAIM(s) from a previous turn: "
         f"{targets}. On this turn either complete the write with "
-        "create_file/append_text/edit_section/replace_text for each, or post "
+        "create_file/append_text/edit_section/rename_file/replace_text for each, or post "
         "`RELEASE <target>` to give it up. Do not re-post the same CLAIM."
     )
 
@@ -246,6 +323,7 @@ def run_group_chat(
         if a.strip()
     )
     mode = os.environ.get("AGENT_MODE", "stub").lower()
+    runpod = mode == "runpod"
 
     owns_store = store is None
     if store is None:
@@ -268,11 +346,53 @@ def run_group_chat(
     if transport is None:
         transport = build_transport(mode, agent_id, DATA_DIR)
 
+    project_state = _ProjectState()
+    project_handler = None
+    if runpod:
+        ws_env = os.environ.get("AGENT_WORKSPACE")
+        if ws_env:
+            agent_workspace = Path(ws_env)
+            agent_workspace.mkdir(parents=True, exist_ok=True)
+            project_handler = _build_project_handler(project_state, agent_workspace)
+            most_recent = most_recent_project_dir(agent_workspace)
+            if most_recent is None:
+                # First boot in this workspace — no choice to make.
+                initial = next_project_dir(agent_workspace)
+                project_state.active = initial
+                active_name = initial.name if initial is not None else "<none>"
+                print(
+                    colors.dim(
+                        f"[project] active={active_name} (new) — :project new for fresh, "
+                        ":project use N to switch, :project list to enumerate."
+                    ),
+                    flush=True,
+                )
+            else:
+                # Existing projects found — defer to operator so reconnect is explicit.
+                existing_names = ", ".join(
+                    sorted(
+                        (
+                            e.name for e in agent_workspace.iterdir()
+                            if e.is_dir() and re.fullmatch(r"project\d+", e.name)
+                        ),
+                        key=lambda n: int(n[len("project"):]),
+                    )
+                )
+                print(
+                    colors.dim(
+                        f"[project] existing: {existing_names} — no active project. "
+                        "Type :project new to start fresh, or :project use N to "
+                        "reconnect. Inbound messages are skipped until you choose."
+                    ),
+                    flush=True,
+                )
+
     if console is None:
         console = ConsoleControl(
             budget=budget,
             stop_event=stop_event,
             send_fn=transport.send,
+            project_handler=project_handler,
         )
         console.start()
 
@@ -301,8 +421,6 @@ def run_group_chat(
         ),
         flush=True,
     )
-
-    runpod = mode == "runpod"
 
     def _hub_echo(arrow: str, sender: str, text: str) -> None:
         snippet = text[:160].replace("\n", " ")
@@ -400,6 +518,15 @@ def run_group_chat(
         )
         if guidance:
             runtime_guidance.append(guidance)
+        if runpod and project_state.active is not None:
+            code_guidance = process_shared_code(
+                message.text, agent_id, project_state.active
+            )
+            if code_guidance:
+                runtime_guidance.append(code_guidance)
+            runtime_guidance.append(
+                _remote_workspace_guidance(agent_id, project_state.active.name)
+            )
         try:
             return run_peer_task(
                 message,
@@ -454,6 +581,19 @@ def run_group_chat(
             _hub_echo("<-", message.sender_id, message.text)
 
         prior_context = _remember_inbound(message)
+
+        if runpod and project_state.active is None:
+            _absorb_inbound_claims(message)
+            _log(
+                store,
+                "reply_decision",
+                f"respond=False reason=no_active_project msg_id={message.id} sender={message.sender_id}",
+            )
+            print(
+                f"{colors.ts()} {colors.dim('[skip] no active project — :project new or :project use N to choose')}",
+                flush=True,
+            )
+            return
 
         now = time.time()
         followup_kind = _followup_reply_kind(message.text)

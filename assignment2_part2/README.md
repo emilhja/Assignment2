@@ -110,15 +110,20 @@ redirection. It refuses outside-workspace paths and existing files unless
 exact whole-line `old_text` section with `new_text`, including indentation, and
 refuses missing, repeated, partial-line, or outside-workspace edits.
 
+`rename_file` renames one file inside the configured workspace without shelling
+out to `mv`. It refuses directories, outside-workspace paths, existing targets
+unless `overwrite` is true, and moves between private and shared roots.
+
 `replace_text` edits one file inside the configured workspace. It replaces one
 exact whole-line match by default, or every exact whole-line match when
 `all_occurrences` is true. Repeated text is refused unless the caller
 explicitly asks for every match.
 
-After a successful `create_file`, `edit_section`, or `replace_text` call, the agent runtime
-automatically runs the full Part 2 pytest suite before returning a final
-answer. From the repository root it uses `python -m pytest assignment2_part2 -q`;
-from the packaged Part 2 app root it uses `python -m pytest -q`.
+After a successful `create_file`, `edit_section`, `rename_file`, or
+`replace_text` call, the agent runtime automatically runs the full Part 2
+pytest suite before returning a final answer. From the repository root it uses
+`python -m pytest assignment2_part2 -q`; from the packaged Part 2 app root it
+uses `python -m pytest -q`.
 
 ## Safety
 

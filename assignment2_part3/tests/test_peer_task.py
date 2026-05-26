@@ -12,7 +12,7 @@ from session_store import SessionStore
 from budget import Budget
 from claims import ClaimRegistry
 from peer import PeerMessage
-from peer_task import _ensure_peer_mentions, run_peer_task
+from peer_task import _ensure_peer_mentions, _run_tool_with_approval, run_peer_task
 from reply_policy import CollisionInfo
 from thread_safe_store import ThreadSafeSessionStore
 
@@ -68,6 +68,73 @@ class _BudgetApprovalConsole:
     def request_budget_approval(self, reason, estimated_tokens):
         self.requests.append((reason, estimated_tokens))
         return self.approved
+
+
+class _BashApprovalConsole:
+    def __init__(self, approved):
+        self.approved = approved
+        self.requests = []
+
+    def request_bash_approval(self, command):
+        self.requests.append(command)
+        return self.approved
+
+
+def test_safe_ls_auto_approval_skips_console_prompt(monkeypatch):
+    console = _BashApprovalConsole(approved=False)
+    calls = []
+
+    def fake_run_tool(tool, args):
+        calls.append((tool, args))
+        return "listed files"
+
+    monkeypatch.setattr("peer_task.run_tool", fake_run_tool)
+
+    observation = _run_tool_with_approval(
+        "bash",
+        {"command": "ls -la /workspace"},
+        console,
+    )
+
+    assert observation == "listed files"
+    assert console.requests == []
+    assert calls == [("bash", {"command": "ls -la /workspace"})]
+
+
+def test_non_ls_bash_still_requires_operator_approval(monkeypatch):
+    console = _BashApprovalConsole(approved=False)
+
+    def fake_run_tool(tool, args):
+        raise AssertionError("denied command should not run")
+
+    monkeypatch.setattr("peer_task.run_tool", fake_run_tool)
+
+    observation = _run_tool_with_approval(
+        "bash",
+        {"command": "cat /workspace/file.txt"},
+        console,
+    )
+
+    assert observation == "The command was denied by the operator, so I did not run it."
+    assert console.requests == ["cat /workspace/file.txt"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ls /",
+        "ls ../x",
+        "ls /workspace/*",
+        "ls $(pwd)",
+    ],
+)
+def test_unsafe_ls_variants_require_approval_and_remain_safety_blocked(command):
+    console = _BashApprovalConsole(approved=True)
+
+    observation = _run_tool_with_approval("bash", {"command": command}, console)
+
+    assert console.requests == [command]
+    assert observation.startswith("Blocked by safety check:")
 
 
 def test_budget_override_denial_stops_without_llm_call(tmp_path):
@@ -2284,6 +2351,102 @@ def test_user_action_request_followed_by_tool_call_no_reprompt(tmp_path, monkeyp
     assert len(calls) == 2
     kinds = [kind for _role, kind, _content in _events(store)]
     assert "user_action_prose_stall_reprompt" not in kinds
+
+
+def test_private_project_rename_tool_recovers_invalid_snippet_filename(tmp_path, monkeypatch):
+    """A model fixing an invalid Python module filename should use rename_file,
+    not bash mv. This covers the RunPod calculator trace where snippet1-2.py
+    caused a SyntaxError in pytest collection."""
+
+    project = tmp_path / "project2"
+    project.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    (project / "snippet1-2.py").write_text(
+        "def add(a, b):\n    return a + b\n",
+        encoding="utf-8",
+    )
+    (project / "test_calculator.py").write_text(
+        "from snippet1-2 import add\n\n"
+        "def test_add():\n"
+        "    assert add(1, 2) == 3\n",
+        encoding="utf-8",
+    )
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_rename",
+        sender_id="emil-user",
+        text="@alice-swe fix the pytest import error in project2",
+    )
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "run_tests",
+            "args": {"path": "/workspace/project2/test_calculator.py"},
+        }),
+        json.dumps({
+            "type": "tool_call",
+            "tool": "rename_file",
+            "args": {
+                "source_path": "/workspace/project2/snippet1-2.py",
+                "target_path": "/workspace/project2/snippet1_2.py",
+            },
+        }),
+        json.dumps({
+            "type": "tool_call",
+            "tool": "replace_text",
+            "args": {
+                "path": "/workspace/project2/test_calculator.py",
+                "old_text": "from snippet1-2 import add\n",
+                "new_text": "from snippet1_2 import add\n",
+            },
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Renamed the snippet module and updated the test import.",
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    import peer_task as _peer_task_mod
+    real_run_tool = _peer_task_mod.run_tool
+
+    def fake_run_tool(tool, args):
+        if tool == "run_tests":
+            return (
+                "pytest exited with code 2.\n"
+                "SyntaxError: invalid syntax\n"
+                "from snippet1-2 import add"
+            )
+        return real_run_tool(tool, args)
+
+    monkeypatch.setattr("peer_task.run_tool", fake_run_tool)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="alice",
+    )
+
+    assert "Renamed" in answer
+    assert not (project / "snippet1-2.py").exists()
+    assert (project / "snippet1_2.py").read_text(encoding="utf-8").startswith("def add")
+    assert "from snippet1_2 import add" in (project / "test_calculator.py").read_text(
+        encoding="utf-8"
+    )
+    tool_events = [
+        json.loads(content)
+        for role, _kind, content in _events(store)
+        if role == "tool"
+    ]
+    assert [event["args"] for event in tool_events if "source_path" in event["args"]]
+    assert all(event["args"].get("command", "").split(" ", 1)[0] != "mv" for event in tool_events)
 
 
 def test_user_no_action_request_prose_passes_through(tmp_path, monkeypatch):

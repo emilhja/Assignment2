@@ -15,7 +15,7 @@ from tools import MAX_OUTPUT_CHARS, TOOL_REGISTRY, run_tool
 MAX_STEPS = 8
 MAX_CONTEXT_TURNS = 4
 MAX_CONTEXT_CHARS = 2000
-EDIT_TOOLS = {"create_file", "edit_section", "replace_text"}
+EDIT_TOOLS = {"create_file", "edit_section", "rename_file", "replace_text"}
 POST_EDIT_TEST_COMMAND = "python -m pytest assignment2_part2 -q"
 POST_EDIT_TEST_LOCAL_COMMAND = "python -m pytest -q"
 POST_EDIT_TEST_TIMEOUT_SECONDS = 120
@@ -114,7 +114,9 @@ def _truncate_observation(text: str) -> str:
 def _edit_succeeded(tool: str, observation: str) -> bool:
     if tool not in EDIT_TOOLS:
         return False
-    return observation.startswith(("Created file", "Overwrote file", "Edited one section", "Replaced "))
+    return observation.startswith(
+        ("Created file", "Overwrote file", "Edited one section", "Renamed file", "Replaced ")
+    )
 
 
 def _user_requested_execution(user_task: str) -> bool:

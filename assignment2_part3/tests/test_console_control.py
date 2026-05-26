@@ -228,6 +228,51 @@ def test_pause_persists_to_disk(tmp_path):
     assert reloaded.paused is True
 
 
+def test_project_command_without_handler_prints_disabled():
+    cc, budget, stop, stdout = _start_console(":project new\n")
+    assert _wait_for(lambda: "[project not enabled in this mode]" in stdout.getvalue())
+    stop.set()
+
+
+def test_project_command_invokes_handler():
+    calls: list[tuple[str, list[str]]] = []
+
+    def handler(action, rest):
+        calls.append((action, rest))
+        return f"active=project{rest[0] if rest else 'X'}"
+
+    cc, budget, stop, stdout = _start_console(
+        ":project use 5\n", project_handler=handler
+    )
+    assert _wait_for(lambda: calls == [("use", ["5"])])
+    assert _wait_for(lambda: "active=project5" in stdout.getvalue())
+    stop.set()
+
+
+def test_project_info_default_action():
+    calls: list[tuple[str, list[str]]] = []
+
+    def handler(action, rest):
+        calls.append((action, rest))
+        return "active=project3"
+
+    cc, budget, stop, stdout = _start_console(":project\n", project_handler=handler)
+    assert _wait_for(lambda: calls == [("info", [])])
+    assert _wait_for(lambda: "active=project3" in stdout.getvalue())
+    stop.set()
+
+
+def test_project_handler_exception_is_caught():
+    def handler(action, rest):
+        raise RuntimeError("nope")
+
+    cc, budget, stop, stdout = _start_console(
+        ":project list\n", project_handler=handler
+    )
+    assert _wait_for(lambda: "[project error] nope" in stdout.getvalue())
+    stop.set()
+
+
 def test_resume_persists_to_disk(tmp_path):
     budget_path = tmp_path / "budget.json"
     budget = Budget.load(

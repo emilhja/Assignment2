@@ -44,6 +44,10 @@ HELP_TEXT = (
     "  :pause / :resume              stop or resume outbound LLM calls\n"
     "  :approve / :deny              answer the pending bash/budget approval\n"
     "  :say <text>                   post a message to the group chat as this agent\n"
+    "  :project                      show active remote-hub project\n"
+    "  :project new                  allocate a fresh projectN and switch to it\n"
+    "  :project use <N>              switch active project to projectN\n"
+    "  :project list                 list existing projects (active marked *)\n"
     "  :stop                         exit cleanly\n"
     "  :help                         print this list\n"
 )
@@ -70,12 +74,14 @@ class ConsoleControl:
         stdin: Optional[IO[str]] = None,
         stdout: Optional[IO[str]] = None,
         send_fn: Optional[Callable[[str], None]] = None,
+        project_handler: Optional[Callable[[str, list[str]], str]] = None,
     ):
         self.budget = budget
         self.stop_event = stop_event
         self.stdin = stdin if stdin is not None else sys.stdin
         self.stdout = stdout if stdout is not None else sys.stdout
         self.send_fn = send_fn
+        self.project_handler = project_handler
         self._approval_lock = threading.Lock()
         self._pending: Optional[BashApproval] = None
         self._pending_budget: Optional[BudgetApproval] = None
@@ -201,6 +207,8 @@ class ConsoleControl:
                 self._print(colors.paint("[denied]", colors.BOLD, colors.RED))
         elif cmd == "say":
             self._cmd_say(rest)
+        elif cmd == "project":
+            self._cmd_project(args)
         elif cmd == "stop":
             self._print(colors.paint("[stop requested]", colors.YELLOW))
             self.stop_event.set()
@@ -222,6 +230,18 @@ class ConsoleControl:
             self.send_fn(scrubbed)
         except Exception as exc:
             self._print(f"[say failed: {exc}]")
+
+    def _cmd_project(self, args: list[str]) -> None:
+        if self.project_handler is None:
+            self._print("[project not enabled in this mode]")
+            return
+        action = args[0].lower() if args else "info"
+        rest = args[1:]
+        try:
+            result = self.project_handler(action, rest)
+        except Exception as exc:
+            result = f"[project error] {exc}"
+        self._print(result)
 
     def _cmd_limit(self, args: list[str]) -> None:
         if len(args) != 2:

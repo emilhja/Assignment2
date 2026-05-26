@@ -147,7 +147,7 @@ local-hub-1    | [hub] POST /api/message from alice-swe
 agent-alice-1  | [hub->] seq=3 alice-swe: Created utils.py with add(a,b)
 agent-bob-1    | [skip] not addressed; not a broadcast
 agent-bob-1    | [hub->] seq=8 bob-swe: Hi, happy to help!
-agent-alice-1  | [approval needed] bash> ls -la /workspace/alice
+agent-alice-1  | [approval needed] bash> cat /workspace/alice/notes.txt
 ```
 
 To filter T1 to one container: `docker compose logs -f agent-alice`.
@@ -157,9 +157,10 @@ compose owns the containers' stdin and `docker attach` in T2/T3 won't work.
 
 ### 3. Approving bash commands
 
-When an agent proposes a bash command, T1 shows:
+When an agent proposes a bash command other than auto-approved safe `ls`
+inspection, T1 shows:
 ```
-agent-alice-1  | [approval needed] bash> ls -la /workspace/alice
+agent-alice-1  | [approval needed] bash> cat /workspace/alice/notes.txt
 agent-alice-1  | Type :approve or :deny.
 ```
 
@@ -171,7 +172,7 @@ Switch to T2 (alice's attach terminal) and type:
 T1 then confirms:
 ```
 agent-alice-1  | [approved]
-agent-alice-1  | [hub->] seq=N alice-swe: <ls output>
+agent-alice-1  | [hub->] seq=N alice-swe: <command output>
 ```
 
 You can leave T2 and T3 attached permanently — no need to detach between
@@ -198,7 +199,8 @@ flip the mode.
    [hub->] seq=13 <your-name>: hello, I'm joining ...
    ```
 
-Approvals stay local. If the LLM proposes a bash command, you'll see
+Approvals stay local. If the LLM proposes a bash command that is not
+auto-approved safe `ls` inspection, you'll see
 `[approval needed] bash> ...` in **your** terminal; if an LLM call would
 exceed the token/rate budget, you'll see `[budget approval needed] budget> ...`.
 Reply with `:approve` or `:deny` in the agent console. The hub never
@@ -290,12 +292,12 @@ stop. Use `:limit` again if you want to persistently raise the cap.
 Send alice a task that requires a shell action (T4):
 
 ```bash
-python tools/chat.py say --as emil-user "@alice-swe run ls -la /workspace/alice"
+python tools/chat.py say --as emil-user "@alice-swe run cat /workspace/alice/notes.txt"
 ```
 
 T2 shows:
 ```
-agent-alice-1  | [approval needed] bash> ls -la /workspace/alice
+agent-alice-1  | [approval needed] bash> cat /workspace/alice/notes.txt
 agent-alice-1  | Type :approve or :deny.
 ```
 

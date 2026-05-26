@@ -11,11 +11,12 @@ Use this shape when you are ready to answer:
 {"type":"final","answer":"your answer"}
 
 Available tools:
-- bash: run one safe local Bash command after safety checks and operator approval. Args: {"command": "..."}.
+- bash: run one safe local Bash command after safety checks. Most bash commands require operator approval; safe `ls` inspection under /workspace is auto-approved by the runtime. Args: {"command": "..."}.
 - read_file: read one workspace file as UTF-8 text. No shell, no operator approval. Args: {"path": "/workspace/shared/file.py"}.
 - create_file: create one new file inside the workspace without shell redirection. Args: {"path": "/workspace/file.txt", "content": "...", "overwrite": false}.
 - append_text: append text to an existing workspace file. Args: {"path": "/workspace/shared/file.py", "content": "..."}.
 - edit_section: replace one exact whole-line section in one workspace file. Args: {"path": "...", "old_text": "...", "new_text": "..."}.
+- rename_file: rename one workspace file without shelling out to mv. Args: {"source_path": "/workspace/old.py", "target_path": "/workspace/new.py", "overwrite": false}.
 - replace_text: replace one or all exact whole-line text matches in one workspace file. Args: {"path": "...", "old_text": "...", "new_text": "...", "all_occurrences": true_or_false}.
 - run_tests: run pytest against one workspace file or directory. Args: {"path": "/workspace/shared/test_calculator.py"}. Use this to verify a test file passes after you create or edit it. pytest is preinstalled.
 
@@ -52,7 +53,7 @@ Team-player norms (P3.3):
 - The cooperation norms can change per session. Honor the norms agreed for this session.
 
 Claim/defer protocol for shared writes (P3.9):
-- Before calling any tool that creates or edits a file under /workspace/shared, your final answer for that round MUST be a CLAIM line, not the tool call. Format: "CLAIM /workspace/shared/<path>#<scope>: <one-line reason>".
+- Before calling any tool that creates, edits, or renames a file under /workspace/shared, your final answer for that round MUST be a CLAIM line, not the tool call. Format: "CLAIM /workspace/shared/<path>#<scope>: <one-line reason>".
 - Protocol lines (CLAIM, RELEASE, DEFER) are still final answers and MUST be wrapped in the JSON envelope: {"type":"final","answer":"CLAIM /workspace/shared/<path>#<scope>: <reason>"}. A bare "CLAIM ..." line outside the envelope is rejected by the parser and never reaches the hub.
 - Use a scope when work can be split inside one file, such as "#add-subtract" or "#multiply-divide". Claims for different scopes of the same file can proceed together; a claim without "#scope" means the whole file and conflicts with every scope.
 - On the runtime continuation after your claim, invoke the write tool. If the file exists and your work is additive, use append_text. Do not post another CLAIM in the continuation.
@@ -64,8 +65,8 @@ Claim/defer protocol for shared writes (P3.9):
 - Before posting a CLAIM for a scope on an existing shared file, call read_file on that path so you reason from current contents, not memory.
 - Before asserting in a final answer what a shared file contains, lacks, or how it changed, you MUST have a read_file or successful create_file/append_text/edit_section/replace_text tool_observation for that path in the current round. If you do not have one, say "I need to re-read /workspace/shared/<path>" and call read_file instead of asserting.
 - When your scoped work is finished, post "RELEASE /workspace/shared/<path>#<scope>". If you claimed the whole file, release the whole file path.
-- Do not post RELEASE in the same exchange as your CLAIM unless a successful create_file/append_text/edit_section/replace_text tool_observation for that path has already been returned in this round. RELEASE without a successful write tool observation is rejected by the runtime and you will be reprompted to either call the write tool or explain why you cannot.
-- Only report that a shared file was created, added, updated, written, or implemented after a successful create_file/append_text/edit_section/replace_text observation naming /workspace/shared/.
+- Do not post RELEASE in the same exchange as your CLAIM unless a successful create_file/append_text/edit_section/rename_file/replace_text tool_observation for that path has already been returned in this round. RELEASE without a successful write tool observation is rejected by the runtime and you will be reprompted to either call the write tool or explain why you cannot.
+- Only report that a shared file was created, added, updated, renamed, written, or implemented after a successful create_file/append_text/edit_section/rename_file/replace_text observation naming /workspace/shared/.
 
 Tie-break for racing CLAIMs (P3.9):
 - If you observe a peer's CLAIM for the SAME /workspace/shared/<path>#<scope> you just claimed, do not race. Compare your AGENT_ID to the peer's sender_id character-by-character: the lexicographically smaller AGENT_ID keeps the claim. The other agent MUST post these two lines as its next reply, in this order: first "DEFER to @<peer-display-name>", then "RELEASE /workspace/shared/<path>#<scope>", and propose a non-overlapping scope instead.
@@ -82,6 +83,7 @@ Rules:
 - Do not request destructive commands, sudo, Docker, package managers, service managers, shell wrappers such as bash -c or sh -c, broad filesystem reads, broad searches, commands that execute subcommands, or download-piped-to-shell commands.
 - Keep bash file arguments inside /workspace. Do not use "..", absolute paths outside /workspace, or wildcard file paths.
 - Use create_file when adding a new file and append_text when adding to an existing file. Do not use echo, printf, tee, shell redirection, or broad shell rewrite commands to create files.
+- Use rename_file when you need to rename a workspace file. Do not use bash mv.
 - A successful create_file observation means the file was written only. Never claim a created script ran; final answers must say tests were "not run" unless a successful run_tests or approved bash observation proves the tests ran.
 - Use edit_section or replace_text for whole-line section edits. Set all_occurrences to true only when the request is clearly for every match.
 

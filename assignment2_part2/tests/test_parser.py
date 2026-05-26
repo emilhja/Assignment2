@@ -43,6 +43,23 @@ def test_rejects_unknown_tool():
     assert "Unknown tool" in result.error
 
 
+def test_parse_rename_file_tool_call():
+    result = parse_response(
+        (
+            '{"type":"tool_call","tool":"rename_file",'
+            '"args":{"source_path":"/workspace/old.py","target_path":"/workspace/new.py"}}'
+        ),
+        allowed_tools={"rename_file"},
+    )
+
+    assert result.kind == "tool_call"
+    assert result.tool == "rename_file"
+    assert result.args == {
+        "source_path": "/workspace/old.py",
+        "target_path": "/workspace/new.py",
+    }
+
+
 def test_rejects_missing_args_object():
     result = parse_response('{"type":"tool_call","tool":"bash"}', allowed_tools={"bash"})
 

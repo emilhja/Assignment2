@@ -17,6 +17,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import shlex
 import threading
 from typing import Callable, Optional
 
@@ -24,6 +25,7 @@ import part2_bridge  # noqa: F401 — sys.path side effect; needed before Part 2
 
 from llm_client import complete_chat_with_metadata
 from parser import parse_response
+from safety import safety_check
 from session_store import SessionStore
 from tools import MAX_OUTPUT_CHARS, TOOL_REGISTRY, _resolve_workspace_path, run_tool
 
@@ -43,8 +45,9 @@ MAX_CONTINUATION_REPROMPTS_PER_REASON = 2
 MAX_CONTEXT_MESSAGES = 24
 MAX_CONTEXT_CHARS = 2000
 
-CLAIM_GATED_TOOLS = {"create_file", "append_text", "edit_section", "replace_text"}
+CLAIM_GATED_TOOLS = {"create_file", "append_text", "edit_section", "rename_file", "replace_text"}
 SHARED_PATH_PREFIX = "/workspace/shared/"
+_AUTO_APPROVAL_CONTROL_CHARS = re.compile(r"[;&|]|\r|\n")
 
 
 def _json(payload: dict) -> str:
@@ -95,6 +98,11 @@ def _tool_arg_summary(tool: str, args: dict) -> str:
             content = str(args.get("content", ""))
             extra = f" {len(content)}b"
         return f"path={path}{extra}"
+    if tool == "rename_file":
+        source = args.get("source_path")
+        target = args.get("target_path")
+        if isinstance(source, str) and isinstance(target, str):
+            return f"{source} -> {target}"
     keys = ",".join(sorted(args.keys()))
     return f"args=[{keys}]"
 
@@ -239,6 +247,26 @@ def _maybe_scrub_args_refusal(args: dict) -> Optional[str]:
     return peer_intent_refusal(text)
 
 
+def _is_auto_approvable_bash_command(command: str) -> bool:
+    """Return True for the narrow Part 3 bash approval bypass.
+
+    The actual execution still goes through Part 2's run_tool/run_bash path,
+    so this only decides whether the local operator prompt can be skipped.
+    """
+
+    command = command.strip()
+    allowed, _reason = safety_check(command)
+    if not allowed:
+        return False
+    if _AUTO_APPROVAL_CONTROL_CHARS.search(command):
+        return False
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    return bool(tokens) and tokens[0] == "ls"
+
+
 def _run_tool_with_approval(
     tool: str,
     args: dict,
@@ -248,7 +276,7 @@ def _run_tool_with_approval(
         command = args.get("command")
         if not isinstance(command, str) or not command.strip():
             return "Tool error: bash requires a non-empty string command."
-        if console is not None:
+        if console is not None and not _is_auto_approvable_bash_command(command):
             if not console.request_bash_approval(command):
                 return "The command was denied by the operator, so I did not run it."
     return run_tool(tool, args)
@@ -265,6 +293,13 @@ def _maybe_shared_write_refusal(
     if claims is None or tool not in CLAIM_GATED_TOOLS:
         return None
     path = args.get("path")
+    if tool == "rename_file":
+        source_path = args.get("source_path")
+        target_path = args.get("target_path")
+        if isinstance(source_path, str) and source_path.startswith(SHARED_PATH_PREFIX):
+            path = source_path
+        elif isinstance(target_path, str) and target_path.startswith(SHARED_PATH_PREFIX):
+            path = target_path
     if not isinstance(path, str) or not path.startswith(SHARED_PATH_PREFIX):
         return None
     own_claim = claims.own_claim_for_write(path, self_id)
@@ -792,7 +827,7 @@ def run_peer_task(
                 guidance = (
                     "You already posted the CLAIM. This is the runtime continuation for that "
                     "active claim, so do not reply with another CLAIM. Use a tool call now "
-                    "(read_file, create_file, append_text, edit_section, or replace_text), then "
+                    "(read_file, create_file, append_text, edit_section, rename_file, or replace_text), then "
                     "report only after the tool observation succeeds."
                 )
                 stopped = _continuation_reprompt_or_stop(
@@ -1009,6 +1044,22 @@ def run_peer_task(
                     saw_successful_shared_write = True
                     if claims is not None and self_id:
                         claims.mark_satisfied(self_id, parsed.args["path"])
+            elif parsed.tool == "rename_file":
+                source_path = parsed.args.get("source_path")
+                target_path = parsed.args.get("target_path")
+                shared_path = None
+                if isinstance(source_path, str) and source_path.startswith(SHARED_PATH_PREFIX):
+                    shared_path = source_path
+                elif isinstance(target_path, str) and target_path.startswith(SHARED_PATH_PREFIX):
+                    shared_path = target_path
+                if shared_path is not None:
+                    if _looks_like_failed_write(observation):
+                        saw_failed_shared_write = True
+                    else:
+                        saw_failed_shared_write = False
+                        saw_successful_shared_write = True
+                        if claims is not None and self_id:
+                            claims.mark_satisfied(self_id, shared_path)
             if parsed.tool == "run_tests":
                 # Any reachable run_tests attempt counts as verification: a red
                 # pytest is still proof the agent tried, and the next final

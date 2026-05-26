@@ -25,11 +25,21 @@ from claims import ClaimRegistry
 from console_control import ConsoleControl
 from group_chat import (
     _released_without_write_guidance,
+    _remote_workspace_guidance,
     _stale_claim_guidance,
     load_system_prompt,
     run_group_chat,
 )
 from transport import StubTransport
+
+
+def test_remote_workspace_guidance_rejects_wrong_remote_paths():
+    guidance = _remote_workspace_guidance("emil_hjaertfors_bot", "project2")
+    assert "/workspace/emil_hjaertfors_bot/project2/" in guidance
+    assert "/sandbox" in guidance
+    assert "/workspace/shared" in guidance
+    assert "# file: <filename>" in guidance
+    assert "exact saved /workspace/<agent>/<project>/<filename> path" in guidance
 
 
 class FakeChat:
@@ -500,6 +510,12 @@ def test_skip_reason_silent_in_stub_mode(tmp_path, monkeypatch, capsys):
 
 def test_skip_reason_printed_in_runpod_mode(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("AGENT_MODE", "runpod")
+    # Fresh workspace so the runpod startup auto-allocates project1 instead of
+    # deferring to the operator — otherwise the no-active-project gate fires
+    # first and the reply-policy skip we want to assert never runs.
+    private = tmp_path / "alice"
+    private.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
     peer_lines = [
         json.dumps({"id": "m1", "sender_id": "bob", "text": "random chatter, no mention"}) + "\n",
     ]
@@ -516,6 +532,73 @@ def test_skip_reason_printed_in_runpod_mode(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "[skip]" in captured.out
     assert "not addressed" in captured.out
+
+
+def test_runpod_with_existing_projects_defers_and_skips_until_chosen(tmp_path, monkeypatch, capsys):
+    """When the runpod agent boots and finds existing projectN/ dirs, it must
+    NOT auto-select one — that's how a reconnect silently lands on stale
+    state. Instead it should print the deferred-selection banner and skip
+    inbound messages until the operator runs :project new or :project use N."""
+
+    private = tmp_path / "alice"
+    private.mkdir()
+    (private / "project1").mkdir()
+    (private / "project2").mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe please continue"}) + "\n",
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies=[])
+    # _setup_run forces AGENT_MODE=stub; flip it to runpod for this test.
+    monkeypatch.setenv("AGENT_MODE", "runpod")
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert ctx["fake_chat"].calls == 0
+    captured = capsys.readouterr()
+    assert "[project] existing: project1, project2" in captured.out
+    assert "no active project" in captured.out
+    assert "[skip] no active project" in captured.out
+
+    decision_rows = [
+        content for role, kind, content in _events(ctx["store"])
+        if kind == "reply_decision"
+    ]
+    assert any("no_active_project" in row for row in decision_rows)
+
+
+def test_runpod_with_no_existing_projects_auto_creates_project1(tmp_path, monkeypatch, capsys):
+    """First boot in a fresh workspace has no choice to make — auto-create
+    project1 and start replying immediately."""
+
+    private = tmp_path / "alice"
+    private.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe say hi"}) + "\n",
+    ]
+    scripted = [json.dumps({"type": "final", "answer": "hi"})]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+    monkeypatch.setenv("AGENT_MODE", "runpod")
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    captured = capsys.readouterr()
+    assert "[project] active=project1 (new)" in captured.out
+    assert (private / "project1").is_dir()
+    replies = _outbox_replies(ctx["outbox"])
+    assert len(replies) == 1
+    assert replies[0]["text"] == "hi"
 
 
 def test_claim_continuation_creates_shared_calculator(tmp_path, monkeypatch):

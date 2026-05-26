@@ -283,6 +283,113 @@ def test_create_file_refuses_parent_path_that_is_file(tmp_path, monkeypatch):
     assert parent.read_text(encoding="utf-8") == "not a directory"
 
 
+def test_rename_file_renames_workspace_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    source = tmp_path / "snippet1-2.py"
+    target = tmp_path / "snippet1_2.py"
+    source.write_text("x = 1\n", encoding="utf-8")
+
+    output = tools.rename_file("/workspace/snippet1-2.py", "/workspace/snippet1_2.py")
+
+    assert output == "Renamed file from /workspace/snippet1-2.py to /workspace/snippet1_2.py."
+    assert not source.exists()
+    assert target.read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_rename_file_blocks_missing_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+
+    output = tools.rename_file("/workspace/missing.py", "/workspace/new.py")
+
+    assert output.startswith("Edit blocked:")
+    assert "source file does not exist" in output
+    assert not (tmp_path / "new.py").exists()
+
+
+def test_rename_file_refuses_existing_target_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    source = tmp_path / "old.py"
+    target = tmp_path / "new.py"
+    source.write_text("old\n", encoding="utf-8")
+    target.write_text("target\n", encoding="utf-8")
+
+    output = tools.rename_file("old.py", "new.py")
+
+    assert "target file already exists" in output
+    assert source.read_text(encoding="utf-8") == "old\n"
+    assert target.read_text(encoding="utf-8") == "target\n"
+
+
+def test_rename_file_overwrites_when_requested(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    source = tmp_path / "old.py"
+    target = tmp_path / "new.py"
+    source.write_text("old\n", encoding="utf-8")
+    target.write_text("target\n", encoding="utf-8")
+
+    output = tools.rename_file("old.py", "new.py", overwrite=True)
+
+    assert output == "Renamed file from /workspace/old.py to /workspace/new.py."
+    assert not source.exists()
+    assert target.read_text(encoding="utf-8") == "old\n"
+
+
+def test_rename_file_refuses_directories(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    (tmp_path / "source_dir").mkdir()
+
+    output = tools.rename_file("source_dir", "target")
+
+    assert output.startswith("Edit blocked:")
+    assert "source path is not a file" in output
+    assert (tmp_path / "source_dir").is_dir()
+
+
+def test_rename_file_blocks_outside_workspace(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("secret\n", encoding="utf-8")
+    monkeypatch.setenv("AGENT_WORKSPACE", str(workspace))
+
+    output = tools.rename_file(str(outside), "/workspace/outside.py")
+
+    assert output.startswith("Edit blocked:")
+    assert outside.exists()
+    assert not (workspace / "outside.py").exists()
+
+
+def test_rename_file_blocks_cross_workspace_move(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+    source = private / "calc.py"
+    source.write_text("x = 1\n", encoding="utf-8")
+
+    output = tools.rename_file("/workspace/calc.py", "/workspace/shared/calc.py")
+
+    assert output.startswith("Edit blocked:")
+    assert "same workspace root" in output
+    assert source.exists()
+    assert not (shared / "calc.py").exists()
+
+
+def test_rename_file_via_tool_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
+    (tmp_path / "old.py").write_text("x = 1\n", encoding="utf-8")
+
+    output = tools.run_tool(
+        "rename_file",
+        {"source_path": "/workspace/old.py", "target_path": "/workspace/new.py"},
+    )
+
+    assert "Renamed file" in output
+    assert (tmp_path / "new.py").read_text(encoding="utf-8") == "x = 1\n"
+
+
 def test_append_text_appends_to_existing_workspace_file(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_WORKSPACE", str(tmp_path))
     target = tmp_path / "demo.txt"
