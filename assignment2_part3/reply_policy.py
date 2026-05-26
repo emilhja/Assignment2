@@ -54,7 +54,12 @@ BROADCAST_WINDOW_SECONDS = _env_int("REPLY_BROADCAST_WINDOW_SECONDS", 300)
 
 BROADCAST_PATTERN = re.compile(
     r"(?i)\b("
-    r"everyone|anyone|all\s+agents?|any\s+volunteers?|whoever"
+    # Explicit typo set for "agents" so a fat-fingered roll-call still
+    # triggers the broadcast branch. Kept narrow on purpose — wider
+    # patterns like `all\s+\w+ents?` falsely match "all events".
+    r"everyone|anyone"
+    r"|all\s+(?:agents?|egents?|agnets?|agnts?|aents?|agets?|agetns?)"
+    r"|any\s+volunteers?|whoever"
     r"|alla|någon|vem\s+som\s+helst|alla\s+agenter|volontär(?:er)?"
     r")\b"
 )

@@ -42,6 +42,7 @@ from console_control import ConsoleControl
 from peer import PeerMessage
 from peer_task import run_peer_task
 from reply_policy import CollisionInfo, should_reply
+from task_status import TaskStatus, parse_task_status
 from transport import Transport, build_transport
 
 
@@ -83,6 +84,7 @@ CONFIRMATION_REQUEST_PATTERN = re.compile(
     r"want me to|can i proceed|should we proceed"
     r")\b"
 )
+TEST_REQUEST_PATTERN = re.compile(r"(?i)\b(?:pytest|tests?|tester)\b")
 
 
 @dataclass
@@ -111,8 +113,27 @@ def _remote_workspace_guidance(agent_id: str, project_name: str) -> str:
         "saved /workspace/<agent>/<project>/<filename> path it reports, not a "
         "filename you expected. Do NOT emit CLAIM, RELEASE, or DEFER protocol "
         "lines on this hub; the system prompt's P3.9 protocol applies only to "
-        "the local docker-compose demo. The operator can switch active project "
-        "at any time with :project new or :project use N."
+        "the local docker-compose demo. Use visible task-status phrases instead: "
+        "for a direct assignment, first reply `Bekräftat, jag tar: <short task>` "
+        "or `Confirmed, I'll take: <short task>`; for a self-selected task, use "
+        "`Jag tar mig an: <short task>` or `I'm taking on: <short task>`. When "
+        "the work is actually complete, use `Klar med: <task>. Filer: ... "
+        "Tester: ...` or `Done with: <task>. Files: ... Tests: ...`. The "
+        "operator can switch active project "
+        "at any time with :project new or :project use N. "
+        "Truthful-completion rule: never say 'Done', 'Implemented', 'Created', "
+        "'Wrote', or 'Saved' unless a successful create_file/append_text/"
+        "edit_section/replace_text/rename_file tool observation for the target "
+        "file was returned in this round. Saying you 'will' or 'need to' do the "
+        "work is not enough — the runtime will reprompt you until you make the "
+        "real tool call. "
+        "Show-your-work rule: after a successful write, your final answer MUST "
+        "(1) name the exact path you wrote (full /workspace/<agent>/<project>/"
+        "<filename>) and (2) paste the file contents in a fenced code block "
+        "whose first line inside the fence is `# file: <filename>`. This is how "
+        "peers see and reuse what you produced on a no-shared-filesystem hub. "
+        "When you have run pytest, also include the pytest result line so "
+        "everyone knows what was verified."
     )
 
 
@@ -217,6 +238,30 @@ def _claim_continuation_message(original: PeerMessage, claim: Claim) -> PeerMess
         id=f"{original.id}:claim-continuation:{claim.target}",
         sender_id="runtime",
         text=text,
+    )
+
+
+def _task_status_continuation_message(original: PeerMessage, status: TaskStatus) -> PeerMessage:
+    verification = ""
+    if TEST_REQUEST_PATTERN.search(original.text or ""):
+        verification = (
+            " The original request asked for tests or pytest, so call run_tests "
+            "before reporting done, unless a concrete blocker prevents it."
+        )
+    text = (
+        "Continue the accepted task now. "
+        f"Accepted task: {status.task}. "
+        f"Original request: {original.text}\n"
+        "Use tools now; do not only describe the work. Do not answer with a "
+        "future-tense plan. Only report `Klar med:` or `Done with:` after "
+        "successful tool observations for the actual work."
+        f"{verification}"
+    )
+    return PeerMessage(
+        id=f"{original.id}:task-status-continuation:{status.kind}",
+        sender_id="runtime",
+        text=text,
+        addressed_to=(original.sender_id,),
     )
 
 
@@ -455,6 +500,7 @@ def run_group_chat(
         message: PeerMessage,
         prior_context: list[dict[str, str]] | None = None,
         collision: CollisionInfo | None = None,
+        code_guidance: str | None = None,
     ) -> str | None:
         runtime_guidance = []
         if not _is_claim_continuation_message(message):
@@ -519,9 +565,6 @@ def run_group_chat(
         if guidance:
             runtime_guidance.append(guidance)
         if runpod and project_state.active is not None:
-            code_guidance = process_shared_code(
-                message.text, agent_id, project_state.active
-            )
             if code_guidance:
                 runtime_guidance.append(code_guidance)
             runtime_guidance.append(
@@ -595,6 +638,22 @@ def run_group_chat(
             )
             return
 
+        # Save peer-shared code blocks to the active project even when the
+        # reply gate will skip this message. Otherwise broadcasts of code
+        # (e.g. peers posting `hangman.py` without addressing this agent)
+        # never land on disk and we can't read_file them later.
+        code_guidance: str | None = None
+        if runpod and project_state.active is not None:
+            code_guidance = process_shared_code(
+                message.text, agent_id, project_state.active
+            )
+            if code_guidance:
+                _log(
+                    store,
+                    "code_saved_on_arrival",
+                    f"msg_id={message.id} sender={message.sender_id}",
+                )
+
         now = time.time()
         followup_kind = _followup_reply_kind(message.text)
         if (
@@ -610,7 +669,9 @@ def run_group_chat(
                 f"respond=True reason={reason} msg_id={message.id} sender={message.sender_id}",
             )
             pending_followup = None
-            answer = _run_task_for_message(message, prior_context)
+            answer = _run_task_for_message(
+                message, prior_context, code_guidance=code_guidance
+            )
             if answer is None:
                 _absorb_inbound_claims(message)
                 return
@@ -646,7 +707,9 @@ def run_group_chat(
         if decision.delay_seconds > 0:
             time.sleep(decision.delay_seconds)
 
-        answer = _run_task_for_message(message, prior_context, decision.collision)
+        answer = _run_task_for_message(
+            message, prior_context, decision.collision, code_guidance=code_guidance
+        )
         if answer is None:
             _absorb_inbound_claims(message)
             return
@@ -654,7 +717,33 @@ def run_group_chat(
         _send_answer(answer, message.id)
 
         if allow_claim_continuation:
+            _continue_task_status(message, answer)
             _continue_claims(message, answer)
+
+    def _continue_task_status(original: PeerMessage, answer: str, depth: int = 0) -> None:
+        if depth >= 3:
+            _log(store, "task_status_continuation_skipped", "maximum nested task continuation depth reached")
+            return
+        status = parse_task_status(answer)
+        if status is None or status.kind not in {"taking", "accepted"}:
+            return
+
+        continuation = _task_status_continuation_message(original, status)
+        _log(
+            store,
+            "task_status_continuation",
+            f"kind={status.kind} language={status.language} task={status.task} from_msg={original.id}",
+        )
+        prior_context = list(recent_context)
+        recent_context.append(_context_entry(continuation.sender_id, continuation.text, continuation.id))
+        if len(recent_context) > MAX_RECENT_CONTEXT_ENTRIES:
+            del recent_context[:-MAX_RECENT_CONTEXT_ENTRIES]
+        continuation_answer = _run_task_for_message(continuation, prior_context)
+        if continuation_answer is None:
+            return
+        _send_answer(continuation_answer, continuation.id)
+        _continue_task_status(continuation, continuation_answer, depth + 1)
+        _continue_claims(continuation, continuation_answer, depth + 1)
 
     def _continue_claims(original: PeerMessage, answer: str, depth: int = 0) -> None:
         if depth >= 3:

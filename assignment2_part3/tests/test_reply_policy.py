@@ -214,6 +214,34 @@ def test_broadcast_keyword_whoever():
     assert "broadcast" in d.reason
 
 
+def test_broadcast_keyword_all_agents_typos():
+    # A fat-fingered roll-call ("all egents, are you here?") should still
+    # register as a broadcast — the explicit typo set in BROADCAST_PATTERN
+    # covers the common misspellings of "agents".
+    for text in (
+        "all egents, are you here?",
+        "all agnets, status?",
+        "all agnts please reply",
+        "all aents present?",
+        "all agets ping",
+    ):
+        d = should_reply(
+            _msg(text), "alice", "alice-swe", [], now=1000.0, rng=_rng()
+        )
+        assert d.respond is True, text
+        assert "broadcast" in d.reason, text
+
+
+def test_broadcast_typo_set_does_not_match_unrelated_nouns():
+    # The typo set must stay tight — "all events" / "all gents" / "all
+    # students" are not roll-calls and must not flip the broadcast branch.
+    for text in ("all events from yesterday", "all gents welcome", "all students passed"):
+        d = should_reply(
+            _msg(text), "alice", "alice-swe", [], now=1000.0, rng=_rng()
+        )
+        assert d.respond is False, text
+
+
 def test_bare_all_does_not_trigger_broadcast():
     # "All" alone (no "agents") must NOT be treated as a broadcast — the
     # regex requires \b(everyone|anyone|all\s+agents?|...). This pins the

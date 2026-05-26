@@ -34,6 +34,7 @@ from claims import CLAIM_PATTERN, DEFER_PATTERN, RELEASE_PATTERN, ClaimRegistry,
 from console_control import ConsoleControl
 from peer import PeerMessage, peer_intent_refusal, scrub_outbound
 from reply_policy import CollisionInfo
+from task_status import parse_task_status
 
 
 MAX_STEPS = 8
@@ -379,9 +380,19 @@ _ACTION_REQUEST_RE = re.compile(
     r"|repair(?:ed|s|ing)?"
     r"|update(?:d|s|ing)?"
     r"|execute"
+    r"|use\s+tools?"
+    r"|call\s+run_tests"
     r"|run\s+pytest"
     r"|go\s+ahead"
     r"|please\s+(?:run|verify|test|execute|ensure|implement|fix|repair|update)"
+    r"|gör"
+    r"|skapa"
+    r"|skriv"
+    r"|implementera"
+    r"|kör"
+    r"|testa"
+    r"|verifiera"
+    r"|fixa"
     r")\b"
 )
 
@@ -450,6 +461,24 @@ def _looks_like_done_without_tests(answer: str) -> bool:
     return any(marker in lowered for marker in _TESTS_NOT_RUN_MARKERS)
 
 
+def _states_test_blocker(answer: str) -> bool:
+    lowered = (answer or "").lower()
+    blocker_markers = (
+        "blocker",
+        "blocked",
+        "cannot run",
+        "can't run",
+        "unable to run",
+        "kunde inte",
+        "kan inte",
+        "blockerad",
+    )
+    test_markers = ("pytest", "test", "tests", "tester")
+    return any(marker in lowered for marker in blocker_markers) and any(
+        marker in lowered for marker in test_markers
+    )
+
+
 def _claim_targets_from_text(text: str) -> set[str]:
     targets: set[str] = set()
     for match in CLAIM_PATTERN.finditer(text or ""):
@@ -483,6 +512,10 @@ def _looks_like_pending_shared_write(answer: str) -> bool:
         "i need to",
         "i am going to",
         "i'm going to",
+        "jag ska",
+        "jag kommer att",
+        "jag behöver",
+        "jag tänker",
         "going to",
         "will create",
         "will implement",
@@ -499,7 +532,133 @@ def _looks_like_pending_shared_write(answer: str) -> bool:
         "have to read",
         "should read",
     )
-    return any(marker in lowered for marker in pending_markers)
+    return bool(_PENDING_ACTION_PROMISE_RE.search(answer)) or any(
+        marker in lowered for marker in pending_markers
+    )
+
+
+_PENDING_WRITE_MARKERS_ANY_PATH = (
+    "i will create",
+    "i'll create",
+    "i will implement",
+    "i'll implement",
+    "i will write",
+    "i'll write",
+    "i will add",
+    "i'll add",
+    "i will start",
+    "i'll start",
+    "i need to create",
+    "i need to implement",
+    "i need to write",
+    "i need to re-read",
+    "i need to reread",
+    "i need to read",
+    "i am going to",
+    "i'm going to",
+    "jag ska",
+    "jag kommer att",
+    "jag behöver",
+    "jag tänker",
+    "going to create",
+    "going to implement",
+    "going to write",
+    "let me create",
+    "let me implement",
+    "let me write",
+    "let me re-read",
+    "let me read",
+    "start the implementation",
+    "start this implementation",
+    "begin the implementation",
+)
+
+
+_PENDING_ACTION_PROMISE_RE = re.compile(
+    r"(?i)\b(?:"
+    r"i\s+will"
+    r"|i'll"
+    r"|i\s+am\s+going\s+to"
+    r"|i'm\s+going\s+to"
+    r"|i\s+need\s+to"
+    r"|jag\s+ska"
+    r"|jag\s+kommer\s+att"
+    r"|jag\s+behöver"
+    r"|jag\s+tänker"
+    r")\b"
+)
+
+
+def _looks_like_pending_write_any_path(answer: str) -> bool:
+    """Path-agnostic counterpart of `_looks_like_pending_shared_write`.
+
+    Used so remote-hub mode (writes go to /workspace/<agent_id>/projectN/)
+    gets the same stall coverage as the shared-workspace flow. Tighter
+    marker list than the shared-path version on purpose: this fires even
+    when the answer mentions no /workspace/ path at all, so false
+    positives are costlier here.
+    """
+
+    if not answer:
+        return False
+    if RELEASE_PATTERN.search(answer) or DEFER_PATTERN.search(answer):
+        return False
+    if CLAIM_PATTERN.search(answer):
+        return False
+    lowered = answer.lower()
+    return bool(_PENDING_ACTION_PROMISE_RE.search(answer)) or any(
+        marker in lowered for marker in _PENDING_WRITE_MARKERS_ANY_PATH
+    )
+
+
+_COMPLETION_CLAIM_MARKERS = (
+    "done:",
+    "done with:",
+    "klar med:",
+    "i have implemented",
+    "i have created",
+    "i have written",
+    "i have added",
+    "i have saved",
+    "i've implemented",
+    "i've created",
+    "i've written",
+    "i've added",
+    "i've saved",
+    "successfully implemented",
+    "successfully created",
+    "successfully wrote",
+    "implementation is complete",
+    "the implementation is complete",
+    "has been implemented",
+    "has been created",
+    "has been written",
+    "the file was created",
+    "the script was created",
+    "the file has been created",
+    "the script has been created",
+)
+
+
+def _looks_like_completion_claim_any_path(answer: str) -> bool:
+    """Detect first-person claims that work has been completed.
+
+    Dangerous when no successful write tool observation happened this
+    round — the model is fabricating context. Reused both for the
+    user-action reprompt branch (force a real tool call) and for the
+    final-answer correction layer (rewrite the lie if the model still
+    won't comply).
+    """
+
+    if not answer:
+        return False
+    if RELEASE_PATTERN.search(answer) or DEFER_PATTERN.search(answer):
+        return False
+    status = parse_task_status(answer)
+    if status is not None and status.kind == "done":
+        return True
+    lowered = answer.lower()
+    return any(marker in lowered for marker in _COMPLETION_CLAIM_MARKERS)
 
 
 def _looks_like_pending_test_work(answer: str) -> bool:
@@ -512,12 +671,19 @@ def _looks_like_pending_test_work(answer: str) -> bool:
         "i need to",
         "i am going to",
         "i'm going to",
+        "jag ska",
+        "jag kommer att",
+        "jag behöver",
+        "jag tänker",
         "going to",
         "next steps",
         "now i will",
     )
     test_markers = ("pytest", "test", "tests")
-    return any(marker in lowered for marker in pending_markers) and any(
+    return (
+        bool(_PENDING_ACTION_PROMISE_RE.search(answer))
+        or any(marker in lowered for marker in pending_markers)
+    ) and any(
         marker in lowered for marker in test_markers
     )
 
@@ -652,6 +818,8 @@ def run_peer_task(
     saw_failed_shared_write = False
     saw_successful_shared_write = False
     saw_successful_test_run = False
+    saw_any_successful_write = False  # any /workspace path, not just shared
+    saw_any_tool_observation = False
     continuation_reprompt_counts: dict[str, int] = {}
 
     def _continuation_reprompt_or_stop(
@@ -895,6 +1063,30 @@ def run_peer_task(
                     return stopped
                 continue
             if (
+                not _is_claim_continuation(message)
+                and _pytest_was_requested(message.text)
+                and saw_any_successful_write
+                and not saw_successful_test_run
+                and _looks_like_completion_claim_any_path(answer)
+                and not _states_test_blocker(answer)
+            ):
+                guidance = (
+                    "The request asked for tests or pytest, and you already have a successful "
+                    "write observation in this round, but no run_tests observation yet. Do not "
+                    "report `Klar med:` or `Done with:` until you call run_tests, unless you "
+                    "state a concrete blocker that prevents running tests. Call run_tests now "
+                    "for the file or test directory you created/updated, then report the result "
+                    "honestly."
+                )
+                stopped = _continuation_reprompt_or_stop(
+                    "user_action_pytest_required_reprompt",
+                    guidance,
+                    "I had to stop because I reported done without running the requested pytest verification.",
+                )
+                if stopped is not None:
+                    return stopped
+                continue
+            if (
                 _is_claim_continuation(message)
                 and not saw_successful_shared_write
                 and _looks_like_pending_shared_write(answer)
@@ -957,6 +1149,45 @@ def run_peer_task(
                     return stopped
                 continue
             if (
+                not _is_claim_continuation(message)
+                and _action_was_requested(message.text)
+                and not saw_any_successful_write
+                and not saw_successful_test_run
+                and (
+                    _looks_like_completion_claim_any_path(answer)
+                    or _looks_like_pending_write_any_path(answer)
+                )
+            ):
+                # Remote-hub-mode (and any path-agnostic) variant of the
+                # stall guard above. Fires when the user asked for action
+                # but the round ended with prose that either fabricates
+                # completion ("Done: Implemented...") or postpones it
+                # ("I will create..."), without any successful write tool
+                # observation backing it up.
+                guidance = (
+                    "The user asked you to take action and your reply has no successful write "
+                    "tool observation in this round. Never claim Done/Implemented/Created unless "
+                    "a create_file/append_text/edit_section/replace_text/rename_file observation "
+                    "for the target path was returned in this round. Make the actual tool call "
+                    'now: {"type":"tool_call","tool":"create_file","args":{"path":"/workspace/'
+                    "<your_agent_id>/<projectN>/<filename>\",\"content\":\"...\"}} for a new "
+                    "file (use your active project dir; do NOT write to /workspace/shared on the "
+                    "remote hub), or append_text / edit_section / replace_text for an existing "
+                    "file. After a successful write, your final answer MUST name the exact path "
+                    "you wrote AND paste the file contents in a fenced code block (with `# file: "
+                    "<filename>` as the first line inside the fence) so peers can see what was "
+                    "actually done."
+                )
+                stopped = _continuation_reprompt_or_stop(
+                    "user_action_no_write_reprompt",
+                    guidance,
+                    "I had to stop because I described work as Done or upcoming without actually "
+                    "calling a write tool. No file was created.",
+                )
+                if stopped is not None:
+                    return stopped
+                continue
+            if (
                 _is_claim_continuation(message)
                 and RELEASE_PATTERN.search(answer)
                 and not saw_successful_shared_write
@@ -986,6 +1217,22 @@ def run_peer_task(
                     "I could not complete the shared-file write. The latest tool observation "
                     "reported a block/refusal, so no successful update to /workspace/shared "
                     "should be assumed."
+                )
+                _log("assistant", "peer_reply_corrected", scrubbed)
+            elif (
+                not saw_any_successful_write
+                and not saw_successful_test_run
+                and _looks_like_completion_claim_any_path(scrubbed)
+            ):
+                # Final safety net: the reprompt loop above gave up (or
+                # this is a non-action-requested context that still tried
+                # to fabricate completion). Replace the lie with the truth
+                # rather than ship it to the hub.
+                scrubbed = (
+                    "I have not actually created or edited any file in this round — no "
+                    "create_file/append_text/edit_section/replace_text observation was "
+                    "returned. Please rephrase the request or let me know if you want me "
+                    "to retry, and I will call the write tool this time."
                 )
                 _log("assistant", "peer_reply_corrected", scrubbed)
             scrubbed = _ensure_peer_mentions(scrubbed, peer_names)
@@ -1027,6 +1274,7 @@ def run_peer_task(
             observation = _run_tool_with_approval(parsed.tool, parsed.args, console)
             observation = _truncate(observation)
             _emit("tool=", _observation_summary(observation))
+            saw_any_tool_observation = True
             if (
                 parsed.tool in CLAIM_GATED_TOOLS
                 and isinstance(parsed.args.get("path"), str)
@@ -1042,9 +1290,20 @@ def run_peer_task(
                     # and the model's truthful answer gets overwritten below.
                     saw_failed_shared_write = False
                     saw_successful_shared_write = True
+                    saw_any_successful_write = True
                     if claims is not None and self_id:
                         claims.mark_satisfied(self_id, parsed.args["path"])
-            elif parsed.tool == "rename_file":
+            elif (
+                parsed.tool in CLAIM_GATED_TOOLS
+                and isinstance(parsed.args.get("path"), str)
+                and not _looks_like_failed_write(observation)
+            ):
+                # Private/project writes (remote-hub mode). Tracked separately
+                # from saw_successful_shared_write so claim-gate logic stays
+                # shared-only, but the user-facing "did you actually do it?"
+                # gate sees them.
+                saw_any_successful_write = True
+            if parsed.tool == "rename_file":
                 source_path = parsed.args.get("source_path")
                 target_path = parsed.args.get("target_path")
                 shared_path = None
@@ -1058,8 +1317,11 @@ def run_peer_task(
                     else:
                         saw_failed_shared_write = False
                         saw_successful_shared_write = True
+                        saw_any_successful_write = True
                         if claims is not None and self_id:
                             claims.mark_satisfied(self_id, shared_path)
+                elif not _looks_like_failed_write(observation):
+                    saw_any_successful_write = True
             if parsed.tool == "run_tests":
                 # Any reachable run_tests attempt counts as verification: a red
                 # pytest is still proof the agent tried, and the next final

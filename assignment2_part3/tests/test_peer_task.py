@@ -2489,3 +2489,255 @@ def test_user_no_action_request_prose_passes_through(tmp_path, monkeypatch):
     assert len(calls) == 1
     kinds = [kind for _role, kind, _content in _events(store)]
     assert "user_action_prose_stall_reprompt" not in kinds
+
+
+def test_remote_hub_hallucinated_completion_reprompts(tmp_path, monkeypatch):
+    """Remote-hub-mode regression: the bot says 'Done: Implemented...' with a
+    private /workspace/<agent>/projectN/ path and never calls a write tool. The
+    shared-prefix stall guard didn't fire in remote mode, so completion claims
+    sailed through to the hub. This must now reprompt and eventually give up
+    with a truthful explanation."""
+
+    private = tmp_path / "emil_hjaertfors_bot"
+    private.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_remote_done",
+        sender_id="emil-user",
+        text="@emil_hjaertfors_bot make a simple calculator in python and run pytest",
+    )
+    hallucination = json.dumps({
+        "type": "final",
+        "answer": (
+            "Done: Implemented a simple calculator in Python at "
+            "/workspace/emil_hjaertfors_bot/project3/calculator.py."
+        ),
+    })
+    calls: list[int] = []
+
+    def chat_fn(messages):
+        calls.append(len(messages))
+        return hallucination
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="emil_hjaertfors_bot",
+    )
+
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert kinds.count("user_action_no_write_reprompt") == 2
+    assert "claim_continuation_giveup" in kinds
+    # The eventual answer must NOT claim Done — either the giveup fallback
+    # speaks, or the truth-correction layer rewrites it.
+    assert "Done:" not in answer
+    assert "Implemented" not in answer
+
+
+def test_remote_hub_future_intent_without_tool_reprompts(tmp_path, monkeypatch):
+    """The other half of the remote-hub regression: 'I will create...' prose
+    finals with no /workspace/shared/ path also need to be reprompted."""
+
+    private = tmp_path / "remote_bot"
+    private.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_remote_future",
+        sender_id="emil-user",
+        text="@remote_bot please implement a simple calculator in python",
+    )
+    stall = json.dumps({
+        "type": "final",
+        "answer": (
+            "I will create a simple calculator in Python that supports addition, "
+            "subtraction, multiplication and division."
+        ),
+    })
+
+    def chat_fn(messages):
+        return stall
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="remote_bot",
+    )
+
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert kinds.count("user_action_no_write_reprompt") == 2
+    assert "claim_continuation_giveup" in kinds
+    assert "I will create" not in answer
+
+
+def test_swedish_action_request_future_intent_without_tool_reprompts(tmp_path, monkeypatch):
+    private = tmp_path / "sv_bot"
+    private.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_sv_future",
+        sender_id="emil-user",
+        text="@sv_bot skapa en terminal-kalkylator och kör pytest",
+    )
+    stall = json.dumps({
+        "type": "final",
+        "answer": "Jag ska skapa en terminal-kalkylator och sedan köra pytest.",
+    })
+
+    def chat_fn(messages):
+        return stall
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="sv_bot",
+    )
+
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert kinds.count("user_action_no_write_reprompt") == 2
+    assert "claim_continuation_giveup" in kinds
+    assert "Jag ska skapa" not in answer
+
+
+def test_swedish_done_without_tool_observation_reprompts(tmp_path, monkeypatch):
+    private = tmp_path / "sv_done_bot"
+    private.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_sv_done",
+        sender_id="runtime",
+        text=(
+            "Continue the accepted task now. Accepted task: kalkylator. "
+            "Use tools now; do not only describe the work."
+        ),
+    )
+    done = json.dumps({"type": "final", "answer": "Klar med: kalkylator"})
+
+    def chat_fn(messages):
+        return done
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="sv_done_bot",
+    )
+
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert kinds.count("user_action_no_write_reprompt") == 2
+    assert "claim_continuation_giveup" in kinds
+    assert "Klar med:" not in answer
+
+
+def test_remote_hub_completion_truth_correction(tmp_path, monkeypatch):
+    """Safety-net layer: even outside an action-request context, an outright
+    completion lie with no successful write observation is rewritten before
+    leaving the runtime, so peers never see a fake Done."""
+
+    private = tmp_path / "bot2"
+    private.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_status",
+        sender_id="emil-user",
+        text="@bot2 status?",
+    )
+    lie = json.dumps({
+        "type": "final",
+        "answer": "I have created /workspace/bot2/project1/calculator.py with full coverage.",
+    })
+
+    def chat_fn(messages):
+        return lie
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="bot2",
+    )
+
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert "peer_reply_corrected" in kinds
+    assert "I have not actually created or edited any file" in answer
+
+
+def test_remote_hub_real_write_passes_through(tmp_path, monkeypatch):
+    """When the agent actually calls create_file with a private path and
+    succeeds, the final answer must NOT be reprompted or rewritten — even if
+    it includes 'Done:' phrasing, the truthful claim is allowed."""
+
+    private = tmp_path / "alice"
+    private.mkdir()
+    (private / "project1").mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_real",
+        sender_id="emil-user",
+        text="@alice please implement a simple add function",
+    )
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {
+                "path": "/workspace/alice/project1/calculator.py",
+                "content": "def add(a, b):\n    return a + b\n",
+            },
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": (
+                "Done: Created /workspace/alice/project1/calculator.py. "
+                "```python\n# file: calculator.py\ndef add(a, b):\n    return a + b\n```"
+            ),
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="alice",
+    )
+
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert "user_action_no_write_reprompt" not in kinds
+    assert "peer_reply_corrected" not in kinds
+    assert "Done:" in answer
+    assert "calculator.py" in answer

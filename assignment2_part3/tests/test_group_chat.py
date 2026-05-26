@@ -662,6 +662,65 @@ def test_claim_continuation_creates_shared_calculator(tmp_path, monkeypatch):
     assert any(kind == "claim_continuation" for _role, kind, _content in events)
 
 
+def test_task_status_acceptance_triggers_internal_continuation(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    project = workspace / "alice" / "project1"
+    project.mkdir(parents=True)
+    monkeypatch.setenv("AGENT_WORKSPACE", str(workspace))
+
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "@alice skapa en terminal-kalkylator",
+        })
+        + "\n",
+    ]
+    content = "def add(a, b):\n    return a + b\n"
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "Bekräftat, jag tar: terminal-kalkylator",
+        }),
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {
+                "path": "/workspace/alice/project1/calculator.py",
+                "content": content,
+            },
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": (
+                "Klar med: terminal-kalkylator. "
+                "Filer: /workspace/alice/project1/calculator.py. Tester: inte körda."
+            ),
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert [payload["text"] for payload in replies] == [
+        "Bekräftat, jag tar: terminal-kalkylator",
+        (
+            "Klar med: terminal-kalkylator. "
+            "Filer: /workspace/alice/project1/calculator.py. Tester: inte körda."
+        ),
+    ]
+    assert (project / "calculator.py").read_text(encoding="utf-8") == content
+    assert ctx["fake_chat"].calls == 3
+
+    events = _events(ctx["store"])
+    assert any(kind == "task_status_continuation" for _role, kind, _content in events)
+
+
 def test_claim_from_continuation_gets_its_own_continuation(tmp_path, monkeypatch):
     private = tmp_path / "alice"
     shared = tmp_path / "shared"
