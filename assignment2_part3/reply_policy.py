@@ -100,13 +100,19 @@ def _strip_protocol_lines(text: str) -> str:
 
 
 def _mentions(text: str, names: tuple[str, ...]) -> bool:
+    if not names:
+        return False
     lowered = text.lower()
-    agent_id, display_name = names
-    for name in (agent_id, display_name):
+    agent_id = names[0]
+    # display_name + any aliases — all are human-friendly handles that
+    # show up bare or @-prefixed in chat.
+    human_names = names[1:]
+    for name in names:
         if name and f"@{name.lower()}" in lowered:
             return True
-    if display_name and re.search(rf"(?i)\b{re.escape(display_name)}\b", text):
-        return True
+    for name in human_names:
+        if name and re.search(rf"(?i)\b{re.escape(name)}\b", text):
+            return True
     if agent_id and re.search(rf"(?i)^\s*{re.escape(agent_id)}\b\s*[:,\-]", text):
         return True
     return False
@@ -175,11 +181,15 @@ def should_reply(
     now: float | None = None,
     rng: random.Random | None = None,
     claims: Optional[ClaimRegistry] = None,
+    aliases: tuple[str, ...] = (),
 ) -> ReplyDecision:
     """Decide whether to reply to a peer message.
 
     `message` must expose `.sender_id` and `.text`. `recent_replies` is a
     list of `(timestamp, message_id)` for this agent's outbound replies.
+    `aliases` is an optional tuple of extra handles this agent should also
+    respond to (e.g. a human's real name) — matched the same way as
+    `display_name`.
     """
 
     if now is None:
@@ -190,7 +200,7 @@ def should_reply(
     if message.sender_id == agent_id:
         return ReplyDecision(False, "skipped: message is from this agent")
 
-    names = (agent_id, display_name)
+    names = (agent_id, display_name, *aliases)
 
     # Coordinator handoff is a stronger signal than a passing mention,
     # so check it first — an "assigned: alice" line should be tagged

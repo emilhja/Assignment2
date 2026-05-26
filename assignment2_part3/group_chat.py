@@ -240,6 +240,11 @@ def run_group_chat(
     DATA_DIR.mkdir(exist_ok=True)
     agent_id = os.environ.get("AGENT_ID", "local")
     display_name = os.environ.get("AGENT_DISPLAY_NAME", f"{agent_id}-swe")
+    aliases = tuple(
+        a.strip()
+        for a in os.environ.get("AGENT_ALIASES", "").split(",")
+        if a.strip()
+    )
     mode = os.environ.get("AGENT_MODE", "stub").lower()
 
     owns_store = store is None
@@ -283,10 +288,15 @@ def run_group_chat(
         _env_float("PENDING_FOLLOWUP_SECONDS", DEFAULT_PENDING_FOLLOWUP_SECONDS),
     )
     pending_followup: PendingFollowup | None = None
-    _log(store, "session_start", f"agent_id={agent_id} display={display_name} mode={mode}")
+    _log(
+        store,
+        "session_start",
+        f"agent_id={agent_id} display={display_name} aliases={','.join(aliases)} mode={mode}",
+    )
+    alias_note = f" aliases=[{', '.join(aliases)}]" if aliases else ""
     print(
         colors.dim(
-            f"[part3] {display_name} (id={agent_id}) listening via {mode}. "
+            f"[part3] {display_name} (id={agent_id}){alias_note} listening via {mode}. "
             f"Type :help for console commands."
         ),
         flush=True,
@@ -298,6 +308,12 @@ def run_group_chat(
         snippet = text[:160].replace("\n", " ")
         tag = colors.dim(f"[hub{arrow}]")
         print(f"{colors.ts()} {tag} {colors.agent_label(sender)}: {snippet}", flush=True)
+
+    def _peer_console_log(kind: str, detail: str) -> None:
+        """Live-attach trace of LLM/tool/refusal events. Runpod mode only."""
+        if not runpod:
+            return
+        print(f"{colors.ts()} {colors.dim(f'[{kind}]')} {detail}", flush=True)
 
     def _send_answer(answer: str, msg_id: str) -> None:
         nonlocal pending_followup
@@ -397,6 +413,7 @@ def run_group_chat(
                 absorb_claims=False,
                 collision=collision,
                 runtime_guidance=runtime_guidance,
+                console_log=_peer_console_log,
             )
         except RuntimeError as exc:
             # Most often: every LLM provider was rate-limited or unreachable.
@@ -469,7 +486,8 @@ def run_group_chat(
             pending_followup = None
 
         decision = should_reply(
-            message, agent_id, display_name, recent_replies, claims=claims
+            message, agent_id, display_name, recent_replies,
+            claims=claims, aliases=aliases,
         )
         _log(
             store,

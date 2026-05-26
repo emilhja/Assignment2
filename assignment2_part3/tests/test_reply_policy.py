@@ -57,6 +57,54 @@ def test_unaddressed_chatter_is_skipped():
     assert d.respond is False
 
 
+def test_alias_at_mention_triggers_reply():
+    d = should_reply(
+        _msg("@Emil can you check?"),
+        "emil_hjaertfors_bot",
+        "emil_hjaertfors_bot",
+        [],
+        now=1000.0,
+        aliases=("Emil Hjärtfors", "Emil"),
+    )
+    assert d.respond is True
+    assert "addressed" in d.reason
+
+
+def test_alias_word_boundary_triggers_reply():
+    d = should_reply(
+        _msg("Emil Hjärtfors, are you here?"),
+        "emil_hjaertfors_bot",
+        "emil_hjaertfors_bot",
+        [],
+        now=1000.0,
+        aliases=("Emil Hjärtfors", "Emil"),
+    )
+    assert d.respond is True
+
+
+def test_alias_substring_inside_word_does_not_trigger():
+    d = should_reply(
+        _msg("Emilio is on holiday"),
+        "emil_hjaertfors_bot",
+        "emil_hjaertfors_bot",
+        [],
+        now=1000.0,
+        aliases=("Emil",),
+    )
+    assert d.respond is False
+
+
+def test_aliases_default_to_empty_and_keep_old_behavior():
+    d = should_reply(
+        _msg("Emil Hjärtfors, are you here?"),
+        "emil_hjaertfors_bot",
+        "emil_hjaertfors_bot",
+        [],
+        now=1000.0,
+    )
+    assert d.respond is False
+
+
 def test_self_message_is_skipped():
     msg = PeerMessage(id="m1", sender_id="alice", text="@alice talking to self")
     d = should_reply(msg, "alice", "alice-swe", [], now=1000.0)

@@ -2119,3 +2119,210 @@ def test_pytest_required_reprompt_gives_up_after_cap(tmp_path, monkeypatch):
     kinds = [kind for _role, kind, _content in events]
     assert kinds.count("claim_continuation_pytest_required_reprompt") == 2
     assert "claim_continuation_giveup" in kinds
+
+
+def test_user_action_request_with_prose_stall_reprompts(tmp_path, monkeypatch):
+    """When the operator asks the agent to act (e.g. 'run the tests and verify')
+    and the agent replies prose-only with a workspace path and deferral marker,
+    the runtime must reprompt — even though this is not a claim continuation.
+
+    This reproduces alice-swe's 2026-05-25 calculator stall:
+    'I need to re-read /workspace/shared/test_calculator.py to verify...'
+    """
+
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_user_1",
+        sender_id="emil-user",
+        text="@alice-swe run the tests and verify implementation",
+    )
+    stall = json.dumps({
+        "type": "final",
+        "answer": (
+            "I need to re-read /workspace/shared/test_calculator.py "
+            "to verify the current implementation before running the tests."
+        ),
+    })
+    calls: list[int] = []
+
+    def chat_fn(messages):
+        calls.append(len(messages))
+        return stall
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="alice",
+    )
+
+    assert "describing what I would do" in answer
+    assert len(calls) >= 3
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert kinds.count("user_action_prose_stall_reprompt") == 2
+    assert "claim_continuation_giveup" in kinds
+
+
+def test_fix_request_with_ensure_implemented_reprompts_on_reread_stall(tmp_path, monkeypatch):
+    """Bob's calculator follow-up phrasing is an action request even though it
+    does not say "run" or "verify": "Please ensure these functions are
+    implemented" must force a tool call instead of letting a reread stall pass.
+    """
+
+    private = tmp_path / "bob"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_user_bob_reread",
+        sender_id="emil-user",
+        text=(
+            "@bob-swe, The tests in /workspace/shared/test_calculator.py failed "
+            "because the functions 'add' and 'subtract' are not defined. Please "
+            "ensure these functions are implemented in the calculator module"
+        ),
+    )
+    stall = json.dumps({
+        "type": "final",
+        "answer": "I need to re-read /workspace/shared/calculator.py",
+    })
+    calls: list[int] = []
+
+    def chat_fn(messages):
+        calls.append(len(messages))
+        return stall
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="bob",
+    )
+
+    assert "describing what I would do" in answer
+    assert len(calls) >= 3
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert kinds.count("user_action_prose_stall_reprompt") == 2
+    assert "claim_continuation_giveup" in kinds
+
+
+def test_user_action_request_followed_by_tool_call_no_reprompt(tmp_path, monkeypatch):
+    """When the agent honors the action request with a real tool call, the new
+    branch must not fire."""
+
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+    (shared / "test_calculator.py").write_text(
+        "def test_one():\n    assert 1 == 1\n", encoding="utf-8"
+    )
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_user_2",
+        sender_id="emil-user",
+        text="@alice-swe run the tests",
+    )
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "run_tests",
+            "args": {"path": "/workspace/shared/test_calculator.py"},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Tests: ran and passed.",
+        }),
+    ])
+    calls: list[int] = []
+
+    def chat_fn(messages):
+        calls.append(len(messages))
+        return next(responses)
+
+    import peer_task as _peer_task_mod
+    real_run_tool = _peer_task_mod.run_tool
+
+    def fake_run_tool(tool, args):
+        if tool == "run_tests":
+            return "1 passed in 0.01s"
+        return real_run_tool(tool, args)
+
+    monkeypatch.setattr("peer_task.run_tool", fake_run_tool)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="alice",
+    )
+
+    assert "ran and passed" in answer
+    assert len(calls) == 2
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert "user_action_prose_stall_reprompt" not in kinds
+
+
+def test_user_no_action_request_prose_passes_through(tmp_path, monkeypatch):
+    """Prose finals naming a shared path must not be reprompted when the inbound
+    is just chit-chat (no action verb), otherwise we'd over-fire."""
+
+    private = tmp_path / "alice"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_user_3",
+        sender_id="emil-user",
+        text="thanks alice",
+    )
+    calls: list[int] = []
+
+    def chat_fn(messages):
+        calls.append(len(messages))
+        return json.dumps({
+            "type": "final",
+            "answer": "I need to re-read /workspace/shared/test_calculator.py later.",
+        })
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="alice",
+    )
+
+    assert "re-read" in answer
+    assert len(calls) == 1
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert "user_action_prose_stall_reprompt" not in kinds

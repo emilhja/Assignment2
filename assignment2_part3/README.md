@@ -117,7 +117,7 @@ Useful kinds to grep for: `claim_observed`, `claim_self`,
 
 ## How to interact with them
 
-Three modes, increasing in realism:
+Four modes, increasing in realism:
 
 ### Mode 1 — Stub mode (single agent, one message at a time)
 
@@ -151,8 +151,8 @@ chat with each other and with you.
 ```bash
 # T1 — bring the stack up, then watch all logs (hub + both agents)
 cd assignment2_part3
-docker compose up -d
-docker compose logs -f
+docker compose --profile local up -d
+docker compose --profile local logs -f
 
 # T2 — alice console (approve bash commands, send :say)
 docker attach assignment2_part3-agent-alice-1
@@ -180,15 +180,19 @@ agent-alice-1  | [hub->] seq=3 alice-swe: Created utils.py with add(a,b)
 agent-bob-1    | [skip] not addressed; not a broadcast
 ```
 
-The agents default to `AGENT_MODE=runpod` and `RUNPOD_CHAT_URL=http://local-hub:8080`,
-so the only `.env` setup for local development is `LOCAL_HUB_PASSWORD` and
-`RUNPOD_CHAT_PASSWORD` (use the same value for both). Compose refuses to start
-without them, which keeps any shared secret out of the committed compose file.
-For local Docker runs, `docker-compose.yml` deliberately points the agents at
-the internal Docker service URL `http://local-hub:8080`; `LOCAL_HUB_PORT` only
-controls the host port used by `tools/chat.py`.
-To point at another hub from the Docker agents, set `LOCAL_AGENT_HUB_URL`.
-For host-side, non-Docker runs, set `RUNPOD_CHAT_URL` directly.
+Alice and bob are **hardcoded** to the local hub (`http://local-hub:8080`)
+with the password from `LOCAL_HUB_PASSWORD`. They will not pick up
+`RUNPOD_CHAT_URL` from `.env` even if it's set — the only `.env` variable
+required for Mode 2 is `LOCAL_HUB_PASSWORD` (any value; Compose refuses to
+start without it). `LOCAL_HUB_PORT` only controls the host port used by
+`tools/chat.py`. To put a single agent on a remote hub instead, use the
+`agent-remote` service under the `remote` profile (Mode 4 below). The
+`local-hub`, `agent-alice`, and `agent-bob` services all sit behind the
+`local` Compose profile, so plain `docker compose up` without
+`--profile local` will not start them. This is intentional — it stops the
+single-bot remote flow from accidentally pulling up the local hub, and
+prevents alice/bob from leaking onto the public hub when `RUNPOD_CHAT_URL`
+is set in `.env` for the remote bot.
 
 `tools/chat.py` is a small REST client for the hub. Subcommands:
 
@@ -225,6 +229,51 @@ sent until you flip the mode.
    loop continues — the transport never raises into the main loop.
 
 See `th25-hub-connection.md` for the hub REST API.
+
+### Mode 4 — Single agent to a remote hub (Docker)
+
+Like Mode 3, but the agent runs in Docker under its own identity and the
+local hub / alice / bob are not started. Useful when you just want **one**
+bot (e.g. `emil_hjaertfors_bot`) to join the live course hub.
+
+1. Edit `.env`:
+   ```
+   AGENT_ID=emil_hjaertfors_bot
+   AGENT_DISPLAY_NAME=emil_hjaertfors_bot
+   AGENT_MODE=runpod
+   RUNPOD_CHAT_URL=https://<your-runpod-hub>
+   RUNPOD_CHAT_PASSWORD=<actual hub password>
+   ```
+   `AGENT_ID` and `AGENT_DISPLAY_NAME` are required in this mode — Compose
+   refuses to start without them. The workspace and SQLite log are
+   namespaced from `AGENT_ID` (`workspace/<AGENT_ID>/`,
+   `data/<AGENT_ID>.sqlite3`).
+
+2. Bring up only the remote bot:
+   ```bash
+   docker compose --profile remote up -d agent-remote
+   docker compose --profile remote logs -f agent-remote
+   ```
+
+3. Operator console — same as Mode 2:
+   ```bash
+   docker attach assignment2_part3-agent-remote-1
+   # :budget :approve :pause :say <text>
+   # Detach with Ctrl-P, Ctrl-Q. Do NOT Ctrl-C.
+   ```
+
+4. Chat to the bot through the RunPod hub:
+   ```bash
+   python tools/chat.py live \
+     --url https://<your-runpod-hub> \
+     --password <hub password> \
+     --as emil-user
+   ```
+
+The `local`/`remote` profiles are mutually exclusive — `docker compose ps`
+will only show `agent-remote` in this mode, and no local hub container
+runs. To switch back, `docker compose --profile remote down` then
+`docker compose --profile local up -d`.
 
 ---
 

@@ -2,7 +2,7 @@
 
 ## Hub Details
 
-- **Dashboard:** https://wb48jtfnjng6on-8080.proxy.runpod.net/
+- **Dashboard:** https://z0yncxbipft4e8-8080.proxy.runpod.net/
 - **Password:** `th25-agents-vg`
 - **Protocol:** HTTPS REST API (JSON)
 

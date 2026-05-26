@@ -1,8 +1,10 @@
+## Quick reference — local 2-agent flow
+
 T1
-docker compose up -d
+docker compose --profile local up -d
 rebuilding agents
-docker compose up -d --build agent-alice agent-bob
-docker compose logs -f
+docker compose --profile local up -d --build agent-alice agent-bob
+docker compose --profile local logs -f
 
 T2
 docker attach assignment2_part3-agent-alice-1
@@ -13,6 +15,18 @@ docker attach assignment2_part3-agent-bob-1
 T4
 python tools/chat.py say --as emil-user "@bob-swe @alice-swe build a calculator in /workspace/shared/calculator.py.First, each state agreement on signatures: add(a, b), subtract(a, b), multiply(a, b), divide(a, b).Then split work: alice owns add/subtract, bob owns multiply/divide.Each emit a CLAIM with the function names in the scope, e.g. #add-subtract and #multiply-divide.Write pytest tests next to it."
 python tools/chat.py live --as emil-user
+
+## Quick reference — single bot to remote RunPod hub
+
+T1 (logs)
+docker compose --profile remote up -d agent-remote
+docker compose --profile remote logs -f agent-remote
+
+T2 (console)
+docker attach assignment2_part3-agent-remote-1
+
+T3 (chat)
+python tools/chat.py live --url https://<runpod-url> --password <pw> --as emil-user
 
 
 # Demo: Build & Start the Docker Agent
@@ -96,7 +110,7 @@ separate hub terminal is needed:
 
 ```bash
 cd assignment2_part3
-docker compose up -d
+docker compose --profile local up -d
 ```
 
 This starts three containers: `local-hub`, `agent-alice`, and `agent-bob`.
@@ -115,7 +129,7 @@ RUNPOD_CHAT_PASSWORD=<hub password>
 
 | Terminal | Command | What it shows |
 |---|---|---|
-| T1 — all logs | `docker compose logs -f` | Hub traffic + both agents interleaved, each prefixed by container name. |
+| T1 — all logs | `docker compose --profile local logs -f` | Hub traffic + both agents interleaved, each prefixed by container name. |
 | T2 — alice | `docker attach assignment2_part3-agent-alice-1` | Alice's console. Type `:approve`/`:deny`/`:say` here. |
 | T3 — bob | `docker attach assignment2_part3-agent-bob-1` | Bob's console. Type `:approve`/`:deny`/`:say` here. |
 | T4 — live chat | `python tools/chat.py live --as emil-user` | REPL: incoming hub messages stream in, you type to post. |
@@ -310,12 +324,50 @@ python -m pytest assignment2_part3/tests -q     # 168 tests
 python -m pytest assignment2_part2 -q     # 95 tests
 ```
 
+### J. Single bot to remote RunPod hub (P3.4)
+
+Run **just one** agent under your own identity, connected to the live
+course hub instead of the local mock. Alice/bob and the local hub are
+not started.
+
+1. `.env` must have:
+   ```
+   AGENT_ID=<your-bot-name>
+   AGENT_DISPLAY_NAME=<your-bot-name>
+   AGENT_MODE=runpod
+   RUNPOD_CHAT_URL=https://<runpod-url>
+   RUNPOD_CHAT_PASSWORD=<real hub password>
+   ```
+
+2. Bring up only the remote bot:
+   ```bash
+   docker compose --profile remote up -d agent-remote
+   docker compose --profile remote logs -f agent-remote
+   ```
+   Look for `listening via runpod` and the absence of `[hub!] ... 401`.
+
+3. Operator console — `docker attach assignment2_part3-agent-remote-1`,
+   then `:budget`, `:say`, `:approve`, etc. Detach with `Ctrl-P, Ctrl-Q`.
+
+4. Chat from the host:
+   ```bash
+   python tools/chat.py live --url https://<runpod-url> --password <pw> --as emil-user
+   ```
+
+To stop and switch back: `docker compose --profile remote down`, then
+`docker compose --profile local up -d`.
+
 ## Notes
 
-- Default `AGENT_MODE=stub` — agents read PeerMessage JSON from stdin and
-  write replies to stdout. Switch to `runpod` in `.env` once the hub URL +
-  token are set (see README §"Wiring the live RunPod group chat").
+- The Docker stack uses Compose **profiles**: `local` covers
+  `local-hub` + `agent-alice` + `agent-bob`; `remote` covers the
+  single-bot `agent-remote`. Plain `docker compose up` without
+  `--profile <name>` starts nothing — pick a mode explicitly.
+- `AGENT_MODE=stub` is the test transport (stdin/stdout JSON, no HTTP)
+  used by host-side `python agent.py` runs. Both Docker profiles use
+  `AGENT_MODE=runpod` — just pointed at different hub URLs.
 - Resource caps per container: `cpus: 1.0`, `mem_limit: 512m`,
   `pids_limit: 100`, all caps dropped, `no-new-privileges`.
-- To run just one agent: `docker compose up agent-alice`.
-- To rebuild after code changes: `docker compose build --no-cache`.
+- To run just one local agent: `docker compose --profile local up agent-alice`.
+- To rebuild after code changes: `docker compose --profile local build --no-cache`
+  (or `--profile remote` for `agent-remote`).

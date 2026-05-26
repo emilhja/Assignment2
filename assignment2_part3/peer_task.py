@@ -18,7 +18,7 @@ import inspect
 import json
 import re
 import threading
-from typing import Optional
+from typing import Callable, Optional
 
 import part2_bridge  # noqa: F401 — sys.path side effect; needed before Part 2 imports
 
@@ -72,6 +72,42 @@ def _peer_user_envelope(message: PeerMessage) -> str:
 
 def _tool_observation_message(tool: str, observation: str) -> str:
     return _json({"type": "tool_observation", "tool": tool, "observation": observation})
+
+
+def _tool_arg_summary(tool: str, args: dict) -> str:
+    """One-line preview of a tool call for the live attach console."""
+    if not isinstance(args, dict):
+        return ""
+    if tool == "bash":
+        cmd = str(args.get("command", "")).replace("\n", " ")
+        return f"cmd={cmd[:80]!r}"
+    path = args.get("path")
+    if isinstance(path, str) and path:
+        extra = ""
+        if tool in {"edit_section", "replace_text"}:
+            old = str(args.get("old_text", "")).splitlines()[0:1]
+            if old:
+                extra = f" old={old[0][:40]!r}"
+        elif tool == "append_text":
+            text = str(args.get("text", ""))
+            extra = f" +{len(text)}b"
+        elif tool == "create_file":
+            content = str(args.get("content", ""))
+            extra = f" {len(content)}b"
+        return f"path={path}{extra}"
+    keys = ",".join(sorted(args.keys()))
+    return f"args=[{keys}]"
+
+
+def _observation_summary(observation: str) -> str:
+    """First substantive line of a tool observation, truncated."""
+    if not observation:
+        return "(empty)"
+    for line in observation.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:120]
+    return observation[:120]
 
 
 def _recent_context_message(recent_context: Optional[list[dict[str, str]]]) -> Optional[str]:
@@ -298,6 +334,29 @@ def _pytest_was_requested(text: str) -> bool:
     return bool(_PYTEST_REQUEST_RE.search(text or ""))
 
 
+_ACTION_REQUEST_RE = re.compile(
+    r"(?i)\b("
+    r"run\s+(?:the\s+)?(?:tests?|pytest)"
+    r"|verify(?:\s+(?:the\s+)?(?:tests?|implementation|code))?"
+    r"|ensure(?:\s+(?:that\s+)?[\w\s'/-]+)?\s+(?:is|are|gets?|be|being)?\s*(?:implemented|fixed|updated|defined)"
+    r"|implement(?:ed|s|ing)?"
+    r"|fix(?:ed|es|ing)?"
+    r"|repair(?:ed|s|ing)?"
+    r"|update(?:d|s|ing)?"
+    r"|execute"
+    r"|run\s+pytest"
+    r"|go\s+ahead"
+    r"|please\s+(?:run|verify|test|execute|ensure|implement|fix|repair|update)"
+    r")\b"
+)
+
+
+def _action_was_requested(text: str) -> bool:
+    # Stricter than _pytest_was_requested: only True when the operator/peer
+    # told the agent to do something, not when tests are merely discussed.
+    return bool(_ACTION_REQUEST_RE.search(text or ""))
+
+
 def _test_target_for_claim(target: str | None) -> str | None:
     if not target:
         return None
@@ -485,6 +544,7 @@ def run_peer_task(
     absorb_claims: bool = True,
     collision: Optional[CollisionInfo] = None,
     runtime_guidance: Optional[list[str]] = None,
+    console_log: Optional[Callable[[str, str], None]] = None,
 ) -> str:
     # Late binding so monkey-patching `peer_task.complete_chat_with_metadata`
     # in tests works.
@@ -497,6 +557,7 @@ def run_peer_task(
 
     self_id = agent_id or ""
     trace_id = message.id
+    _emit = console_log or (lambda _tag, _msg: None)
     _record_params = inspect.signature(store.record).parameters
     _supports_trace = "trace_id" in _record_params
     _supports_model = "model" in _record_params and "provider" in _record_params
@@ -544,6 +605,7 @@ def run_peer_task(
     refusal = peer_intent_refusal(message.text)
     if refusal:
         _log("assistant", "peer_refusal", refusal)
+        _emit("refuse", f"intent: {refusal[:80]}")
         return refusal
 
     messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -612,6 +674,7 @@ def run_peer_task(
             budget.permit(estimate)
         except BudgetExceeded as exc:
             _log("system", "budget_exceeded", exc.reason)
+            _emit("budget!", exc.reason[:120])
             if console is None:
                 return f"I have to stop here: my session budget is exhausted ({exc.reason})."
             _log(
@@ -659,6 +722,16 @@ def run_peer_task(
         _log("assistant", "raw_json", raw_response, provider=provider, model=model)
         if budget_save_event is not None:
             budget_save_event.set()
+        _prompt_t = _usage_value(usage, "prompt_tokens")
+        _completion_t = _usage_value(usage, "completion_tokens")
+        _llm_id = f"{provider}/{model}" if (provider or model) else "model"
+        if _prompt_t is not None or _completion_t is not None:
+            _emit(
+                "llm",
+                f"{_llm_id} step={step} prompt={_prompt_t or 0}t out={_completion_t or 0}t",
+            )
+        else:
+            _emit("llm", f"{_llm_id} step={step}")
 
         if not (raw_response or "").strip():
             empty_streak += 1
@@ -829,6 +902,26 @@ def run_peer_task(
                     return stopped
                 continue
             if (
+                not _is_claim_continuation(message)
+                and _action_was_requested(message.text)
+                and _looks_like_pending_shared_write(answer)
+            ):
+                guidance = (
+                    "The user asked you to take action (e.g. run pytest or read a file) and your "
+                    'reply was prose only. {"type":"final",...} replies describing what you "will" '
+                    'or "need to" do are invalid here — make the tool call now. For verification, '
+                    'call {"type":"tool_call","tool":"run_tests","args":{"path":"/workspace/shared/test_<file>.py"}}. '
+                    "For inspection, use read_file first. Only send a final answer after a tool observation."
+                )
+                stopped = _continuation_reprompt_or_stop(
+                    "user_action_prose_stall_reprompt",
+                    guidance,
+                    "I had to stop because I kept describing what I would do instead of calling a tool.",
+                )
+                if stopped is not None:
+                    return stopped
+                continue
+            if (
                 _is_claim_continuation(message)
                 and RELEASE_PATTERN.search(answer)
                 and not saw_successful_shared_write
@@ -881,6 +974,7 @@ def run_peer_task(
             args_refusal = _maybe_scrub_args_refusal(parsed.args)
             if args_refusal:
                 _log("system", "peer_refusal_tool_args", args_refusal)
+                _emit("refuse", f"tool_args: {args_refusal[:80]}")
                 observation = _refusal_observation(args_refusal)
                 messages.append({"role": "user", "content": observation})
                 continue
@@ -888,13 +982,16 @@ def run_peer_task(
             block_reason = _maybe_shared_write_refusal(parsed.tool, parsed.args, claims, self_id)
             if block_reason:
                 _log("system", "claim_block", block_reason)
+                _emit("block", block_reason[:120])
                 saw_failed_shared_write = True
                 observation = _refusal_observation(block_reason)
                 messages.append({"role": "user", "content": observation})
                 continue
 
+            _emit("tool", f"{parsed.tool} {_tool_arg_summary(parsed.tool, parsed.args)}")
             observation = _run_tool_with_approval(parsed.tool, parsed.args, console)
             observation = _truncate(observation)
+            _emit("tool=", _observation_summary(observation))
             if (
                 parsed.tool in CLAIM_GATED_TOOLS
                 and isinstance(parsed.args.get("path"), str)

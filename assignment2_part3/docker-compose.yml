@@ -1,17 +1,19 @@
 services:
   local-hub:
+    profiles: [local]
     build:
       context: ..
       dockerfile: assignment2_part3/Dockerfile
     env_file:
       - .env
-    command: python tools/local_hub.py --password ${LOCAL_HUB_PASSWORD:?Set LOCAL_HUB_PASSWORD in .env (any value; agents must use the same as RUNPOD_CHAT_PASSWORD)}
+    command: python tools/local_hub.py --password ${LOCAL_HUB_PASSWORD:?Set LOCAL_HUB_PASSWORD in .env (any value; alice/bob use the same value automatically)}
     environment:
       PYTHONUNBUFFERED: "1"
     ports:
       - "${LOCAL_HUB_PORT:-8080}:8080"
 
   agent-alice:
+    profiles: [local]
     build:
       context: ..
       dockerfile: assignment2_part3/Dockerfile
@@ -31,8 +33,8 @@ services:
       LLM_RATE_LIMIT_MAX_WAIT_SECONDS: ${LLM_RATE_LIMIT_MAX_WAIT_SECONDS:-0}
       LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-4096}
       LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-120}
-      RUNPOD_CHAT_URL: ${LOCAL_AGENT_HUB_URL:-http://local-hub:8080}
-      RUNPOD_CHAT_PASSWORD: ${RUNPOD_CHAT_PASSWORD:?Set RUNPOD_CHAT_PASSWORD in .env (must match LOCAL_HUB_PASSWORD for the local hub)}
+      RUNPOD_CHAT_URL: http://local-hub:8080
+      RUNPOD_CHAT_PASSWORD: ${LOCAL_HUB_PASSWORD:?Set LOCAL_HUB_PASSWORD in .env}
       RUNPOD_CHAT_POLL_INTERVAL: ${RUNPOD_CHAT_POLL_INTERVAL:-4}
       LOCAL_LLM_BASE_URL: ${LOCAL_LLM_BASE_URL:-http://host.docker.internal:8080}
     depends_on:
@@ -50,7 +52,49 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # Single bot that joins a remote RunPod hub using identity from .env.
+  # Not started by default; opt in with `docker compose --profile remote up agent-remote`.
+  agent-remote:
+    profiles: [remote]
+    build:
+      context: ..
+      dockerfile: assignment2_part3/Dockerfile
+    env_file:
+      - .env
+    environment:
+      AGENT_ID: ${AGENT_ID:?Set AGENT_ID in .env for the remote bot}
+      AGENT_DISPLAY_NAME: ${AGENT_DISPLAY_NAME:?Set AGENT_DISPLAY_NAME in .env for the remote bot}
+      AGENT_ALIASES: ${AGENT_ALIASES:-}
+      AGENT_MODE: runpod
+      AGENT_WORKSPACE: /workspace/${AGENT_ID}
+      SHARED_WORKSPACE: /workspace/shared
+      AGENT_SESSION_DB: /data/${AGENT_ID}.sqlite3
+      AGENT_TPM_LIMIT: ${AGENT_TPM_LIMIT:-100000}
+      AGENT_RPM_LIMIT: ${AGENT_RPM_LIMIT:-30}
+      AGENT_TOTAL_TOKEN_LIMIT: ${AGENT_TOTAL_TOKEN_LIMIT:-2000000}
+      LLM_PROVIDER_ORDER: ${LLM_PROVIDER_ORDER:-local}
+      LLM_RATE_LIMIT_MAX_WAIT_SECONDS: ${LLM_RATE_LIMIT_MAX_WAIT_SECONDS:-0}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-4096}
+      LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-120}
+      RUNPOD_CHAT_URL: ${RUNPOD_CHAT_URL:?Set RUNPOD_CHAT_URL in .env to the RunPod hub URL (no local-hub fallback in remote mode)}
+      RUNPOD_CHAT_PASSWORD: ${RUNPOD_CHAT_PASSWORD:?Set RUNPOD_CHAT_PASSWORD in .env to the RunPod hub password}
+      RUNPOD_CHAT_POLL_INTERVAL: ${RUNPOD_CHAT_POLL_INTERVAL:-4}
+      LOCAL_LLM_BASE_URL: ${LOCAL_LLM_BASE_URL:-http://host.docker.internal:8080}
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./workspace:/workspace
+      - ./data:/data
+    cpus: "1.0"
+    mem_limit: 512m
+    pids_limit: 100
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
   agent-bob:
+    profiles: [local]
     build:
       context: ..
       dockerfile: assignment2_part3/Dockerfile
@@ -70,8 +114,8 @@ services:
       LLM_RATE_LIMIT_MAX_WAIT_SECONDS: ${LLM_RATE_LIMIT_MAX_WAIT_SECONDS:-0}
       LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-4096}
       LLM_REQUEST_TIMEOUT_SECONDS: ${LLM_REQUEST_TIMEOUT_SECONDS:-120}
-      RUNPOD_CHAT_URL: ${LOCAL_AGENT_HUB_URL:-http://local-hub:8080}
-      RUNPOD_CHAT_PASSWORD: ${RUNPOD_CHAT_PASSWORD:?Set RUNPOD_CHAT_PASSWORD in .env (must match LOCAL_HUB_PASSWORD for the local hub)}
+      RUNPOD_CHAT_URL: http://local-hub:8080
+      RUNPOD_CHAT_PASSWORD: ${LOCAL_HUB_PASSWORD:?Set LOCAL_HUB_PASSWORD in .env}
       RUNPOD_CHAT_POLL_INTERVAL: ${RUNPOD_CHAT_POLL_INTERVAL:-4}
       LOCAL_LLM_BASE_URL: ${LOCAL_LLM_BASE_URL:-http://host.docker.internal:8080}
     depends_on:
