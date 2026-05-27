@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from task_status import parse_task_status
+from task_status import looks_like_empty_acknowledgment, parse_task_status
 
 
 @pytest.mark.parametrize(
@@ -38,3 +38,40 @@ def test_parse_task_status_uses_first_non_empty_line():
 
 def test_parse_task_status_rejects_plain_prose():
     assert parse_task_status("Jag ska skapa en kalkylator.") is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Okej, jag förstår. Jag avvaktar nya instruktioner.",
+        "Okej, jag förstår att jag ska använda filen. Jag avvaktar nästa instruktion.",
+        "I will await the coordinator's task distribution.",
+        "Ready for next task.",
+        "Tack!",
+        "Noted.",
+    ],
+)
+def test_empty_acknowledgment_is_detected(text):
+    assert looks_like_empty_acknowledgment(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Klar med: terminal-kalkylator. Filer: /workspace/alice/project1/calc.py. Tester: passed.",
+        "CLAIM /workspace/shared/calc.py#add: implement add",
+        "RELEASE /workspace/shared/calc.py#add",
+        "Done: implemented add at /workspace/shared/calc.py. Tests: ran and passed.",
+        "Should I create the README file?",
+        "Bekräftat, jag tar: terminal-kalkylator",
+        "Here is the code:\n```python\ndef add(a, b): return a+b\n```",
+    ],
+)
+def test_empty_acknowledgment_skips_substantive_replies(text):
+    assert looks_like_empty_acknowledgment(text) is False
+
+
+def test_empty_acknowledgment_skips_long_text():
+    # An ack-like phrase buried in a very long reply is no longer "empty".
+    text = "Okej, jag förstår. " + ("Lorem ipsum dolor sit amet. " * 20)
+    assert looks_like_empty_acknowledgment(text) is False

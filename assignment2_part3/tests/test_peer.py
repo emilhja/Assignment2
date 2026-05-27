@@ -75,6 +75,32 @@ def test_scrub_passes_clean_text_through():
     assert hits == []
 
 
+def test_scrub_replaces_private_workspace_path_with_self_placeholder():
+    text = (
+        "I wrote it at /workspace/emil_hjaertfors_bot/project7/game.py and you can "
+        "find it in /workspace/emil_hjaertfors_bot/project7/."
+    )
+    scrubbed, hits = scrub_outbound(text, agent_id="emil_hjaertfors_bot")
+    assert "emil_hjaertfors_bot" not in scrubbed
+    assert "/workspace/<self>/project7/game.py" in scrubbed
+    assert "/workspace/<self>/project7/" in scrubbed
+    assert "private_workspace_path" in hits
+
+
+def test_scrub_leaves_peer_workspace_paths_alone():
+    text = "Check peer file /workspace/bob/project3/calc.py for the answer."
+    scrubbed, hits = scrub_outbound(text, agent_id="alice")
+    assert scrubbed == text
+    assert "private_workspace_path" not in hits
+
+
+def test_scrub_without_agent_id_does_not_touch_workspace_paths():
+    text = "Look at /workspace/alice/project1/foo.py please."
+    scrubbed, hits = scrub_outbound(text)
+    assert scrubbed == text
+    assert hits == []
+
+
 def test_peer_message_dataclass_immutable():
     msg = PeerMessage(id="m1", sender_id="alice", text="hi")
     # frozen dataclass: assignment raises

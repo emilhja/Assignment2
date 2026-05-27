@@ -452,6 +452,114 @@ def test_real_mention_alongside_defer_still_triggers_reply():
     assert "addressed" in d.reason
 
 
+def test_intro_reply_counts_against_broadcast_window(monkeypatch):
+    """A prior reply (e.g. the one-line intro on m0) consumes the broadcast
+    window slot, so a subsequent broadcast must hit back-off.
+
+    `_replies_in_window` does not distinguish intro vs. broadcast vs. direct
+    replies — every entry in `recent_replies` counts. This pins that
+    behavior so a future tweak that tries to "free" intros from the budget
+    fails loudly: by design, an intro is just another reply.
+    """
+
+    monkeypatch.setattr(reply_policy, "MAX_BROADCAST_REPLIES", 1)
+    monkeypatch.setattr(reply_policy, "BROADCAST_WINDOW_SECONDS", 300)
+    monkeypatch.setattr(reply_policy, "COOLDOWN_SECONDS", 0)
+    # Intro posted 50s ago — still inside the 300s broadcast window.
+    recent = [(950.0, "intro-msg")]
+    d = should_reply(
+        _msg("anyone able to help?"),
+        "alice",
+        "alice-swe",
+        recent,
+        now=1000.0,
+    )
+    assert d.respond is False
+    assert "back-off" in d.reason
+
+
+def test_suppressed_intro_still_records_recent_reply(tmp_path, monkeypatch):
+    """End-to-end: even when the runtime suppresses a duplicate intro, the
+    send-attempt is appended to recent_replies so the broadcast window
+    budget is not undermined by the suppression path."""
+
+    import json
+    import threading
+    import time
+
+    import io
+    from budget import Budget
+    from console_control import ConsoleControl
+    from group_chat import run_group_chat
+    from thread_safe_store import ThreadSafeSessionStore as SessionStore
+    from transport import StubTransport
+
+    monkeypatch.setenv("AGENT_ID", "alice")
+    monkeypatch.setenv("AGENT_DISPLAY_NAME", "alice-swe")
+    monkeypatch.setenv("AGENT_MODE", "stub")
+
+    class FakeChat:
+        def __init__(self, replies):
+            self._replies = list(replies)
+            self.calls = 0
+            self.messages = []
+
+        def __call__(self, messages):
+            self.calls += 1
+            self.messages.append(messages)
+            if not self._replies:
+                return json.dumps({"type": "final", "answer": "no more"})
+            return self._replies.pop(0)
+
+    fake_chat = FakeChat(
+        [
+            json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
+            json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
+        ]
+    )
+    import peer_task
+    monkeypatch.setattr(peer_task, "complete_chat_with_metadata", fake_chat)
+
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe please say hi"}) + "\n",
+        json.dumps({"id": "m2", "sender_id": "emil-user", "text": "@alice-swe please say hi again"}) + "\n",
+    ]
+    inbox = io.StringIO("".join(peer_lines))
+    outbox = io.StringIO()
+    transport = StubTransport("alice", inbox=inbox, outbox=outbox)
+
+    store = SessionStore(str(tmp_path / "sess.sqlite3"))
+    budget = Budget(
+        tokens_per_minute=100_000,
+        requests_per_minute=1000,
+        lifetime_tokens=100_000,
+        persist_path=tmp_path / "budget.json",
+    )
+    stop = threading.Event()
+    console = ConsoleControl(budget=budget, stop_event=stop, stdin=io.StringIO(""), stdout=io.StringIO())
+
+    def runner():
+        run_group_chat(
+            transport=transport,
+            budget=budget,
+            console=console,
+            store=store,
+            stop_event=stop,
+            idle_sleep=0.01,
+        )
+
+    t = threading.Thread(target=runner)
+    t.start()
+    time.sleep(2.5)
+    stop.set()
+    t.join(timeout=5.0)
+
+    cur = store.connection.execute(
+        "SELECT kind FROM events WHERE kind = 'intro_suppressed' ORDER BY id"
+    )
+    assert cur.fetchone() is not None, "expected an intro_suppressed event"
+
+
 def test_claim_collision_only_fires_on_self_claim():
     """A peer CLAIM for a path we do not own should not bypass cooldown."""
 

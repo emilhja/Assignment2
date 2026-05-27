@@ -17,6 +17,7 @@ from code_share import (
     extract_code_blocks,
     maybe_run_pytest,
     most_recent_project_dir,
+    named_project_dir,
     next_project_dir,
     process_shared_code,
     save_code_blocks,
@@ -306,3 +307,98 @@ def test_process_shared_code_end_to_end_with_tests(tmp_path, monkeypatch):
     assert "/workspace/emil_bot/project5/test_calc.py" in guidance
     assert "Auto-pytest: ran" in guidance
     assert "2 passed" in guidance
+
+
+# -------------------------------------------------- named project allocator
+
+
+def test_named_project_dir_creates_and_is_idempotent(tmp_path):
+    root = tmp_path / "shared"
+    root.mkdir()
+    first = named_project_dir(root, "calc")
+    assert first is not None and first.name == "calc"
+    assert first.is_dir()
+    # Second call returns the same dir without raising.
+    second = named_project_dir(root, "calc")
+    assert second is not None and second == first
+
+
+def test_named_project_dir_lowercases_and_trims(tmp_path):
+    root = tmp_path / "shared"
+    root.mkdir()
+    result = named_project_dir(root, "  Calc  ")
+    assert result is not None and result.name == "calc"
+
+
+def test_named_project_dir_rejects_unsafe_names(tmp_path):
+    root = tmp_path / "shared"
+    root.mkdir()
+    for bad in ("..", "../etc", "name/sub", "weird.name", "with space", "", "/abs"):
+        assert named_project_dir(root, bad) is None, f"should reject {bad!r}"
+
+
+def test_next_project_dir_retries_on_race(tmp_path, monkeypatch):
+    """Two agents racing on `next_project_dir` against the same shared root.
+
+    Simulate by pre-creating project1 and forcing the first mkdir attempt to
+    raise FileExistsError; the allocator should retry and land on project2.
+    """
+    ws = tmp_path / "shared"
+    ws.mkdir()
+    (ws / "project1").mkdir()
+
+    original_mkdir = Path.mkdir
+    state = {"raised": False}
+
+    def _flaky_mkdir(self, *args, **kwargs):
+        if (
+            not state["raised"]
+            and self.name == "project2"
+            and kwargs.get("exist_ok") is False
+        ):
+            state["raised"] = True
+            raise FileExistsError(self)
+        return original_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", _flaky_mkdir)
+    result = next_project_dir(ws)
+    assert state["raised"] is True
+    assert result is not None
+    # Either project2 (after the retry re-reads indices and finds project1
+    # only) or project3 (if the simulated mkdir created project2 anyway) is
+    # acceptable — the contract is "no FileExistsError leak, monotonic".
+    assert result.name in {"project2", "project3"}
+
+
+# ---------------------------------- process_shared_code auto_pytest + shared
+
+
+def test_process_shared_code_auto_pytest_false_skips_subprocess(tmp_path, monkeypatch):
+    project = tmp_path / "project1"
+    project.mkdir()
+
+    def _no_subprocess(*args, **kwargs):  # pragma: no cover — must not run
+        raise AssertionError("pytest must not run when auto_pytest=False")
+
+    monkeypatch.setattr(subprocess, "run", _no_subprocess)
+    text = (
+        "```python\n# file: t.py\ndef test_x():\n    assert True\n```\n"
+    )
+    guidance = process_shared_code(text, "alice", project, auto_pytest=False)
+    assert guidance is not None
+    assert "Auto-pytest: skipped" in guidance
+    assert (project / "t.py").exists()
+
+
+def test_process_shared_code_reports_shared_path_when_shared_root_set(tmp_path):
+    root = tmp_path / "shared"
+    root.mkdir()
+    project = root / "calc"
+    project.mkdir()
+    text = "```python\n# file: calc.py\ndef add(a, b):\n    return a + b\n```\n"
+    guidance = process_shared_code(
+        text, "alice", project, auto_pytest=False, shared_root=root
+    )
+    assert guidance is not None
+    assert "/workspace/shared/calc/calc.py" in guidance
+    assert "/workspace/alice/" not in guidance

@@ -4,7 +4,10 @@ from coordination import (
     followup_assignment_guidance,
     handoff_guidance,
     parse_coordination_plan,
+    parse_project_directive,
     private_workspace_guidance,
+    proactive_assignment_guidance,
+    project_name_from_shared_path,
     status_request_guidance,
 )
 
@@ -448,3 +451,136 @@ def test_handoff_guidance_falls_back_to_recent_assignment():
 
     assert guidance is not None
     assert "/workspace/shared/calculator.py#multiply-division" in guidance
+
+
+def test_proactive_hint_disabled_by_default():
+    g = proactive_assignment_guidance(
+        "Distribute roles between each other and create a calculator.py",
+        agent_id="alice",
+        display_name="alice-swe",
+        recent_context=[],
+    )
+    assert g is None
+
+
+def test_proactive_hint_fires_when_env_set(monkeypatch):
+    monkeypatch.setenv("AGENT_PROACTIVE_SUBTASKS", "1")
+    g = proactive_assignment_guidance(
+        "Distribute roles between each other and create a calculator.py",
+        agent_id="alice",
+        display_name="alice-swe",
+        recent_context=[],
+    )
+    assert g is not None
+    assert "Proactivity hint" in g
+
+
+def test_proactive_hint_silent_when_agent_already_engaged(monkeypatch):
+    monkeypatch.setenv("AGENT_PROACTIVE_SUBTASKS", "1")
+    recent = [
+        {"sender_id": "alice-swe", "text": "Jag tar mig an: divisionsdelen"},
+    ]
+    g = proactive_assignment_guidance(
+        "Anyone else want to implement a sub-task?",
+        agent_id="alice",
+        display_name="alice-swe",
+        recent_context=recent,
+    )
+    assert g is None
+
+
+def test_proactive_hint_silent_when_directly_addressed(monkeypatch):
+    monkeypatch.setenv("AGENT_PROACTIVE_SUBTASKS", "1")
+    g = proactive_assignment_guidance(
+        "@alice-swe please implement add and subtract",
+        agent_id="alice",
+        display_name="alice-swe",
+        recent_context=[],
+    )
+    assert g is None
+
+
+def test_proactive_hint_silent_when_no_write_verb(monkeypatch):
+    monkeypatch.setenv("AGENT_PROACTIVE_SUBTASKS", "1")
+    g = proactive_assignment_guidance(
+        "How is everyone doing today?",
+        agent_id="alice",
+        display_name="alice-swe",
+        recent_context=[],
+    )
+    assert g is None
+
+
+def test_proactive_hint_silent_when_has_open_claim(monkeypatch):
+    monkeypatch.setenv("AGENT_PROACTIVE_SUBTASKS", "1")
+    g = proactive_assignment_guidance(
+        "implement calc.py please everyone",
+        agent_id="alice",
+        display_name="alice-swe",
+        recent_context=[],
+        has_open_claim=True,
+    )
+    assert g is None
+
+
+# ----------------------------- PROJECT directive + shared-path project name
+
+
+def test_parse_project_directive_picks_up_name():
+    assert parse_project_directive("PROJECT: calc") == "calc"
+    assert parse_project_directive("hello\nPROJECT: my-thing\nthen more") == "my-thing"
+
+
+def test_parse_project_directive_returns_none_when_absent():
+    assert parse_project_directive("just chatter, no directive") is None
+    assert parse_project_directive("") is None
+    assert parse_project_directive(None) is None  # type: ignore[arg-type]
+
+
+def test_parse_project_directive_rejects_unsafe_chars():
+    # Pattern only captures [A-Za-z0-9_-]+; punctuation/slashes break the match.
+    assert parse_project_directive("PROJECT: bad/name") is None
+    assert parse_project_directive("PROJECT: ..") is None
+
+
+def test_project_name_from_shared_path_first_segment():
+    assert project_name_from_shared_path(
+        "/workspace/shared/calc/calculator.py"
+    ) == "calc"
+
+
+def test_project_name_from_shared_path_returns_none_for_flat_file():
+    # No subfolder under /workspace/shared/ → no project to create.
+    assert project_name_from_shared_path("/workspace/shared/calculator.py") is None
+
+
+def test_project_name_from_shared_path_returns_none_for_non_shared():
+    assert project_name_from_shared_path("/workspace/alice/calc/x.py") is None
+    assert project_name_from_shared_path("/elsewhere/calc/x.py") is None
+    assert project_name_from_shared_path("") is None
+    assert project_name_from_shared_path(None) is None  # type: ignore[arg-type]
+
+
+# ------------------------------ widened signature-agreement pattern
+
+
+def test_signature_agreement_widened_phrasings_trigger_guidance():
+    """Operator phrasings beyond strict 'agree on function signatures' fire."""
+    phrasings = [
+        "first, state agreement on signatures: add(a,b)",
+        "propose signatures before writing",
+        "confirm the signatures everyone",
+        "agree on signatures first",
+        "agree on the function signatures together",
+    ]
+    for phrase in phrasings:
+        text = (
+            f"@alice-swe @bob-swe build a calculator in /workspace/shared/calc/calculator.py. "
+            f"{phrase}. alice owns add/subtract, bob owns multiply/divide."
+        )
+        guidance = assignment_guidance(
+            text, agent_id="alice", display_name="alice-swe"
+        )
+        assert guidance is not None and "signature" in guidance.lower(), (
+            f"phrase {phrase!r} should trigger signature-agreement guidance"
+        )

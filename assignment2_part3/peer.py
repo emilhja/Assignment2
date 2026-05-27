@@ -102,8 +102,19 @@ CREDENTIAL_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
-def scrub_outbound(text: str) -> tuple[str, list[str]]:
-    """Redact credential-shaped strings. Return (scrubbed_text, kinds_hit)."""
+def scrub_outbound(
+    text: str,
+    *,
+    agent_id: Optional[str] = None,
+) -> tuple[str, list[str]]:
+    """Redact credential-shaped strings and private workspace paths.
+
+    Return (scrubbed_text, kinds_hit). When `agent_id` is provided, any
+    `/workspace/<agent_id>/...` prefix is rewritten to `/workspace/<self>/...`
+    so peers cannot see the literal id or guess sibling project paths. The
+    show-your-work protocol still works for the agent itself because the
+    rewrite happens only on the wire.
+    """
 
     if not isinstance(text, str) or not text:
         return text or "", []
@@ -118,4 +129,14 @@ def scrub_outbound(text: str) -> tuple[str, list[str]]:
         if count:
             hits.append(kind)
             scrubbed = new_text
+
+    if agent_id:
+        private_pattern = re.compile(
+            rf"/workspace/{re.escape(agent_id)}(?=/|\b)"
+        )
+        new_text, count = private_pattern.subn("/workspace/<self>", scrubbed)
+        if count:
+            hits.append("private_workspace_path")
+            scrubbed = new_text
+
     return scrubbed, hits

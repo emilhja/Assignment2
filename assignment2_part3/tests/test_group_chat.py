@@ -24,6 +24,7 @@ from budget import Budget
 from claims import ClaimRegistry
 from console_control import ConsoleControl
 from group_chat import (
+    _local_workspace_guidance,
     _released_without_write_guidance,
     _remote_workspace_guidance,
     _stale_claim_guidance,
@@ -561,9 +562,12 @@ def test_runpod_with_existing_projects_defers_and_skips_until_chosen(tmp_path, m
 
     assert ctx["fake_chat"].calls == 0
     captured = capsys.readouterr()
-    assert "[project] existing: project1, project2" in captured.out
+    # New unified `[project?]` block — used both on startup-with-existing
+    # and on every skipped inbound, so `docker attach` sees the same prompt
+    # regardless of when the operator joined.
+    assert "[project?] existing: project1, project2" in captured.out
     assert "no active project" in captured.out
-    assert "[skip] no active project" in captured.out
+    assert "PROJECT: <name>" in captured.out  # the third resolution hint
 
     decision_rows = [
         content for role, kind, content in _events(ctx["store"])
@@ -707,11 +711,13 @@ def test_task_status_acceptance_triggers_internal_continuation(tmp_path, monkeyp
     t.join(timeout=5.0)
 
     replies = _outbox_replies(ctx["outbox"])
+    # The private workspace path is rewritten to /workspace/<self>/ on the wire
+    # (see peer.scrub_outbound) so peers cannot guess sibling project paths.
     assert [payload["text"] for payload in replies] == [
         "Bekräftat, jag tar: terminal-kalkylator",
         (
             "Klar med: terminal-kalkylator. "
-            "Filer: /workspace/alice/project1/calculator.py. Tester: inte körda."
+            "Filer: /workspace/<self>/project1/calculator.py. Tester: inte körda."
         ),
     ]
     assert (project / "calculator.py").read_text(encoding="utf-8") == content
@@ -907,6 +913,91 @@ def test_status_request_with_open_claim_suppresses_stale_nudge(tmp_path, monkeyp
     assert stale_alone == [], f"stale-claim guidance leaked alongside status: {stale_alone}"
 
 
+def test_intro_line_is_posted_once_then_suppressed(tmp_path, monkeypatch):
+    """Defense-in-depth for the P3.7 "intro at most once" rule.
+
+    The system prompt forbids re-posting "Hej, jag är ...", but the model
+    occasionally regresses on long sessions. The runtime must drop the
+    duplicate intro on the wire instead of sending it to the hub.
+    """
+
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe please say hi"}) + "\n",
+        json.dumps({"id": "m2", "sender_id": "emil-user", "text": "@alice-swe new agent joined, introduce again please"}) + "\n",
+    ]
+    scripted = [
+        json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
+        json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(2.5)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    intro_replies = [r for r in replies if r["text"].startswith("Hej, jag är")]
+    assert len(intro_replies) == 1, f"intro line should be sent exactly once: {replies}"
+
+    events = _events(ctx["store"])
+    assert any(kind == "intro_suppressed" for _role, kind, _content in events)
+
+
+def test_empty_acknowledgment_reply_is_suppressed(tmp_path, monkeypatch):
+    """Reply-discipline runtime gate: "Okej, jag förstår. Jag avvaktar..." is
+    a content-free reply and never reaches the hub."""
+
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe heads up, peer wrote game.py"}) + "\n",
+    ]
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "Okej, jag förstår. Jag avvaktar nästa instruktion.",
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.5)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert replies == [], f"empty acknowledgment must not leave the runtime: {replies}"
+
+    events = _events(ctx["store"])
+    assert any(kind == "acknowledgment_suppressed" for _role, kind, _content in events)
+
+
+def test_substantive_reply_is_not_suppressed(tmp_path, monkeypatch):
+    """Sanity: a real status reply (no empty-ack markers) goes out unchanged."""
+
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe what file should I touch?"}) + "\n",
+    ]
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "Looking at /workspace/shared/calc.py first — propose a #division scope.",
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.5)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert len(replies) == 1
+    assert "#division" in replies[0]["text"]
+
+
 def test_satisfied_claim_does_not_re_inject_nudge(tmp_path, monkeypatch):
     """Once a claim is satisfied by a successful write, the next turn must
     NOT contain the stale-claim nudge — otherwise the model would be told
@@ -932,3 +1023,345 @@ def test_satisfied_claim_does_not_re_inject_nudge(tmp_path, monkeypatch):
     assert ctx["fake_chat"].calls == 1
     contents = [message["content"] for message in ctx["fake_chat"].messages[0]]
     assert not any("unsatisfied active CLAIM" in content for content in contents)
+
+
+def test_local_workspace_guidance_invariants(tmp_path):
+    """Local-mode guidance must invert the remote stanza: peers CAN read shared
+    files, CLAIM is mandatory before any write, and the agent must not redirect
+    to a private workspace when the operator named a shared path."""
+
+    guidance = _local_workspace_guidance("alice-swe", tmp_path / "calc")
+    assert "/workspace/shared/calc/" in guidance
+    assert "CLAIM /workspace/shared/" in guidance
+    assert "RELEASE /workspace/shared/" in guidance
+    # Inverse of the remote rule — the local hub explicitly allows shared writes.
+    assert "do not redirect" in guidance.lower()
+    # The remote-hub `# file: <filename>` payload convention should NOT appear here.
+    assert "# file: <filename>" not in guidance
+
+
+def test_named_project_inferred_from_inbound_shared_path(tmp_path, monkeypatch):
+    """A `/workspace/shared/<name>/...` path in the operator broadcast must
+    set the active project to `<name>` (not a flat `shared/` write) so peers
+    write into a co-visible project subfolder."""
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+    monkeypatch.setenv("CLAIM_CONTINUATION_GRACE_SECONDS", "0")
+
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": (
+                "@alice-swe build a calculator in /workspace/shared/calc/calculator.py. "
+                "alice owns add/subtract."
+            ),
+        })
+        + "\n",
+    ]
+    calc_src = "def add(a, b):\n    return a + b\n"
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "CLAIM /workspace/shared/calc/calculator.py#add-subtract: implement add",
+        }),
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "/workspace/shared/calc/calculator.py", "content": calc_src},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "Created /workspace/shared/calc/calculator.py.",
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert (shared / "calc" / "calculator.py").read_text(encoding="utf-8") == calc_src
+    # The flat-file landing-on-shared-root path must NOT be used.
+    assert not (shared / "calculator.py").exists()
+
+    events = _events(ctx["store"])
+    inferred = [
+        content for _role, kind, content in events if kind == "project_set_from_inbound"
+    ]
+    assert any("name=calc" in content for content in inferred)
+
+
+def test_project_directive_overrides_path(tmp_path, monkeypatch):
+    """A `PROJECT: <name>` directive in the inbound must win over any
+    `/workspace/shared/<other>/...` path mentioned in the same message."""
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+    monkeypatch.setenv("CLAIM_CONTINUATION_GRACE_SECONDS", "0")
+
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": (
+                "PROJECT: foo\n"
+                "@alice-swe collaborate in /workspace/shared/calc/calculator.py: "
+                "alice owns add"
+            ),
+        })
+        + "\n",
+    ]
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "Ack.",
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    events = _events(ctx["store"])
+    inferred = [
+        content for _role, kind, content in events if kind == "project_set_from_inbound"
+    ]
+    assert any("name=foo" in content for content in inferred)
+    assert not any("name=calc" in content for content in inferred)
+
+
+def test_peer_claim_blocks_auto_save_in_shared(tmp_path, monkeypatch):
+    """When a peer holds an active CLAIM on a file, an incoming code block for
+    that same file must NOT be auto-saved to the shared project — saving would
+    overwrite the claim-holder's in-flight work. A log row records the skip
+    and the runtime guidance nudges the agent to read_file instead."""
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+    monkeypatch.setenv("CLAIM_CONTINUATION_GRACE_SECONDS", "0")
+
+    # Pre-seed: bob has already claimed calculator.py#multiply.
+    registry = ClaimRegistry()
+    registry.record_observed("bob", "/workspace/shared/calc/calculator.py#multiply")
+
+    peer_lines = [
+        # First message anchors the project so `project_state.active` is set.
+        json.dumps({
+            "id": "m0",
+            "sender_id": "emil-user",
+            "text": "@alice-swe project in /workspace/shared/calc/calculator.py",
+        })
+        + "\n",
+        # Then bob posts code for the file he has under CLAIM. Auto-save must skip.
+        json.dumps({
+            "id": "m1",
+            "sender_id": "bob",
+            "text": (
+                "Sharing my in-progress code:\n\n"
+                "```python\n"
+                "# file: calculator.py\n"
+                "def multiply(a, b):\n"
+                "    return a * b\n"
+                "```\n"
+            ),
+        })
+        + "\n",
+    ]
+    scripted = [
+        json.dumps({"type": "final", "answer": "Ack."}),
+        json.dumps({"type": "final", "answer": "Noted, will read_file before editing."}),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted, claims=registry)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    # Poll for the expected event rather than sleeping a fixed wall-clock duration;
+    # under a loaded test suite a fixed sleep can stop the runner before bob's
+    # second message is even read off the inbox.
+    deadline = time.time() + 10.0
+    skipped: list[str] = []
+    while time.time() < deadline:
+        events = _events(ctx["store"])
+        skipped = [
+            content for _role, kind, content in events if kind == "code_save_skipped_claim_conflict"
+        ]
+        if skipped:
+            break
+        time.sleep(0.05)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert skipped, "expected a code_save_skipped_claim_conflict event"
+    assert any("calculator.py" in row for row in skipped)
+    # The file must not have been written by the auto-save path.
+    assert not (shared / "calc" / "calculator.py").exists()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: PROJECT-directive auto-allocate + system-prompt cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_remote_mode_auto_allocates_on_project_directive(tmp_path, monkeypatch, capsys):
+    """Remote (runpod) mode + no active project + inbound carries
+    `PROJECT: <name>` → the runtime allocates the next numeric `projectN`
+    and processes the message in the same round. No skip, no
+    `everyone continue` required."""
+
+    private = tmp_path / "alice"
+    private.mkdir()
+    (private / "project1").mkdir()  # force "existing projects" branch on startup
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "@alice-swe build a calculator.\nPROJECT: calc",
+        })
+        + "\n",
+    ]
+    scripted = [json.dumps({"type": "final", "answer": "On it."})]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+    monkeypatch.setenv("AGENT_MODE", "runpod")  # flip after _setup_run
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.2)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    events = _events(ctx["store"])
+    alloc = [
+        content for _role, kind, content in events if kind == "project_auto_allocated"
+    ]
+    assert alloc, "expected a project_auto_allocated event"
+    assert any("reason=directive" in row and "directive_name=calc" in row for row in alloc)
+    # The dir name is numeric in remote mode (not "calc").
+    assert any("name=project2" in row for row in alloc)
+    # The LLM round ran for this message — no skip.
+    assert ctx["fake_chat"].calls == 1
+
+
+def test_no_directive_still_skips_in_remote_mode(tmp_path, monkeypatch, capsys):
+    """An inbound without `PROJECT: <name>` keeps the existing safety brake:
+    no auto-allocate, the rich skip prompt is printed, and the LLM is never
+    called."""
+
+    private = tmp_path / "alice"
+    private.mkdir()
+    (private / "project1").mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "@alice-swe ping",
+        })
+        + "\n",
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies=[])
+    monkeypatch.setenv("AGENT_MODE", "runpod")
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert ctx["fake_chat"].calls == 0
+    events = _events(ctx["store"])
+    assert not any(kind == "project_auto_allocated" for _role, kind, _content in events)
+    captured = capsys.readouterr()
+    assert "[project?] no active project" in captured.out
+    assert "msg m1" in captured.out
+    assert "PROJECT: <name>" in captured.out
+
+
+def test_local_mode_auto_allocates_named_dir_on_project_directive(tmp_path, monkeypatch):
+    """Local-shared mode + inbound carries `PROJECT: <name>` → the active
+    project is `<shared>/<name>/`, not a numeric `projectN`. (Verifies the
+    existing local-mode lazy-inference path still wins in shared mode.)"""
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+    monkeypatch.setenv("CLAIM_CONTINUATION_GRACE_SECONDS", "0")
+
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "@alice-swe build a calculator.\nPROJECT: calc",
+        })
+        + "\n",
+    ]
+    scripted = [json.dumps({"type": "final", "answer": "ack"})]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    events = _events(ctx["store"])
+    inferred = [
+        content for _role, kind, content in events if kind == "project_set_from_inbound"
+    ]
+    assert any("name=calc" in row for row in inferred)
+    # No numeric project allocation in local-shared mode.
+    assert not any(kind == "project_auto_allocated" for _role, kind, _content in events)
+    assert (shared / "calc").is_dir()
+
+
+def test_local_workspace_guidance_includes_full_claim_contract():
+    """`_local_workspace_guidance` is the sole source of truth for the
+    local-mode CLAIM/RELEASE/DEFER protocol after the system-prompt cleanup.
+    It must carry the full contract that used to live in P3.9 of the prompt."""
+
+    guidance = _local_workspace_guidance("alice-swe", Path("/tmp/calc"))
+    # Core protocol verbs
+    for term in ("CLAIM", "RELEASE", "DEFER"):
+        assert term in guidance
+    # Specific rules pulled out of the prompt
+    assert "read_file" in guidance
+    assert "lexicographically" in guidance
+    assert "whole file" in guidance.lower() or "whole-file" in guidance.lower()
+    assert "JSON envelope" in guidance or '{"type":"final"' in guidance
+    # The "no assert without observation" rule
+    assert "re-read" in guidance.lower() or "tool_observation" in guidance.lower()
+
+
+def test_system_prompt_has_no_workspace_or_claim_policy_content():
+    """Regression guard for the prompt cleanup: the system prompt is now
+    mode-agnostic. Folder-policy stanzas (P3.8) and the full claim/defer
+    protocol (P3.9 + tie-break) are owned by the runtime guidance helpers,
+    not by the prompt."""
+
+    prompt = load_system_prompt("alice", "alice-swe")
+    # Section headings — these were the bodies that moved out.
+    for heading in (
+        "P3.8",
+        "P3.9",
+        "Workspace layout",
+        "Claim/defer protocol",
+        "Tie-break for racing CLAIMs",
+    ):
+        assert heading not in prompt, f"{heading!r} should no longer be in the prompt"
+    # The per-agent path template is policy text; it shouldn't survive.
+    assert "/workspace/{AGENT_ID}" not in prompt
+    # Protocol-line templates (CLAIM/RELEASE plus the path shape).
+    assert "CLAIM /workspace/shared/" not in prompt
+    assert "RELEASE /workspace/shared/" not in prompt

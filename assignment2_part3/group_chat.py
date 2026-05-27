@@ -29,20 +29,31 @@ from thread_safe_store import ThreadSafeSessionStore as SessionStore
 import colors
 from budget import Budget, format_usage_summary
 from claims import CLAIM_PATTERN, DEFER_PATTERN, RELEASE_PATTERN, Claim, ClaimRegistry, split_claim_target
-from code_share import MAX_PROJECTS, most_recent_project_dir, next_project_dir, process_shared_code
+from code_share import (
+    MAX_PROJECTS,
+    extract_code_blocks,
+    most_recent_project_dir,
+    named_project_dir,
+    next_project_dir,
+    process_shared_code,
+)
 from coordination import (
+    SHARED_PATH_PATTERN,
     assignment_guidance,
     fix_blockers_guidance,
     followup_assignment_guidance,
     handoff_guidance,
+    parse_project_directive,
     private_workspace_guidance,
+    proactive_assignment_guidance,
+    project_name_from_shared_path,
     status_request_guidance,
 )
 from console_control import ConsoleControl
 from peer import PeerMessage
 from peer_task import run_peer_task
 from reply_policy import CollisionInfo, should_reply
-from task_status import TaskStatus, parse_task_status
+from task_status import TaskStatus, looks_like_empty_acknowledgment, parse_task_status
 from transport import Transport, build_transport
 
 
@@ -85,6 +96,11 @@ CONFIRMATION_REQUEST_PATTERN = re.compile(
     r")\b"
 )
 TEST_REQUEST_PATTERN = re.compile(r"(?i)\b(?:pytest|tests?|tester)\b")
+# Matches the canonical one-line intro the system prompt requires (P3.7).
+# Used to suppress a second intro in the same session — the prompt forbids
+# repeating it, but the model occasionally regresses on long sessions, so the
+# runtime enforces it too.
+INTRO_LINE_PATTERN = re.compile(r"^\s*hej,?\s*jag\s+(?:är|ar)\s+\S+", re.IGNORECASE)
 
 
 @dataclass
@@ -97,6 +113,25 @@ class PendingFollowup:
 @dataclass
 class _ProjectState:
     active: Path | None = None
+    root: Path | None = None
+    is_shared: bool = False
+
+
+def _project_root(mode: str, agent_workspace: Path | None) -> tuple[Path | None, bool]:
+    """Return (root, is_shared) for the project allocator.
+
+    Remote (runpod) keeps the per-agent private workspace; local docker-compose
+    sets ``SHARED_WORKSPACE=/workspace/shared`` so alice and bob co-write into
+    the same project directory. The local branch only activates when the env
+    var is explicitly set, so dev tests imported on a host without
+    ``/workspace`` do not accidentally try to ``mkdir /workspace/shared``.
+    """
+    if mode == "runpod":
+        return (agent_workspace, False)
+    shared_env = os.environ.get("SHARED_WORKSPACE")
+    if shared_env:
+        return (Path(shared_env), True)
+    return (None, False)
 
 
 def _remote_workspace_guidance(agent_id: str, project_name: str) -> str:
@@ -137,32 +172,154 @@ def _remote_workspace_guidance(agent_id: str, project_name: str) -> str:
     )
 
 
+def _local_workspace_guidance(agent_id: str, project_dir: Path) -> str:
+    """Workspace guidance for local docker-compose mode.
+
+    Local hub bind-mounts a single ``./workspace`` host directory into every
+    container, so ``/workspace/shared/<project>/`` is genuinely co-visible.
+    This helper is the *sole* source of truth for the local-mode CLAIM/
+    RELEASE/DEFER protocol — the system prompt is mode-agnostic and no longer
+    carries P3.8/P3.9. Anything the model needs to know about shared writes
+    in local mode lives here.
+    """
+    project_name = project_dir.name
+    shared_root = f"/workspace/shared/{project_name}/"
+    return (
+        # Path / mode
+        f"Local hub mode (shared filesystem). Your active project is "
+        f"{shared_root}. Peers can read and write to the same directory. "
+        f"Write every file you create or edit under {shared_root}<filename> "
+        f"— do not redirect to /workspace/{agent_id}/ when the operator "
+        "named a shared path. You cannot read or write another agent's "
+        "private workspace; if a peer asks about a file you cannot access, "
+        "say so and ask them to move it under /workspace/shared/.\n"
+        # CLAIM contract
+        "Claim/defer protocol for shared writes:\n"
+        "- Before any tool that creates, edits, or renames a file under "
+        "/workspace/shared/, your final answer for that round MUST be a "
+        "CLAIM line, not the tool call. Format: \"CLAIM "
+        "/workspace/shared/<path>#<scope>: <one-line reason>\".\n"
+        "- Protocol lines (CLAIM, RELEASE, DEFER) are still final answers "
+        "and MUST be wrapped in the JSON envelope: "
+        "{\"type\":\"final\",\"answer\":\"CLAIM /workspace/shared/<path>#<scope>: <reason>\"}. "
+        "A bare \"CLAIM ...\" line outside the envelope is rejected by the "
+        "parser and never reaches the hub.\n"
+        "- Use a scope when work can be split inside one file, such as "
+        "\"#add-subtract\" or \"#multiply-divide\". Claims for different "
+        "scopes of the same file can proceed in parallel; a claim without "
+        "\"#scope\" means the whole file and conflicts with every scope.\n"
+        "- On the runtime continuation after your claim, invoke the write "
+        "tool. If the file exists and your work is additive, use "
+        "append_text. Do not post another CLAIM in the continuation.\n"
+        "- If you observe another agent's CLAIM for the same path but a "
+        "different scope, continue your own non-overlapping scoped work. "
+        "Do not DEFER for different scopes.\n"
+        "- If you observe another agent's CLAIM for the same path and same "
+        "scope, or for the whole file you were about to write, do not call "
+        "the write tool. Reply with \"DEFER to @<claimant>\" and offer "
+        "review.\n"
+        "- A peer's \"DEFER to @you\" line is a one-way acknowledgment, "
+        "not a question. Do not reply to it with another DEFER. Continue "
+        "your own non-overlapping scoped work.\n"
+        "- The runtime enforces this: a shared write without your active "
+        "claim returns \"refused: no active claim ...\"; a write targeting "
+        "a conflicting peer claim returns \"refused: deferred: ...\". Do "
+        "not retry — emit the DEFER line or explain the missing claim and "
+        "stop.\n"
+        "- If your scoped claim targets an existing shared file, do not "
+        "recreate or overwrite it with create_file. Read the current file, "
+        "then use append_text for additive new code/tests, or edit_section/"
+        "replace_text for exact replacements, so other agents' sections are "
+        "preserved.\n"
+        "- Before posting a CLAIM for a scope on an existing shared file, "
+        "call read_file on that path so you reason from current contents, "
+        "not memory.\n"
+        "- Before asserting in a final answer what a shared file contains, "
+        "lacks, or how it changed, you MUST have a read_file or successful "
+        "create_file/append_text/edit_section/replace_text tool_observation "
+        "for that path in the current round. If you do not have one, say "
+        "\"I need to re-read /workspace/shared/<path>\" and call read_file "
+        "instead of asserting.\n"
+        "- When your scoped work is finished, post \"RELEASE "
+        "/workspace/shared/<path>#<scope>\". If you claimed the whole "
+        "file, release the whole file path.\n"
+        "- Do not post RELEASE in the same exchange as your CLAIM unless a "
+        "successful create_file/append_text/edit_section/rename_file/"
+        "replace_text tool_observation for that path has already been "
+        "returned in this round. RELEASE without a successful write "
+        "observation is rejected by the runtime and you will be reprompted "
+        "to either call the write tool or explain why you cannot.\n"
+        "- Only report that a shared file was created, added, updated, "
+        "renamed, written, or implemented after a successful create_file/"
+        "append_text/edit_section/rename_file/replace_text observation "
+        "naming /workspace/shared/.\n"
+        # Tie-break
+        "Tie-break for racing CLAIMs:\n"
+        "- If you observe a peer's CLAIM for the SAME "
+        "/workspace/shared/<path>#<scope> you just claimed, do not race. "
+        "Compare your AGENT_ID to the peer's sender_id character-by-"
+        "character: the lexicographically smaller AGENT_ID keeps the "
+        "claim. The other agent MUST post these two lines as its next "
+        "reply, in this order: first \"DEFER to @<peer-display-name>\", "
+        "then \"RELEASE /workspace/shared/<path>#<scope>\", and propose a "
+        "non-overlapping scope instead.\n"
+        "- Example: AGENT_ID \"alice\" < \"bob\", so alice keeps the same "
+        "scoped claim; bob defers and releases.\n"
+        "- After deferring, do not re-claim the same path in this session "
+        "unless the original claimant posts RELEASE first.\n"
+        # Project mgmt + closer
+        "Do not auto-allocate a private /workspace/<agent>/projectN/ path "
+        "on this hub — write to the shared project directory the runtime "
+        "named. Truthful-completion rule: never say 'Done', 'Implemented', "
+        "'Created', 'Wrote', or 'Saved' unless a successful create_file/"
+        "append_text/edit_section/replace_text/rename_file tool observation "
+        "for the target file was returned in this round. The operator can "
+        "switch the active project at any time with :project use <name> or "
+        ":project new."
+    )
+
+
 def _build_project_handler(
     project_state: _ProjectState,
-    agent_workspace: Path,
 ):
+    def _root() -> Path | None:
+        return project_state.root
+
     def handler(action: str, rest: list[str]) -> str:
         action = (action or "info").lower()
+        root = _root()
+        if root is None:
+            return "[project error] no project root configured"
         if action == "info":
             if project_state.active is None:
                 return "active=<none>"
             return f"active={project_state.active.name}"
         if action == "new":
-            nxt = next_project_dir(agent_workspace)
+            nxt = next_project_dir(root)
             if nxt is None:
                 return f"[project error] cap reached ({MAX_PROJECTS} projects)"
             project_state.active = nxt
             return f"active={nxt.name} (new)"
         if action == "use":
             if not rest:
-                return "usage: :project use <N>"
+                return "usage: :project use <N|name>"
+            raw = rest[0]
+            # Numeric form keeps the legacy projectN lookup; named form lets
+            # local-mode operators jump to a co-visible shared project.
             try:
-                n = int(rest[0])
+                n = int(raw)
             except ValueError:
-                return f"[project error] N must be an integer, got {rest[0]!r}"
+                named = named_project_dir(root, raw)
+                if named is None:
+                    return (
+                        f"[project error] invalid project name {raw!r} "
+                        "(allowed: A-Z a-z 0-9 _ -)"
+                    )
+                project_state.active = named
+                return f"active={named.name}"
             if n < 1 or n > MAX_PROJECTS:
                 return f"[project error] N must be 1..{MAX_PROJECTS}, got {n}"
-            target = agent_workspace / f"project{n}"
+            target = root / f"project{n}"
             if not target.is_dir():
                 return f"[project error] {target.name} does not exist"
             project_state.active = target
@@ -170,11 +327,10 @@ def _build_project_handler(
         if action == "list":
             entries = []
             for entry in sorted(
-                agent_workspace.iterdir() if agent_workspace.exists() else [],
+                root.iterdir() if root.exists() else [],
                 key=lambda p: p.name,
             ):
-                m = re.fullmatch(r"project(\d+)", entry.name)
-                if not entry.is_dir() or not m:
+                if not entry.is_dir():
                     continue
                 marker = "*" if (
                     project_state.active is not None
@@ -184,7 +340,7 @@ def _build_project_handler(
             if not entries:
                 return "[no projects]"
             return "\n".join(entries)
-        return "usage: :project [info|new|use <N>|list]"
+        return "usage: :project [info|new|use <N|name>|list]"
 
     return handler
 
@@ -216,6 +372,45 @@ def load_system_prompt(agent_id: str, display_name: str) -> str:
 
 def _log(store: SessionStore, kind: str, content: str) -> None:
     store.record("system", kind, content)
+
+
+def _render_no_project_prompt(
+    project_root: Path,
+    msg_id: str | None,
+    sender_id: str | None,
+) -> str:
+    """Multi-line `[project?]` block for the docker-attach reconnect flow.
+
+    Shown both at startup (when existing projects are found, no active project
+    is set yet) and on every skipped inbound. Lists existing `projectN`
+    directories and the three ways to move forward — so a late `docker attach`
+    sees the same instructions regardless of when the operator joined.
+    """
+    existing: list[str] = []
+    if project_root.exists():
+        existing = sorted(
+            (
+                e.name
+                for e in project_root.iterdir()
+                if e.is_dir() and re.fullmatch(r"project\d+", e.name)
+            ),
+            key=lambda n: int(n[len("project"):]),
+        )
+    if msg_id is not None and sender_id is not None:
+        header = (
+            f"[project?] no active project — inbound msg {msg_id} from "
+            f"{sender_id} skipped."
+        )
+    else:
+        header = "[project?] no active project."
+    return colors.dim(
+        header
+        + "\n[project?] existing: "
+        + (", ".join(existing) if existing else "(none)")
+        + "\n[project?] type `:project new` for a fresh project, "
+        "`:project use <N>` to reconnect, or include `PROJECT: <name>` "
+        "in the next broadcast to auto-start."
+    )
 
 
 def _claimed_targets(text: str) -> set[str]:
@@ -393,16 +588,19 @@ def run_group_chat(
 
     project_state = _ProjectState()
     project_handler = None
-    if runpod:
-        ws_env = os.environ.get("AGENT_WORKSPACE")
-        if ws_env:
-            agent_workspace = Path(ws_env)
-            agent_workspace.mkdir(parents=True, exist_ok=True)
-            project_handler = _build_project_handler(project_state, agent_workspace)
-            most_recent = most_recent_project_dir(agent_workspace)
+    ws_env = os.environ.get("AGENT_WORKSPACE")
+    agent_workspace = Path(ws_env) if ws_env else None
+    project_root, is_shared = _project_root(mode, agent_workspace)
+    if project_root is not None:
+        project_root.mkdir(parents=True, exist_ok=True)
+        project_state.root = project_root
+        project_state.is_shared = is_shared
+        project_handler = _build_project_handler(project_state)
+        if runpod:
+            most_recent = most_recent_project_dir(project_root)
             if most_recent is None:
-                # First boot in this workspace — no choice to make.
-                initial = next_project_dir(agent_workspace)
+                # First boot in this private workspace — no choice to make.
+                initial = next_project_dir(project_root)
                 project_state.active = initial
                 active_name = initial.name if initial is not None else "<none>"
                 print(
@@ -414,23 +612,20 @@ def run_group_chat(
                 )
             else:
                 # Existing projects found — defer to operator so reconnect is explicit.
-                existing_names = ", ".join(
-                    sorted(
-                        (
-                            e.name for e in agent_workspace.iterdir()
-                            if e.is_dir() and re.fullmatch(r"project\d+", e.name)
-                        ),
-                        key=lambda n: int(n[len("project"):]),
-                    )
-                )
-                print(
-                    colors.dim(
-                        f"[project] existing: {existing_names} — no active project. "
-                        "Type :project new to start fresh, or :project use N to "
-                        "reconnect. Inbound messages are skipped until you choose."
-                    ),
-                    flush=True,
-                )
+                # Render via the same prompt the skip-path uses so a late
+                # `docker attach` sees a consistent message.
+                print(_render_no_project_prompt(project_root, None, None), flush=True)
+        else:
+            # Local-hub shared mode: defer allocation. The first inbound message
+            # that names /workspace/shared/<name>/ or includes a PROJECT: line
+            # sets the active project lazily; operator can also use :project.
+            print(
+                colors.dim(
+                    f"[project] shared root={project_root} — active project will be set "
+                    "from an inbound /workspace/shared/<name>/ path or PROJECT: directive."
+                ),
+                flush=True,
+            )
 
     if console is None:
         console = ConsoleControl(
@@ -453,6 +648,7 @@ def run_group_chat(
         _env_float("PENDING_FOLLOWUP_SECONDS", DEFAULT_PENDING_FOLLOWUP_SECONDS),
     )
     pending_followup: PendingFollowup | None = None
+    intro_sent: bool = False
     _log(
         store,
         "session_start",
@@ -472,6 +668,16 @@ def run_group_chat(
         tag = colors.dim(f"[hub{arrow}]")
         print(f"{colors.ts()} {tag} {colors.agent_label(sender)}: {snippet}", flush=True)
 
+    def _print_no_project_prompt(message: PeerMessage) -> None:
+        if project_state.root is None:
+            return
+        print(
+            _render_no_project_prompt(
+                project_state.root, message.id, message.sender_id
+            ),
+            flush=True,
+        )
+
     def _peer_console_log(kind: str, detail: str) -> None:
         """Live-attach trace of LLM/tool/refusal events. Runpod mode only."""
         if not runpod:
@@ -479,8 +685,36 @@ def run_group_chat(
         print(f"{colors.ts()} {colors.dim(f'[{kind}]')} {detail}", flush=True)
 
     def _send_answer(answer: str, msg_id: str) -> None:
-        nonlocal pending_followup
+        nonlocal pending_followup, intro_sent
+        is_intro = bool(INTRO_LINE_PATTERN.match(answer or ""))
+        if is_intro and intro_sent:
+            # Defense-in-depth for the system prompt's "post intro at most once"
+            # rule: if the model regresses and posts another intro after a peer
+            # broadcast, drop it on the floor instead of sending duplicates to
+            # the hub. The send-attempt is still counted against the
+            # broadcast-reply window so the next broadcast doesn't get a free
+            # turn.
+            _log(store, "intro_suppressed", f"msg_id={msg_id}")
+            recent_replies.append((time.time(), msg_id))
+            if len(recent_replies) > 64:
+                del recent_replies[:-64]
+            pending_followup = None
+            budget.save()
+            return
+        if not is_intro and looks_like_empty_acknowledgment(answer):
+            # Reply-discipline runtime gate: "Okej, jag förstår... Jag avvaktar"
+            # carries no peer-unique value, so spend nothing on it. Counted
+            # against the broadcast window for the same reason.
+            _log(store, "acknowledgment_suppressed", f"msg_id={msg_id}")
+            recent_replies.append((time.time(), msg_id))
+            if len(recent_replies) > 64:
+                del recent_replies[:-64]
+            pending_followup = None
+            budget.save()
+            return
         transport.send(answer)
+        if is_intro:
+            intro_sent = True
         if not runpod:
             _hub_echo("->", display_name, answer)
         recent_context.append(_context_entry(display_name, answer, msg_id))
@@ -564,12 +798,26 @@ def run_group_chat(
         )
         if guidance:
             runtime_guidance.append(guidance)
-        if runpod and project_state.active is not None:
+        guidance = proactive_assignment_guidance(
+            message.text,
+            agent_id=agent_id,
+            display_name=display_name,
+            recent_context=prior_context or [],
+            has_open_claim=bool(unsatisfied),
+        )
+        if guidance:
+            runtime_guidance.append(guidance)
+        if project_state.active is not None:
             if code_guidance:
                 runtime_guidance.append(code_guidance)
-            runtime_guidance.append(
-                _remote_workspace_guidance(agent_id, project_state.active.name)
-            )
+            if runpod:
+                runtime_guidance.append(
+                    _remote_workspace_guidance(agent_id, project_state.active.name)
+                )
+            else:
+                runtime_guidance.append(
+                    _local_workspace_guidance(agent_id, project_state.active)
+                )
         try:
             return run_peer_task(
                 message,
@@ -618,6 +866,33 @@ def run_group_chat(
                 ),
             )
 
+    def _peer_claim_blocking_save(message: PeerMessage) -> str | None:
+        """Return the first candidate path a peer holds an active CLAIM on.
+
+        Only meaningful in shared-workspace mode: auto-saving peer code into
+        ``/workspace/shared/<project>/`` while another agent has the same
+        file claimed would overwrite their in-flight work. In private/remote
+        mode the auto-save target is per-agent isolated, so we never block.
+
+        The candidate compared against the claim registry is the canonical
+        ``/workspace/shared/<project>/<filename>`` agent-facing path, because
+        that is the form peers actually emit in CLAIM lines. The on-disk
+        location (a tmpdir under tests, ``/workspace/shared`` in docker) is
+        irrelevant for the gate check.
+        """
+        if not project_state.is_shared or project_state.active is None:
+            return None
+        blocks = extract_code_blocks(message.text or "")
+        if not blocks:
+            return None
+        project_name = project_state.active.name
+        for block in blocks:
+            candidate = f"/workspace/shared/{project_name}/{block.filename}"
+            conflicting = claims.is_claimed_by_other(candidate, agent_id)
+            if conflicting is not None:
+                return candidate
+        return None
+
     def _process_message(message: PeerMessage, *, allow_claim_continuation: bool = True) -> None:
         nonlocal pending_followup
         if not runpod:
@@ -625,6 +900,72 @@ def run_group_chat(
 
         prior_context = _remember_inbound(message)
 
+        # Local shared mode: lazily set the active project from a `PROJECT:`
+        # directive or the first `/workspace/shared/<name>/...` path in the
+        # inbound. A new name in a later message switches the active project.
+        if project_state.is_shared and project_state.root is not None:
+            inferred_name: str | None = None
+            directive_name = parse_project_directive(message.text)
+            if directive_name:
+                inferred_name = directive_name
+            else:
+                path_match = SHARED_PATH_PATTERN.search(message.text or "")
+                if path_match:
+                    inferred_name = project_name_from_shared_path(
+                        path_match.group("path")
+                    )
+            if inferred_name:
+                current_name = (
+                    project_state.active.name if project_state.active is not None else None
+                )
+                if current_name != inferred_name.strip().lower():
+                    new_dir = named_project_dir(project_state.root, inferred_name)
+                    if new_dir is not None:
+                        project_state.active = new_dir
+                        _log(
+                            store,
+                            "project_set_from_inbound",
+                            f"name={new_dir.name} msg_id={message.id} sender={message.sender_id}",
+                        )
+
+        # Remote mode: auto-allocate the next numeric project on an explicit
+        # `PROJECT: <name>` directive. The directive name itself is logged but
+        # the dir keeps the numeric `projectN` form (remote workspaces are
+        # private, so project names don't need to match across agents). Plain
+        # @-mentions or path-only mentions still fall through to the skip path
+        # below — that's the reconnect-safety brake against stale broadcasts.
+        if (
+            runpod
+            and project_state.active is None
+            and project_state.root is not None
+        ):
+            directive_name = parse_project_directive(message.text or "")
+            if directive_name:
+                new_dir = next_project_dir(project_state.root)
+                if new_dir is not None:
+                    project_state.active = new_dir
+                    _log(
+                        store,
+                        "project_auto_allocated",
+                        (
+                            f"name={new_dir.name} reason=directive "
+                            f"directive_name={directive_name} msg_id={message.id}"
+                        ),
+                    )
+                    print(
+                        colors.dim(
+                            f"[project] auto-allocated active={new_dir.name} "
+                            f"from PROJECT: {directive_name}"
+                        ),
+                        flush=True,
+                    )
+
+        # Runpod mode requires an explicit active project before any inbound
+        # is processed (each agent has its own private workspace and the
+        # operator must :project new / :project use N to opt in). Local
+        # shared mode is permissive: writes still go through the CLAIM gate
+        # under /workspace/shared/ even without an "active project" subfolder,
+        # so we only skip when runpod genuinely has nothing to write to.
         if runpod and project_state.active is None:
             _absorb_inbound_claims(message)
             _log(
@@ -632,10 +973,7 @@ def run_group_chat(
                 "reply_decision",
                 f"respond=False reason=no_active_project msg_id={message.id} sender={message.sender_id}",
             )
-            print(
-                f"{colors.ts()} {colors.dim('[skip] no active project — :project new or :project use N to choose')}",
-                flush=True,
-            )
+            _print_no_project_prompt(message)
             return
 
         # Save peer-shared code blocks to the active project even when the
@@ -643,16 +981,34 @@ def run_group_chat(
         # (e.g. peers posting `hangman.py` without addressing this agent)
         # never land on disk and we can't read_file them later.
         code_guidance: str | None = None
-        if runpod and project_state.active is not None:
-            code_guidance = process_shared_code(
-                message.text, agent_id, project_state.active
-            )
-            if code_guidance:
+        if project_state.active is not None:
+            block_path: str | None = _peer_claim_blocking_save(message)
+            if block_path is not None:
                 _log(
                     store,
-                    "code_saved_on_arrival",
-                    f"msg_id={message.id} sender={message.sender_id}",
+                    "code_save_skipped_claim_conflict",
+                    f"path={block_path} msg_id={message.id} sender={message.sender_id}",
                 )
+                code_guidance = (
+                    "A peer message contained a code block for a file currently "
+                    f"covered by another agent's active CLAIM ({block_path}). The "
+                    "runtime did not auto-save it. read_file the path the peer "
+                    "names; do not overwrite their in-flight work."
+                )
+            else:
+                code_guidance = process_shared_code(
+                    message.text,
+                    agent_id,
+                    project_state.active,
+                    auto_pytest=not project_state.is_shared,
+                    shared_root=project_state.root if project_state.is_shared else None,
+                )
+                if code_guidance:
+                    _log(
+                        store,
+                        "code_saved_on_arrival",
+                        f"msg_id={message.id} sender={message.sender_id}",
+                    )
 
         now = time.time()
         followup_kind = _followup_reply_kind(message.text)

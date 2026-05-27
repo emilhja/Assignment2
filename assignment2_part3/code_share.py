@@ -31,6 +31,8 @@ from typing import List, Optional, Tuple
 MAX_PROJECTS = 100
 PYTEST_TIMEOUT_SECONDS = 30.0
 PYTEST_OUTPUT_CHAR_CAP = 4000
+PROJECT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_PROJECT_DIR_RACE_RETRIES = 5
 
 # Language hint (after the opening ```) → file extension.
 _LANG_EXTENSIONS = {
@@ -173,14 +175,46 @@ def next_project_dir(
     """Return a freshly-created ``projectN`` dir, or None if cap reached.
 
     Allocation is max-plus-one (does not fill gaps), so ``project1`` and
-    ``project3`` existing means the next call returns ``project4``.
+    ``project3`` existing means the next call returns ``project4``. Two
+    processes sharing the same workspace (local-hub shared root) may both
+    compute the same ``next_n`` and race; the loser retries up to
+    ``_PROJECT_DIR_RACE_RETRIES`` times before giving up.
     """
-    indices = _existing_project_indices(agent_workspace)
-    next_n = (max(indices) + 1) if indices else 1
-    if next_n > max_projects:
+    for _ in range(_PROJECT_DIR_RACE_RETRIES):
+        indices = _existing_project_indices(agent_workspace)
+        next_n = (max(indices) + 1) if indices else 1
+        if next_n > max_projects:
+            return None
+        project_dir = agent_workspace / f"project{next_n}"
+        try:
+            project_dir.mkdir(parents=True, exist_ok=False)
+            return project_dir
+        except FileExistsError:
+            continue
+    return None
+
+
+def named_project_dir(root: Path, name: str) -> Optional[Path]:
+    """Return ``root/<sanitized name>``, creating it idempotently.
+
+    The name is lower-cased, trimmed, and validated against
+    ``PROJECT_NAME_PATTERN`` (alnum + ``-_`` only). Names containing path
+    separators, ``..``, or that would resolve outside ``root`` are rejected
+    with ``None``. ``mkdir`` uses ``exist_ok=True`` so two agents calling
+    this with the same name converge on one shared directory.
+    """
+    if not isinstance(name, str):
         return None
-    project_dir = agent_workspace / f"project{next_n}"
-    project_dir.mkdir(parents=True, exist_ok=False)
+    cleaned = name.strip().lower()
+    if not cleaned or not PROJECT_NAME_PATTERN.fullmatch(cleaned):
+        return None
+    project_dir = root / cleaned
+    try:
+        resolved = project_dir.resolve()
+        resolved.relative_to(root.resolve())
+    except (ValueError, OSError):
+        return None
+    project_dir.mkdir(parents=True, exist_ok=True)
     return project_dir
 
 
@@ -281,6 +315,9 @@ def process_shared_code(
     message_text: str,
     agent_id: str,
     active_project: Path,
+    *,
+    auto_pytest: bool = True,
+    shared_root: Optional[Path] = None,
 ) -> Optional[str]:
     """Extract code from a peer message and save it into ``active_project``.
 
@@ -289,6 +326,17 @@ def process_shared_code(
     single string suitable for ``runtime_guidance.append(...)``. The
     caller (``group_chat``) owns project allocation — this function never
     creates or switches project dirs.
+
+    When ``auto_pytest`` is False the runtime will not spawn pytest on the
+    saved files; the caller is expected to require an explicit ``run_tests``
+    tool call instead. Local docker-compose mode passes ``auto_pytest=False``
+    because shared dirs are co-writeable and a peer could modify the file
+    between save and pytest (TOCTOU).
+
+    ``shared_root`` indicates that ``active_project`` lives under a
+    co-visible shared root (``/workspace/shared``); when set, the guidance
+    reports the path as ``/workspace/shared/<project>/<file>`` rather than
+    as the per-agent private path.
     """
     blocks = extract_code_blocks(message_text)
     if not blocks:
@@ -297,17 +345,28 @@ def process_shared_code(
     if not written:
         return None
     project_name = active_project.name
-    saved_lines = [
-        f"- {_agent_facing_path(agent_id, project_name, p.name)}" for p in written
-    ]
-    ran, output = maybe_run_pytest(active_project)
-    if ran:
-        pytest_line = f"Auto-pytest: ran. Result:\n{output}"
+    if shared_root is not None:
+        saved_lines = [
+            f"- /workspace/shared/{project_name}/{p.name}" for p in written
+        ]
+        location = f"/workspace/shared/{project_name}/"
     else:
-        pytest_line = "Auto-pytest: not run (no test_*.py files)."
+        saved_lines = [
+            f"- {_agent_facing_path(agent_id, project_name, p.name)}" for p in written
+        ]
+        location = f"/workspace/{agent_id}/{project_name}/"
+    if auto_pytest:
+        ran, output = maybe_run_pytest(active_project)
+        if ran:
+            pytest_line = f"Auto-pytest: ran. Result:\n{output}"
+        else:
+            pytest_line = "Auto-pytest: not run (no test_*.py files)."
+    else:
+        pytest_line = (
+            "Auto-pytest: skipped (call run_tests on the saved test file to verify)."
+        )
     return (
-        f"A peer message contained code. The runtime saved it to "
-        f"/workspace/{agent_id}/{project_name}/:\n"
+        f"A peer message contained code. The runtime saved it to {location}:\n"
         + "\n".join(saved_lines)
         + f"\n{pytest_line}\n"
         "You may read_file these paths, propose changes, or discuss in chat. "

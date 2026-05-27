@@ -112,9 +112,9 @@ Run the tests in Docker:
 docker compose run --rm agent python -m pytest
 ```
 
-The Compose setup loads `.env`, runs the app from `/app`, and mounts only
-`./workspace` into the container at `/workspace`. Ask the agent to use
-`/workspace` when you want commands to operate on mounted files.
+The Compose setup loads `.env`, keeps the app code in `/app`, starts the
+agent process in `/workspace`, and mounts `./workspace` there. Plain commands
+such as `ls` therefore operate on the workspace by default.
 
 ## Test
 

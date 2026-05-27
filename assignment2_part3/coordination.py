@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Iterable
 
 from claims import CLAIM_PATTERN, split_claim_target
+from task_status import parse_task_status
 
 
 SHARED_PATH_PATTERN = re.compile(
@@ -24,7 +26,11 @@ TAKEOVER_PATTERN = re.compile(
     r"(?i)\b(?:take\s+over|handoff|hand\s+off)\b(?:\s+from\s+@?(?P<peer>[A-Za-z0-9_.-]+))?"
 )
 SIGNATURE_AGREEMENT_PATTERN = re.compile(
-    r"(?i)\bagree\s+on\s+(?:the\s+)?function\s+signatures?\b"
+    r"(?i)\b(?:agree|agreement|state\s+agreement|propose|confirm)\s+"
+    r"(?:on\s+)?(?:the\s+)?(?:function\s+)?signatures?\b"
+)
+PROJECT_DIRECTIVE_PATTERN = re.compile(
+    r"(?im)^\s*PROJECT:\s*(?P<name>[A-Za-z0-9_\-]+)\s*$"
 )
 PYTEST_REQUEST_PATTERN = re.compile(r"(?i)\b(?:pytest|tests?)\b")
 PYTEST_FIX_PATTERN = re.compile(r"(?i)\b(?:fix|repair|update|debug)\b.*\b(?:pytest|tests?)\b")
@@ -95,6 +101,44 @@ def _assignments_from_pattern(pattern: re.Pattern[str], text: str) -> list[Assig
             continue
         assignments.append(Assignment(agent=agent, task=task, scope=_scope_from_task(task)))
     return assignments
+
+
+def parse_project_directive(text: str) -> str | None:
+    """Return the project name from a ``PROJECT: <name>`` line in ``text``.
+
+    Returns the first match's name as-typed (case preserved); the caller is
+    responsible for the case-folding/sanitization done inside
+    ``code_share.named_project_dir``. Returns ``None`` for non-strings,
+    empty input, or when no directive line is present.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    match = PROJECT_DIRECTIVE_PATTERN.search(text)
+    if match is None:
+        return None
+    name = match.group("name").strip()
+    return name or None
+
+
+def project_name_from_shared_path(path: str) -> str | None:
+    """Return the first directory segment under ``/workspace/shared/``, or None.
+
+    Returns ``None`` when the path is a file directly under ``/workspace/shared/``
+    (no project subfolder), e.g. ``/workspace/shared/calculator.py``. In that
+    case the runtime leaves the active project untouched — writes still happen
+    under ``/workspace/shared/`` as usual.
+    """
+
+    if not isinstance(path, str):
+        return None
+    prefix = "/workspace/shared/"
+    if not path.startswith(prefix):
+        return None
+    remainder = path[len(prefix):]
+    if not remainder or "/" not in remainder:
+        return None
+    first = remainder.split("/", 1)[0].strip()
+    return first or None
 
 
 def parse_coordination_plan(text: str) -> CoordinationPlan | None:
@@ -488,6 +532,84 @@ def fix_blockers_guidance(
         "run_tests. Your final answer must report either green tests with the "
         "change you made, or — if still red — the exact error from this turn's "
         "run_tests observation and the next concrete step."
+    )
+
+
+PROACTIVE_WRITE_VERB_PATTERN = re.compile(
+    r"(?i)\b("
+    r"create|build|implement|write|add|skapa|bygg(?:er|a)?|"
+    r"implementera|skriv(?:a)?|lägg\s+till|distribute\s+roles|"
+    r"share\s+code|collaborate"
+    r")\b"
+)
+
+
+def _agent_already_engaged(
+    agent_id: str,
+    display_name: str,
+    recent_context: Iterable[dict[str, str]],
+) -> bool:
+    """Return True if the agent already CLAIMed or accepted a task recently."""
+
+    aliases = _agent_aliases(agent_id, display_name)
+    for entry in recent_context or []:
+        sender = str(entry.get("sender_id") or "").lower()
+        if sender not in aliases and sender != display_name.lower():
+            continue
+        text = str(entry.get("text") or "")
+        if CLAIM_PATTERN.search(text):
+            return True
+        status = parse_task_status(text)
+        if status is not None and status.kind in {"taking", "accepted", "done"}:
+            return True
+    return False
+
+
+def proactive_assignment_guidance(
+    text: str,
+    *,
+    agent_id: str,
+    display_name: str,
+    recent_context: list[dict[str, str]] | None = None,
+    has_open_claim: bool = False,
+) -> str | None:
+    """Nudge a SWE-role agent to volunteer for an unclaimed sub-task.
+
+    Gated by `AGENT_PROACTIVE_SUBTASKS=1` because the system prompt's reply
+    discipline ("let peers reply first") is intentionally cautious — turning
+    this on trades that caution for a more active SWE agent in collaborative
+    sessions. The hint only fires when:
+
+      * the gate env var is set,
+      * the broadcast contains a write/build verb (creating, implementing, …),
+      * the agent has no active claim and has not recently posted a
+        `Jag tar mig an:` / `Confirmed, I'll take:` style acceptance,
+      * the message is not personally addressed (those already trigger the
+        stricter assignment_guidance / followup_assignment_guidance helpers).
+
+    Returns a single guidance string the runtime injects before the LLM call.
+    """
+
+    if os.environ.get("AGENT_PROACTIVE_SUBTASKS", "0") != "1":
+        return None
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if has_open_claim:
+        return None
+    if _mentions_current_agent(text, agent_id, display_name):
+        return None
+    if PROACTIVE_WRITE_VERB_PATTERN.search(text) is None:
+        return None
+    if _agent_already_engaged(agent_id, display_name, recent_context or []):
+        return None
+    return (
+        "Proactivity hint: a multi-agent write task is in progress and you "
+        "have not claimed a sub-task yet. If an unclaimed sub-task is "
+        "visible, volunteer with one short line — `Jag tar mig an: <task>` "
+        "or `I'm taking on: <task>` for remote-hub mode, or "
+        "`CLAIM /workspace/shared/<path>#<scope>: <reason>` for the local "
+        "hub — then make the actual write tool call. Do not post an empty "
+        "acknowledgment; either commit to a slice or stay silent."
     )
 
 

@@ -2,8 +2,8 @@
 
 T1
 docker compose --profile local up -d
-rebuilding agents
-docker compose --profile local up -d --build agent-alice agent-bob
+
+docker compose --profile local up -d --build agent-alice agent-bob local-hub
 docker compose --profile local logs -f
 
 T2
@@ -13,7 +13,7 @@ T3
 docker attach assignment2_part3-agent-bob-1
 
 T4
-python tools/chat.py say --as emil-user "@bob-swe @alice-swe build a calculator in /workspace/shared/calculator.py.First, each state agreement on signatures: add(a, b), subtract(a, b), multiply(a, b), divide(a, b).Then split work: alice owns add/subtract, bob owns multiply/divide.Each emit a CLAIM with the function names in the scope, e.g. #add-subtract and #multiply-divide.Write pytest tests next to it."
+python tools/chat.py say --as emil-user "@bob-swe @alice-swe build a calculator in /workspace/shared/calculator.py.First, each state agreement on signatures: add(a, b), subtract(a, b), multiply(a, b), divide(a, b).Then split work: alice owns add/subtract, bob owns multiply/divide.Each emit a CLAIM with the function names in the scope, e.g. #add-subtract and #multiply-divide.Write pytest to the same folder."
 python tools/chat.py live --as emil-user
 
 ## Quick reference — single bot to remote RunPod hub

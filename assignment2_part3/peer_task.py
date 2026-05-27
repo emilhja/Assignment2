@@ -841,7 +841,7 @@ def run_peer_task(
                     "pytest_skipped_due_to_impl_failure",
                     _json({"impl_target": target or "", "test_target": test_target}),
                 )
-            scrubbed, _hits = scrub_outbound(fallback)
+            scrubbed, _hits = scrub_outbound(fallback, agent_id=self_id)
             _log("assistant", "peer_reply_raw", fallback)
             return scrubbed
         continuation_reprompt_counts[kind] = count + 1
@@ -950,7 +950,7 @@ def run_peer_task(
                     "I had to stop: the model returned empty replies repeatedly. "
                     "Try again, shorten the request, or raise LLM_MAX_TOKENS."
                 )
-                scrubbed, _ = scrub_outbound(fallback)
+                scrubbed, _ = scrub_outbound(fallback, agent_id=self_id)
                 _log("assistant", "peer_reply_raw", fallback)
                 return scrubbed
             # Don't pollute history with the empty turn; just re-prompt.
@@ -972,7 +972,7 @@ def run_peer_task(
                 current_target = _claim_continuation_target(message)
                 claimed_targets = _claim_targets_from_text(answer)
                 if current_target is not None and claimed_targets - {current_target}:
-                    scrubbed, hits = scrub_outbound(answer)
+                    scrubbed, hits = scrub_outbound(answer, agent_id=self_id)
                     _log("assistant", "peer_reply_raw", answer)
                     if hits:
                         _log("assistant", "peer_reply_scrubbed", _json({"hits": hits, "text": scrubbed}))
@@ -1208,7 +1208,7 @@ def run_peer_task(
                 if stopped is not None:
                     return stopped
                 continue
-            scrubbed, hits = scrub_outbound(answer)
+            scrubbed, hits = scrub_outbound(answer, agent_id=self_id)
             _log("assistant", "peer_reply_raw", answer)
             if hits:
                 _log("assistant", "peer_reply_scrubbed", _json({"hits": hits, "text": scrubbed}))
@@ -1361,6 +1361,6 @@ def run_peer_task(
             messages.append({"role": "user", "content": guidance})
 
     fallback = "I could not complete this within my step budget. Please rephrase or split the task."
-    scrubbed, _ = scrub_outbound(fallback)
+    scrubbed, _ = scrub_outbound(fallback, agent_id=self_id)
     _log("assistant", "peer_reply_raw", fallback)
     return scrubbed

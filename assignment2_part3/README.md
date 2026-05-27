@@ -282,6 +282,30 @@ runs. To switch back, `docker compose --profile remote down` then
 
 ---
 
+## Agent identity: local vs remote
+
+`AGENT_ID` and `AGENT_DISPLAY_NAME` in `.env` behave differently depending on
+which Compose profile is active. This is intentional — the local demo always
+runs two named agents, while the remote profile runs one bot under your
+chosen identity.
+
+| Profile | Service(s) | Identity source |
+|---|---|---|
+| `local` | `agent-alice`, `agent-bob` | **Hardcoded** in `docker-compose.yml`: `alice` / `alice-swe` and `bob` / `bob-swe`. The `AGENT_ID` / `AGENT_DISPLAY_NAME` values in `.env` are ignored for these two services. |
+| `remote` | `agent-remote` | **Read from `.env`** at startup. Compose refuses to start the service if either is unset. `AGENT_ALIASES` is also forwarded (only) here. |
+
+Practical consequence: if you set `AGENT_ID=emil-hjaertfors-agent` in `.env`,
+that name **only** takes effect when you run `docker compose --profile remote
+up agent-remote`. Running `docker compose --profile local up` still gives you
+two agents called `alice` and `bob`.
+
+Workspaces and SQLite logs follow `AGENT_ID`: `workspace/<AGENT_ID>/` and
+`data/<AGENT_ID>.sqlite3`. So `agent-remote` writes to
+`workspace/emil-hjaertfors-agent/` and `data/emil-hjaertfors-agent.sqlite3`,
+while alice and bob always write to their fixed paths.
+
+---
+
 ## Operator console commands
 
 While the agent is running, the local console accepts one-line commands
@@ -363,8 +387,9 @@ persistent limit change. `:deny` or a timeout preserves the normal
 
 | Var | Default | Purpose |
 |---|---|---|
-| `AGENT_ID` | `local` | Unique short id (also names the workspace subdir). |
-| `AGENT_DISPLAY_NAME` | `<id>-swe` | Human-readable agent name in chat. Format `yourname-rolename`. |
+| `AGENT_ID` | `local` | Unique short id (also names the workspace subdir). Ignored by `agent-alice` / `agent-bob` (hardcoded to `alice` / `bob` in compose); read from `.env` only by `agent-remote`. |
+| `AGENT_DISPLAY_NAME` | `<id>-swe` | Human-readable agent name in chat. Format `yourname-rolename`. Same override rule as `AGENT_ID`: hardcoded to `alice-swe` / `bob-swe` for the local profile; from `.env` for the remote profile. |
+| `AGENT_ALIASES` | *(empty)* | Comma-separated extra handles the remote agent should also reply to (matched like `AGENT_DISPLAY_NAME`). Only forwarded by `agent-remote`. |
 | `AGENT_MODE` | `stub` | `stub` reads stdin/stdout; `runpod` uses `RunPodTransport`. |
 | `AGENT_TPM_LIMIT` | `100000` | Tokens per minute. Generous local-LLM/paid-provider default. |
 | `AGENT_RPM_LIMIT` | `30` | Requests per minute. |
