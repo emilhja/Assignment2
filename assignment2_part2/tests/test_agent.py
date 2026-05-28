@@ -260,6 +260,51 @@ def test_successful_create_file_runs_post_edit_tests_before_final(monkeypatch, c
     assert responses == []
 
 
+def test_successful_append_text_runs_post_edit_tests_before_final(monkeypatch, capsys, tmp_path):
+    _set_session_db(monkeypatch, tmp_path)
+    post_edit_tests = []
+    messages_seen = []
+    responses = [
+        json.dumps(
+            {
+                "type": "tool_call",
+                "tool": "append_text",
+                "args": {
+                    "path": "/workspace/hello.txt",
+                    "content": "\nextra",
+                },
+                "reason": "append to the file",
+            }
+        ),
+        json.dumps({"type": "final", "answer": "Appended text."}),
+    ]
+
+    def fake_complete_chat(messages):
+        messages_seen.append([message.copy() for message in messages])
+        return responses.pop(0)
+
+    def fake_run_tool(tool, _args):
+        assert tool == "append_text"
+        return "Appended text to /workspace/hello.txt."
+
+    def fake_post_edit_tests():
+        post_edit_tests.append(agent.POST_EDIT_TEST_COMMAND)
+        return "78 passed in 1.0s"
+
+    monkeypatch.setattr(agent, "complete_chat", fake_complete_chat)
+    monkeypatch.setattr(agent, "run_tool", fake_run_tool)
+    monkeypatch.setattr(agent, "_run_post_edit_tests", fake_post_edit_tests)
+
+    answer = agent.run_task("Append text to /workspace/hello.txt")
+
+    output = capsys.readouterr().out
+    assert answer == "Appended text."
+    assert "Final answer:\nAppended text." in output
+    assert post_edit_tests == [agent.POST_EDIT_TEST_COMMAND]
+    assert "78 passed in 1.0s" in messages_seen[-1][-1]["content"]
+    assert responses == []
+
+
 def test_create_and_execute_request_does_not_claim_script_ran(monkeypatch, capsys, tmp_path):
     _set_session_db(monkeypatch, tmp_path)
     messages_seen = []

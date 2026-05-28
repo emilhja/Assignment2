@@ -25,9 +25,15 @@ import part2_bridge  # noqa: F401 — sys.path side effect; needed before Part 2
 
 from llm_client import complete_chat_with_metadata
 from parser import parse_response
+from runtime_helpers import (
+    json_dump,
+    tool_observation_message,
+    truncate_observation,
+    workspace_mutation_tools,
+)
 from safety import safety_check
 from session_store import SessionStore
-from tools import MAX_OUTPUT_CHARS, TOOL_REGISTRY, _resolve_workspace_path, run_tool
+from tools import TOOL_REGISTRY, _resolve_workspace_path, run_tool
 
 from budget import Budget, BudgetExceeded, estimate_tokens
 from claims import CLAIM_PATTERN, DEFER_PATTERN, RELEASE_PATTERN, ClaimRegistry, split_claim_target
@@ -46,7 +52,7 @@ MAX_CONTINUATION_REPROMPTS_PER_REASON = 2
 MAX_CONTEXT_MESSAGES = 24
 MAX_CONTEXT_CHARS = 2000
 
-CLAIM_GATED_TOOLS = {"create_file", "append_text", "edit_section", "rename_file", "replace_text"}
+CLAIM_GATED_TOOLS = workspace_mutation_tools()
 SHARED_PATH_PREFIX = "/workspace/shared/"
 _AUTO_APPROVAL_CONTROL_CHARS = re.compile(r"[;&|]|\r|\n")
 
@@ -58,13 +64,11 @@ NO_PROJECT_REFUSAL = (
 
 
 def _json(payload: dict) -> str:
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return json_dump(payload)
 
 
 def _truncate(text: str) -> str:
-    if len(text) <= MAX_OUTPUT_CHARS:
-        return text
-    return text[:MAX_OUTPUT_CHARS] + "\n... [output truncated]"
+    return truncate_observation(text)
 
 
 def _peer_user_envelope(message: PeerMessage) -> str:
@@ -81,7 +85,7 @@ def _peer_user_envelope(message: PeerMessage) -> str:
 
 
 def _tool_observation_message(tool: str, observation: str) -> str:
-    return _json({"type": "tool_observation", "tool": tool, "observation": observation})
+    return tool_observation_message(tool, observation)
 
 
 def _tool_arg_summary(tool: str, args: dict) -> str:

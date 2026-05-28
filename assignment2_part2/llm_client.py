@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from openai import OpenAI, RateLimitError
 
 import colors
+from tools import TOOL_REGISTRY
 
 
 DEFAULT_PROVIDER_ORDER = "groq,openrouter"
@@ -136,7 +137,7 @@ PROVIDERS = {
 
 
 JSON_RESPONSE_FORMAT = {"type": "json_object"}
-TOOL_NAMES = {"bash", "create_file", "edit_section", "rename_file", "replace_text"}
+TOOL_NAMES = frozenset(TOOL_REGISTRY)
 
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))

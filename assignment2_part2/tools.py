@@ -510,6 +510,9 @@ class ToolSpec:
     description: str
     required_args: tuple[str, ...]
     handler: object
+    mutates_workspace: bool = False
+    requires_approval: bool = False
+    success_prefixes: tuple[str, ...] = ()
 
 
 TOOL_REGISTRY = {
@@ -518,12 +521,15 @@ TOOL_REGISTRY = {
         description="Run one safe local Bash command after safety checks and manual approval.",
         required_args=("command",),
         handler=lambda args: run_bash(args["command"]),
+        requires_approval=True,
     ),
     "edit_section": ToolSpec(
         name="edit_section",
         description="Replace one exact whole-line section in one workspace file.",
         required_args=("path", "old_text", "new_text"),
         handler=lambda args: edit_section(args["path"], args["old_text"], args["new_text"]),
+        mutates_workspace=True,
+        success_prefixes=("Edited one section",),
     ),
     "read_file": ToolSpec(
         name="read_file",
@@ -540,12 +546,16 @@ TOOL_REGISTRY = {
             args["content"],
             args.get("overwrite", False),
         ),
+        mutates_workspace=True,
+        success_prefixes=("Created file", "Overwrote file"),
     ),
     "append_text": ToolSpec(
         name="append_text",
         description="Append text to an existing workspace file.",
         required_args=("path", "content"),
         handler=lambda args: append_text(args["path"], args["content"]),
+        mutates_workspace=True,
+        success_prefixes=("Appended text",),
     ),
     "rename_file": ToolSpec(
         name="rename_file",
@@ -556,6 +566,8 @@ TOOL_REGISTRY = {
             args["target_path"],
             args.get("overwrite", False),
         ),
+        mutates_workspace=True,
+        success_prefixes=("Renamed file",),
     ),
     "replace_text": ToolSpec(
         name="replace_text",
@@ -567,6 +579,8 @@ TOOL_REGISTRY = {
             args["new_text"],
             args.get("all_occurrences", False),
         ),
+        mutates_workspace=True,
+        success_prefixes=("Replaced ",),
     ),
     "run_tests": ToolSpec(
         name="run_tests",

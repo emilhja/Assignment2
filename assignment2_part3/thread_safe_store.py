@@ -18,39 +18,18 @@ import threading
 from datetime import UTC, datetime
 from typing import Optional
 
+import part2_bridge  # noqa: F401 - sys.path side effect for Part 2 imports
+from session_store import initialize_events_table
+
 
 class ThreadSafeSessionStore:
     def __init__(self, path: str = "session_history.sqlite3"):
         self.path = path
         self.connection = sqlite3.connect(path, check_same_thread=False)
-        self.connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
-                role TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                content TEXT NOT NULL,
-                trace_id TEXT,
-                provider TEXT,
-                model TEXT
-            )
-            """
+        initialize_events_table(
+            self.connection,
+            extra_columns=("trace_id TEXT", "provider TEXT", "model TEXT"),
         )
-        # Idempotent migration for pre-existing DBs created before trace_id.
-        try:
-            self.connection.execute("ALTER TABLE events ADD COLUMN trace_id TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            self.connection.execute("ALTER TABLE events ADD COLUMN provider TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            self.connection.execute("ALTER TABLE events ADD COLUMN model TEXT")
-        except sqlite3.OperationalError:
-            pass
-        self.connection.commit()
         self._lock = threading.Lock()
 
     def record(

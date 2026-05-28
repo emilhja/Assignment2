@@ -324,6 +324,49 @@ def test_groq_failed_generation_native_create_file_tool_is_recovered(monkeypatch
     )
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected_args"),
+    [
+        (
+            "append_text",
+            '{"path":"/workspace/hello.txt","content":"\\nextra"}',
+            '"args": {"path": "/workspace/hello.txt", "content": "\\nextra"}',
+        ),
+        (
+            "read_file",
+            '{"path":"/workspace/hello.txt"}',
+            '"args": {"path": "/workspace/hello.txt"}',
+        ),
+        (
+            "run_tests",
+            '{"path":"/workspace/test_hello.py"}',
+            '"args": {"path": "/workspace/test_hello.py"}',
+        ),
+    ],
+)
+def test_groq_failed_generation_registered_tools_are_recovered(
+    monkeypatch, tool_name, arguments, expected_args
+):
+    body = {
+        "error": {
+            "message": "Tool choice is none, but model called a tool",
+            "type": "invalid_request_error",
+            "code": "tool_use_failed",
+            "failed_generation": f'{{"name": "{tool_name}", "arguments": {arguments}}}',
+        }
+    }
+    client, _completions = _client_with([FakeProviderError(body)])
+
+    monkeypatch.setenv("LLM_PROVIDER_ORDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setattr(llm_client, "_client_for_provider", lambda _config: client)
+
+    assert llm_client.complete_chat([{"role": "user", "content": "use a tool"}]) == (
+        f'{{"type": "tool_call", "tool": "{tool_name}", '
+        f'{expected_args}, "reason": "recovered provider tool call"}}'
+    )
+
+
 def test_groq_failed_generation_bash_tool_arguments_are_recovered(monkeypatch):
     body = {
         "error": {

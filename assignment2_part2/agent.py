@@ -1,4 +1,3 @@
-import json
 import os
 from pathlib import Path
 import re
@@ -7,6 +6,14 @@ import sys
 
 from llm_client import complete_chat
 from parser import parse_response
+from runtime_helpers import (
+    invalid_response_guidance,
+    json_dump,
+    tool_observation_message,
+    tool_succeeded,
+    truncate_observation,
+    workspace_mutation_tools,
+)
 from safety import confirm_command, intent_refusal
 from session_store import SessionStore
 from tools import MAX_OUTPUT_CHARS, TOOL_REGISTRY, run_tool
@@ -15,7 +22,7 @@ from tools import MAX_OUTPUT_CHARS, TOOL_REGISTRY, run_tool
 MAX_STEPS = 8
 MAX_CONTEXT_TURNS = 4
 MAX_CONTEXT_CHARS = 2000
-EDIT_TOOLS = {"create_file", "edit_section", "rename_file", "replace_text"}
+EDIT_TOOLS = workspace_mutation_tools()
 POST_EDIT_TEST_COMMAND = "python -m pytest assignment2_part2 -q"
 POST_EDIT_TEST_LOCAL_COMMAND = "python -m pytest -q"
 POST_EDIT_TEST_TIMEOUT_SECONDS = 120
@@ -64,10 +71,6 @@ def is_exit_command(text: str) -> bool:
     return text.strip().lower() in EXIT_COMMANDS
 
 
-def _json_dump(payload: dict) -> str:
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
-
-
 def _format_prior_context(prior_context: list[str] | None) -> str | None:
     if not prior_context:
         return None
@@ -83,40 +86,8 @@ def _format_prior_context(prior_context: list[str] | None) -> str | None:
     )
 
 
-def _invalid_response_guidance(error: str | None) -> str:
-    tool_payload = {
-        "type": "tool_call",
-        "tool": "bash",
-        "args": {"command": "pwd"},
-        "reason": "brief reason",
-    }
-    final_payload = {"type": "final", "answer": "answer to the user"}
-    guidance = (
-        "Your previous response was invalid. Respond with exactly one JSON object and no prose.\n"
-        f"Valid tool-call example: {_json_dump(tool_payload)}\n"
-        f"Valid final-answer example: {_json_dump(final_payload)}"
-    )
-    if error:
-        guidance += f"\nParser error: {error}"
-    return guidance
-
-
-def _tool_observation_message(tool: str, observation: str) -> str:
-    return _json_dump({"type": "tool_observation", "tool": tool, "observation": observation})
-
-
-def _truncate_observation(text: str) -> str:
-    if len(text) <= MAX_OUTPUT_CHARS:
-        return text
-    return text[:MAX_OUTPUT_CHARS] + "\n... [output truncated]"
-
-
 def _edit_succeeded(tool: str, observation: str) -> bool:
-    if tool not in EDIT_TOOLS:
-        return False
-    return observation.startswith(
-        ("Created file", "Overwrote file", "Edited one section", "Renamed file", "Replaced ")
-    )
+    return tool_succeeded(tool, observation)
 
 
 def _user_requested_execution(user_task: str) -> bool:
@@ -207,7 +178,7 @@ def _run_post_edit_tests() -> str:
     except subprocess.TimeoutExpired as exc:
         output = exc.stdout or exc.stderr or ""
         detail = f"\n{output.strip()}" if output.strip() else ""
-        return _truncate_observation(
+        return truncate_observation(
             f"Command exited with code 124.\nPost-edit tests timed out after "
             f"{POST_EDIT_TEST_TIMEOUT_SECONDS} seconds.{detail}"
         )
@@ -215,7 +186,7 @@ def _run_post_edit_tests() -> str:
     output = completed.stdout.strip() or completed.stderr.strip() or "(no output)"
     if completed.returncode != 0:
         output = f"Command exited with code {completed.returncode}.\n{output}"
-    return _truncate_observation(output)
+    return truncate_observation(output)
 
 
 def _run_tool_call(tool: str, args: dict) -> str:
@@ -299,7 +270,7 @@ def run_task(
                 store.record(
                     "tool",
                     parsed.tool,
-                    _json_dump({"args": parsed.args, "observation": observation}),
+                    json_dump({"args": parsed.args, "observation": observation}),
                 )
 
                 if debug:
@@ -307,7 +278,7 @@ def run_task(
                     print(observation)
 
                 messages.append(
-                    {"role": "user", "content": _tool_observation_message(parsed.tool, observation)}
+                    {"role": "user", "content": tool_observation_message(parsed.tool, observation)}
                 )
                 if _edit_succeeded(parsed.tool, observation):
                     had_successful_edit = True
@@ -321,7 +292,7 @@ def run_task(
                     store.record(
                         "tool",
                         "bash",
-                        _json_dump(
+                        json_dump(
                             {
                                 "args": {"command": test_command},
                                 "observation": test_observation,
@@ -334,14 +305,14 @@ def run_task(
                     messages.append(
                         {
                             "role": "user",
-                            "content": _tool_observation_message("bash", test_observation),
+                            "content": tool_observation_message("bash", test_observation),
                         }
                     )
                     if execution_requested and created_path:
                         messages.append(
                             {
                                 "role": "user",
-                                "content": _tool_observation_message(
+                                "content": tool_observation_message(
                                     "runtime_note",
                                     _create_without_execution_note([created_path]),
                                 ),
@@ -355,7 +326,7 @@ def run_task(
                         )
                 continue
 
-            guidance = _invalid_response_guidance(parsed.error)
+            guidance = invalid_response_guidance(parsed.error)
             store.record("system", "parser_guidance", guidance)
             if debug:
                 print("\nParser guidance:")

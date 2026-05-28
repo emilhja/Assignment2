@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import runtime_helpers
 import safety
 import tools
 
@@ -90,6 +91,22 @@ def test_run_tool_bash_uses_safety_guard(monkeypatch):
     output = tools.run_tool("bash", {"command": "docker compose ps"})
 
     assert output.startswith("Blocked by safety check:")
+
+
+def test_workspace_mutation_metadata_lists_only_write_tools():
+    assert runtime_helpers.workspace_mutation_tools() == {
+        "append_text",
+        "create_file",
+        "edit_section",
+        "rename_file",
+        "replace_text",
+    }
+    assert runtime_helpers.tool_succeeded(
+        "append_text", "Appended text to /workspace/demo.txt."
+    )
+    assert not runtime_helpers.tool_succeeded(
+        "read_file", "--- /workspace/demo.txt ---\ncontent"
+    )
 
 
 def test_edit_section_replaces_unique_text(tmp_path, monkeypatch):
