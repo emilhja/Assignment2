@@ -1,7 +1,0 @@
-__pycache__/
-*.py[cod]
-.env
-.git/
-.gitignore
-workspace/*
-!workspace/.gitkeep
