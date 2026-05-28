@@ -84,6 +84,7 @@ class CodeBlock:
     lang: str
     content: str
     filename: str
+    canonical: bool = False
 
 
 def _sanitize_basename(name: str) -> str:
@@ -146,12 +147,22 @@ def extract_code_blocks(text: str) -> List[CodeBlock]:
             content = (
                 content[: directive.start()] + content[directive.end():]
             ).lstrip("\n")
+            canonical = True
+        else:
+            canonical = False
         if not filename:
             filename = _filename_from_preceding_prose(text[previous_end:match.start()])
         if not filename:
             fallback_n += 1
             filename = f"snippet{fallback_n}{_extension_for(lang)}"
-        blocks.append(CodeBlock(lang=lang, content=content, filename=filename))
+        blocks.append(
+            CodeBlock(
+                lang=lang,
+                content=content,
+                filename=filename,
+                canonical=canonical,
+            )
+        )
         previous_end = match.end()
     return blocks
 
@@ -344,15 +355,32 @@ def process_shared_code(
     written = save_code_blocks(blocks, active_project)
     if not written:
         return None
+    canonical_by_name = {
+        block.filename: block.canonical
+        for block in blocks
+    }
     project_name = active_project.name
     if shared_root is not None:
         saved_lines = [
-            f"- /workspace/shared/{project_name}/{p.name}" for p in written
+            (
+                f"- /workspace/shared/{project_name}/{p.name}"
+                if canonical_by_name.get(p.name, False)
+                else f"- /workspace/shared/{project_name}/{p.name} (snippet; no # file directive)"
+            )
+            for p in written
         ]
         location = f"/workspace/shared/{project_name}/"
     else:
         saved_lines = [
-            f"- {_agent_facing_path(agent_id, project_name, p.name)}" for p in written
+            (
+                f"- {_agent_facing_path(agent_id, project_name, p.name)}"
+                if canonical_by_name.get(p.name, False)
+                else (
+                    f"- {_agent_facing_path(agent_id, project_name, p.name)} "
+                    "(snippet; no # file directive)"
+                )
+            )
+            for p in written
         ]
         location = f"/workspace/{agent_id}/{project_name}/"
     if auto_pytest:
@@ -370,5 +398,7 @@ def process_shared_code(
         + "\n".join(saved_lines)
         + f"\n{pytest_line}\n"
         "You may read_file these paths, propose changes, or discuss in chat. "
-        "Do not re-create or duplicate these files."
+        "Treat files marked as snippets as untrusted non-canonical context until "
+        "a peer shares a block with `# file: <filename>`. Do not re-create or "
+        "duplicate these files."
     )

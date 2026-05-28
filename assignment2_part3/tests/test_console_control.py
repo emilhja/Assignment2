@@ -273,6 +273,36 @@ def test_project_handler_exception_is_caught():
     stop.set()
 
 
+def test_continue_command_invokes_handler():
+    calls: list[str] = []
+
+    def handler():
+        calls.append("continue")
+        return "[continue queued] retrying msg m1"
+
+    cc, budget, stop, stdout = _start_console(
+        ":continue\n", continue_handler=handler
+    )
+    assert _wait_for(lambda: calls == ["continue"])
+    assert _wait_for(lambda: "[continue queued]" in stdout.getvalue())
+    stop.set()
+
+
+def test_continue_without_handler_prints_disabled():
+    cc, budget, stop, stdout = _start_console(":continue\n")
+    assert _wait_for(lambda: "[continue not enabled in this mode]" in stdout.getvalue())
+    stop.set()
+
+
+def test_continue_handler_exception_is_caught():
+    def handler():
+        raise RuntimeError("offline")
+
+    cc, budget, stop, stdout = _start_console(":continue\n", continue_handler=handler)
+    assert _wait_for(lambda: "[continue error] offline" in stdout.getvalue())
+    stop.set()
+
+
 def test_resume_persists_to_disk(tmp_path):
     budget_path = tmp_path / "budget.json"
     budget = Budget.load(

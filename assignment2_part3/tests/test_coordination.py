@@ -307,6 +307,70 @@ def test_status_request_guidance_recommends_recent_test_path():
     assert "run_tests on /workspace/shared/test_calculator.py" in guidance
 
 
+def test_status_request_guidance_falls_back_to_self_private_test_path():
+    """In runpod-private mode the agent writes under /workspace/<agent_id>/...
+    Status guidance must surface that path so the model has a real file to
+    run_tests against instead of the generic "shared test file" hint."""
+
+    guidance = status_request_guidance(
+        "everyone are done?",
+        agent_id="alice-swe",
+        display_name="alice-swe",
+        recent_context=[
+            {
+                "sender_id": "alice-swe",
+                "text": (
+                    "Klar med: add and subtract. "
+                    "Files: /workspace/alice-swe/project4/calculator.py, "
+                    "/workspace/alice-swe/project4/test_calculator.py. "
+                    "Tests: 2 passed."
+                ),
+            }
+        ],
+    )
+
+    assert guidance is not None
+    assert (
+        "run_tests on /workspace/alice-swe/project4/test_calculator.py"
+        in guidance
+    )
+
+
+def test_status_request_guidance_only_matches_own_sender_id():
+    """A peer's private test path must not leak into this agent's hint."""
+
+    guidance = status_request_guidance(
+        "everyone are done?",
+        agent_id="alice-swe",
+        display_name="alice-swe",
+        recent_context=[
+            {
+                "sender_id": "bob-swe",
+                "text": "Done with: multiply/divide at /workspace/bob-swe/project4/test_calculator.py",
+            }
+        ],
+    )
+
+    assert guidance is not None
+    assert "/workspace/bob-swe/project4/test_calculator.py" not in guidance
+    # Falls through to the generic hint when nothing of this agent's matches.
+    assert "shared test file" in guidance
+
+
+def test_status_request_guidance_done_question_mark_still_matches():
+    """Pin the 'everyone are done?' wording so the trailing `done?` clause
+    in STATUS_REQUEST_PATTERN keeps catching plural status broadcasts."""
+
+    guidance = status_request_guidance(
+        "everyone are done?",
+        agent_id="alice-swe",
+        display_name="alice-swe",
+    )
+
+    assert guidance is not None
+    assert "completion status" in guidance.lower()
+
+
 def test_fix_blockers_guidance_matches_can_you_fix():
     guidance = fix_blockers_guidance(
         "@alice-swe can you fix the blockers?",

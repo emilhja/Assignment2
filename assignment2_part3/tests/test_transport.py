@@ -33,7 +33,7 @@ def test_recv_skips_invalid_json():
 def test_send_writes_json_line():
     outbox = io.StringIO()
     t = StubTransport("alice", inbox=io.StringIO(""), outbox=outbox)
-    t.send("hello world")
+    assert t.send("hello world") is True
     line = outbox.getvalue().strip()
     payload = json.loads(line)
     assert payload["sender_id"] == "alice"
@@ -149,7 +149,7 @@ def _make_transport(tmp_path, **overrides):
 
 def test_runpod_send_posts_expected_payload(tmp_path):
     t, session, stdout, _ = _make_transport(tmp_path)
-    t.send("hello hub")
+    assert t.send("hello hub") is True
     assert len(session.post_calls) == 1
     url, body = session.post_calls[0]
     assert url == "https://hub.example/api/message"
@@ -161,31 +161,159 @@ def test_runpod_send_treats_201_created_as_success(tmp_path):
     session = _FakeSession(post_responses=[_FakeResponse(201, {"ok": True, "seq": 85})])
     t, _, stdout, _ = _make_transport(tmp_path, session=session)
 
-    t.send("created")
+    assert t.send("created") is True
 
     output = stdout.getvalue()
     assert "[hub->]" in output
     assert "[hub!]" not in output
 
 
-def test_runpod_send_truncates_to_4096(tmp_path):
+def test_runpod_send_keeps_payload_within_wire_cap(tmp_path):
+    """5000 'x' chars with no whitespace → 2-part split, every POST ≤ 4096."""
     t, session, _, _ = _make_transport(tmp_path)
     t.send("x" * 5000)
+    assert len(session.post_calls) >= 2
+    for _, body in session.post_calls:
+        assert len(body["content"]) <= 4096
+
+
+def test_runpod_send_does_not_prefix_when_under_cap(tmp_path):
+    t, session, _, _ = _make_transport(tmp_path)
+    t.send("plain short message")
+    assert len(session.post_calls) == 1
     _, body = session.post_calls[0]
-    assert len(body["content"]) == 4096
+    assert body["content"] == "plain short message"
+    assert "(part" not in body["content"]
+
+
+def test_runpod_send_splits_oversized_text_with_part_prefixes(tmp_path):
+    t, session, _, _ = _make_transport(tmp_path)
+    line = "x" * 200 + "\n"
+    text = line * 30  # ~6030 chars, plenty of newline boundaries
+    t.send(text)
+
+    assert len(session.post_calls) >= 2
+    contents = [body["content"] for _, body in session.post_calls]
+    total = len(contents)
+    for i, content in enumerate(contents, start=1):
+        assert content.startswith(f"(part {i}/{total})\n")
+        assert len(content) <= 4096
+    # Reassembling (minus the prefix line) should recover the original payload
+    # with whitespace preserved at boundaries.
+    rejoined = "".join(c.split("\n", 1)[1] for c in contents)
+    assert rejoined.replace("\n", "") == text.replace("\n", "")
+
+
+def test_runpod_send_prefers_newline_boundary_over_mid_line_cut(tmp_path):
+    t, session, _, _ = _make_transport(tmp_path)
+    line = "abcdefghij" * 50 + "\n"  # 501 chars per line, ends in \n
+    text = line * 10  # 5010 chars, 10 full lines
+    t.send(text)
+
+    assert len(session.post_calls) >= 2
+    for _, body in session.post_calls:
+        content = body["content"]
+        # The body after the "(part i/N)\n" header should end at a line
+        # boundary (or be the final chunk), never mid-line.
+        body_text = content.split("\n", 1)[1] if content.startswith("(part") else content
+        assert body_text == "" or body_text.endswith("\n") or body_text.endswith("abcdefghij" * 50)
+
+
+def test_runpod_send_throttles_between_split_parts(tmp_path):
+    """Each part triggers _throttle, so a multi-part send sleeps between POSTs."""
+    t, session, _, clock = _make_transport(tmp_path)
+    t.send("y" * 9000)  # forces ≥3 parts
+    assert len(session.post_calls) >= 3
+    # First send is "free" (no prior request); the rest should pay HUB_MIN_REQUEST_GAP each.
+    assert sum(1 for s in clock.sleeps if s > 0) >= len(session.post_calls) - 1
+
+
+def test_runpod_send_logs_each_part(tmp_path):
+    t, session, stdout, _ = _make_transport(tmp_path)
+    t.send("z" * 9000)
+    output = stdout.getvalue()
+    assert output.count("[hub->]") == len(session.post_calls)
 
 
 def test_runpod_send_skips_blank(tmp_path):
     t, session, _, _ = _make_transport(tmp_path)
-    t.send("   \n  ")
+    assert t.send("   \n  ") is True
     assert session.post_calls == []
 
 
 def test_runpod_send_handles_429_without_raising(tmp_path):
     session = _FakeSession(post_responses=[_FakeResponse(status_code=429, payload={"error": "rate"})])
     t, _, stdout, _ = _make_transport(tmp_path, session=session)
-    t.send("hi")
+    assert t.send("hi") is True
     assert "[hub!]" in stdout.getvalue()
+
+
+def test_runpod_send_retries_on_429_then_succeeds(tmp_path):
+    """One transient 429 should not strand the message — the retry must land."""
+    session = _FakeSession(
+        post_responses=[
+            _FakeResponse(status_code=429, payload={"error": "rate"}),
+            _FakeResponse(status_code=200, payload={"ok": True, "seq": 99}),
+        ]
+    )
+    t, _, stdout, clock = _make_transport(tmp_path, session=session)
+    assert t.send("payload") is True
+    assert len(session.post_calls) == 2
+    output = stdout.getvalue()
+    assert "[hub->]" in output  # eventual success was logged
+    assert "[hub!] send 429" in output  # backoff was logged
+    assert "[hub!] send failed" not in output  # no terminal failure
+    # Must have slept at least the 429 backoff between the two POSTs.
+    assert any(s >= 1.5 for s in clock.sleeps)
+
+
+def test_runpod_send_gives_up_after_max_retries_on_429(tmp_path):
+    session = _FakeSession(
+        post_responses=[
+            _FakeResponse(status_code=429, payload={"error": "rate"}),
+            _FakeResponse(status_code=429, payload={"error": "rate"}),
+            _FakeResponse(status_code=429, payload={"error": "rate"}),
+        ]
+    )
+    t, _, stdout, _ = _make_transport(tmp_path, session=session)
+    assert t.send("payload") is False
+    # 1 initial attempt + 2 retries = 3 POSTs total
+    assert len(session.post_calls) == 3
+    output = stdout.getvalue()
+    assert "[hub!] send failed status=429" in output
+
+
+def test_runpod_multipart_send_aborts_after_failed_middle_part(tmp_path):
+    session = _FakeSession(
+        post_responses=[
+            _FakeResponse(status_code=200, payload={"ok": True, "seq": 1}),
+            _FakeResponse(status_code=500, payload={"error": "boom"}),
+        ]
+    )
+    t, session, stdout, _ = _make_transport(tmp_path, session=session)
+
+    assert t.send("x" * 9000) is False
+
+    assert len(session.post_calls) == 2
+    contents = [body["content"] for _, body in session.post_calls]
+    assert contents[0].startswith("(part 1/")
+    assert contents[1].startswith("(part 2/")
+    output = stdout.getvalue()
+    assert "send failed status=500" in output
+    assert "multipart send aborted after failed part 2/" in output
+
+
+def test_runpod_min_gap_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUB_MIN_REQUEST_GAP_SECONDS", "2.5")
+    t, _, _, _ = _make_transport(tmp_path)
+    assert t._min_request_gap == 2.5
+
+
+def test_runpod_min_gap_env_clamped_to_floor(tmp_path, monkeypatch):
+    """Sub-1s overrides are clamped — the hub enforces 1 req/sec hard."""
+    monkeypatch.setenv("HUB_MIN_REQUEST_GAP_SECONDS", "0.3")
+    t, _, _, _ = _make_transport(tmp_path)
+    assert t._min_request_gap == 1.0
 
 
 def test_runpod_recv_returns_peermessage_and_buffers_rest(tmp_path):

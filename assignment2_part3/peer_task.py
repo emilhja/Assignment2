@@ -50,6 +50,12 @@ CLAIM_GATED_TOOLS = {"create_file", "append_text", "edit_section", "rename_file"
 SHARED_PATH_PREFIX = "/workspace/shared/"
 _AUTO_APPROVAL_CONTROL_CHARS = re.compile(r"[;&|]|\r|\n")
 
+NO_PROJECT_REFUSAL = (
+    "refused: no active project — file-write tools are disabled. "
+    "Operator: type `:project new` in the agent console to allocate one, "
+    "or include `PROJECT: <name>` in the next broadcast to auto-start."
+)
+
 
 def _json(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -283,6 +289,23 @@ def _run_tool_with_approval(
     return run_tool(tool, args)
 
 
+def _maybe_no_project_refusal(tool: str, project_active: bool) -> Optional[str]:
+    """Return a refusal observation for write tools when no project is active.
+
+    Runpod mode parks the model in conversation-only state until the operator
+    runs `:project new` or a broadcast carries `PROJECT: <name>`. Until then
+    file-write tools cannot land anywhere meaningful, so the runtime refuses
+    them at dispatch instead of letting them write to a stale location.
+    Returns None for read-only tools (bash, read_file, list_dir, run_tests).
+    """
+
+    if project_active:
+        return None
+    if tool not in CLAIM_GATED_TOOLS:
+        return None
+    return NO_PROJECT_REFUSAL
+
+
 def _maybe_shared_write_refusal(
     tool: str,
     args: dict,
@@ -364,6 +387,10 @@ def _claim_continuation_target(message: PeerMessage) -> str | None:
 
 
 _PYTEST_REQUEST_RE = re.compile(r"(?i)\b(?:pytest|tests?)\b")
+_COORDINATOR_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(?:you\s+are|act\s+as|be)\s+(?:the\s+)?"
+    r"(?:manager|coordinator|lead|samordnare|projektledare)\b"
+)
 
 
 def _pytest_was_requested(text: str) -> bool:
@@ -379,12 +406,20 @@ _ACTION_REQUEST_RE = re.compile(
     r"|fix(?:ed|es|ing)?"
     r"|repair(?:ed|s|ing)?"
     r"|update(?:d|s|ing)?"
+    r"|create(?:d|s|ing)?"
+    r"|review(?:ed|s|ing)?"
+    r"|share(?:s|ing)?"
+    r"|send(?:s|ing)?"
+    r"|show(?:ed|s|ing)?"
+    r"|paste(?:d|s|ing)?"
+    r"|read(?:s|ing)?"
+    r"|test(?:ed|ing)?"
     r"|execute"
     r"|use\s+tools?"
     r"|call\s+run_tests"
     r"|run\s+pytest"
     r"|go\s+ahead"
-    r"|please\s+(?:run|verify|test|execute|ensure|implement|fix|repair|update)"
+    r"|please\s+(?:run|verify|test|execute|ensure|implement|fix|repair|update|create|review|share|send|show|paste|read)"
     r"|gör"
     r"|skapa"
     r"|skriv"
@@ -688,6 +723,66 @@ def _looks_like_pending_test_work(answer: str) -> bool:
     )
 
 
+_INTRO_ONLY_RE = re.compile(r"(?i)^\s*hej,?\s*jag\s+(?:är|ar)\b[^.!?\n]*(?:[.!?])?\s*$")
+
+
+def _states_concrete_blocker(answer: str) -> bool:
+    lowered = (answer or "").lower()
+    blocker_markers = (
+        "blocker",
+        "blocked",
+        "cannot",
+        "can't",
+        "unable",
+        "not found",
+        "does not exist",
+        "doesn't exist",
+        "no active project",
+        "exact path",
+        "file path",
+        "saknar",
+        "hittar inte",
+        "kan inte",
+        "blockerad",
+    )
+    return any(marker in lowered for marker in blocker_markers)
+
+
+def _looks_like_non_action_final(answer: str) -> bool:
+    text = (answer or "").strip()
+    if not text:
+        return True
+    if CLAIM_PATTERN.search(text) or RELEASE_PATTERN.search(text) or DEFER_PATTERN.search(text):
+        return False
+    if _states_concrete_blocker(text):
+        return False
+    status = parse_task_status(text)
+    if status is not None and status.kind in {"taking", "accepted"}:
+        return False
+    lowered = text.lower()
+    vague_markers = (
+        "ready",
+        "i'm ready",
+        "i am ready",
+        "redo",
+        "standing by",
+        "available",
+        "happy to help",
+        "glad to help",
+        "let me know",
+        "i can help",
+        "i can take",
+        "i'll coordinate",
+        "i will coordinate",
+        "jag kan hjälpa",
+        "jag är redo",
+    )
+    return (
+        bool(_INTRO_ONLY_RE.match(text))
+        or any(marker in lowered for marker in vague_markers)
+    )
+
+
 def _edit_recovery_guidance(tool: str, observation: str) -> str | None:
     if tool not in {"edit_section", "replace_text"}:
         return None
@@ -705,6 +800,23 @@ def _edit_recovery_guidance(tool: str, observation: str) -> str | None:
         "must rewrite existing content, call read_file first and then use "
         "edit_section with old_text equal to an exact complete section from that "
         "observation."
+    )
+
+
+def _write_recovery_guidance(tool: str, args: dict, observation: str) -> str | None:
+    if tool != "create_file":
+        return None
+    if not observation.startswith("Edit blocked:") or "file already exists" not in observation:
+        return None
+    path = args.get("path")
+    path_hint = f" on {path}" if isinstance(path, str) and path else ""
+    read_target = str(path) if isinstance(path, str) and path else "that existing path"
+    return (
+        f"The create_file call was blocked because the target file already exists{path_hint}. "
+        f"Do not retry create_file, do not invent a sibling filename, and do not ask peers "
+        f"for the full content. Call read_file on {read_target} first. Then, only if a real "
+        "change is still needed, use append_text for additive content or edit_section/"
+        "replace_text with exact text from the read_file observation."
     )
 
 
@@ -746,6 +858,7 @@ def run_peer_task(
     collision: Optional[CollisionInfo] = None,
     runtime_guidance: Optional[list[str]] = None,
     console_log: Optional[Callable[[str, str], None]] = None,
+    project_active: bool = True,
 ) -> str:
     # Late binding so monkey-patching `peer_task.complete_chat_with_metadata`
     # in tests works.
@@ -1131,6 +1244,30 @@ def run_peer_task(
             if (
                 not _is_claim_continuation(message)
                 and _action_was_requested(message.text)
+                and _COORDINATOR_ASSIGNMENT_RE.search(message.text or "") is None
+                and not saw_any_tool_observation
+                and _looks_like_non_action_final(answer)
+            ):
+                guidance = (
+                    "The user directly asked you to perform an action, but your reply was "
+                    "only an intro, readiness note, future-intent note, or vague coordination. "
+                    "Perform the requested action using tools, or state the concrete blocker. "
+                    "For file share/show/paste/read requests, call read_file on the exact "
+                    "workspace path first. If no exact path is known, say that as the blocker "
+                    "and ask for the exact file path."
+                )
+                stopped = _continuation_reprompt_or_stop(
+                    "user_action_non_action_reprompt",
+                    guidance,
+                    "I had to stop because I kept answering with an intro, readiness note, "
+                    "or vague coordination instead of using tools or stating a concrete blocker.",
+                )
+                if stopped is not None:
+                    return stopped
+                continue
+            if (
+                not _is_claim_continuation(message)
+                and _action_was_requested(message.text)
                 and _looks_like_pending_shared_write(answer)
             ):
                 guidance = (
@@ -1153,6 +1290,10 @@ def run_peer_task(
                 and _action_was_requested(message.text)
                 and not saw_any_successful_write
                 and not saw_successful_test_run
+                and (
+                    parse_task_status(answer) is None
+                    or parse_task_status(answer).kind == "done"
+                )
                 and (
                     _looks_like_completion_claim_any_path(answer)
                     or _looks_like_pending_write_any_path(answer)
@@ -1261,6 +1402,14 @@ def run_peer_task(
                 messages.append({"role": "user", "content": observation})
                 continue
 
+            no_project_reason = _maybe_no_project_refusal(parsed.tool, project_active)
+            if no_project_reason:
+                _log("system", "no_project_block", no_project_reason)
+                _emit("block", no_project_reason[:120])
+                observation = _refusal_observation(no_project_reason)
+                messages.append({"role": "user", "content": observation})
+                continue
+
             block_reason = _maybe_shared_write_refusal(parsed.tool, parsed.args, claims, self_id)
             if block_reason:
                 _log("system", "claim_block", block_reason)
@@ -1336,6 +1485,10 @@ def run_peer_task(
             messages.append(
                 {"role": "user", "content": _tool_observation_message(parsed.tool, observation)}
             )
+            guidance = _write_recovery_guidance(parsed.tool, parsed.args, observation)
+            if guidance:
+                _log("system", "write_recovery_guidance", guidance)
+                messages.append(_runtime_guidance_message(guidance))
             if _is_claim_continuation(message):
                 guidance = _edit_recovery_guidance(parsed.tool, observation)
                 if guidance:

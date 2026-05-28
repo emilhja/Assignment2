@@ -26,7 +26,7 @@ from peer import PeerMessage
 
 class Transport(Protocol):
     def recv(self, timeout: Optional[float] = None) -> Optional[PeerMessage]: ...
-    def send(self, text: str) -> None: ...
+    def send(self, text: str) -> bool: ...
     def close(self) -> None: ...
 
 
@@ -102,7 +102,7 @@ class StubTransport:
                 _save_seen_ids(self._seen_path, self._seen)
         return message
 
-    def send(self, text: str) -> None:
+    def send(self, text: str) -> bool:
         if self._closed:
             raise RuntimeError("transport closed")
         payload = json.dumps(
@@ -112,14 +112,70 @@ class StubTransport:
         with self._lock:
             self._outbox.write(payload + "\n")
             self._outbox.flush()
+        return True
 
     def close(self) -> None:
         self._closed = True
 
 
 HUB_MAX_CONTENT_CHARS = 4096
-HUB_MIN_REQUEST_GAP = 1.0  # hub enforces 1 req/sec per agent name
+# Reserved at the start of each chunk for the `(part i/N)\n` header when a
+# message needs to be split. 16 covers up to `(part 99/99)\n` with slack.
+HUB_PART_PREFIX_RESERVE = 16
+# Hub enforces 1 req/sec per agent name. We default to 1.2s to leave headroom
+# for clock drift and network jitter — otherwise a request whose body finishes
+# arriving 50ms late at the server will be 429'd.
+HUB_MIN_REQUEST_GAP = 1.2
+# Per-chunk retry on 429. The hub's body is "Wait 1 second between requests",
+# so the backoff is the throttle gap plus a small cushion.
+HUB_SEND_429_RETRIES = 2
+HUB_SEND_429_BACKOFF = 1.5
 FORBIDDEN_HUB_NAMES = {"my-agent", "my_agent", "agent", "test", "bot", "local"}
+
+
+def _resolve_min_request_gap() -> float:
+    raw = os.environ.get("HUB_MIN_REQUEST_GAP_SECONDS", "").strip()
+    if not raw:
+        return HUB_MIN_REQUEST_GAP
+    try:
+        value = float(raw)
+    except ValueError:
+        return HUB_MIN_REQUEST_GAP
+    # Never go below the hub's documented 1s floor.
+    return max(1.0, value)
+
+
+def _split_for_hub(text: str, max_chars: int) -> list[str]:
+    """Split `text` into chunks each ≤ `max_chars`, preferring safe boundaries.
+
+    Tries paragraph break (`\\n\\n`), then line break (`\\n`), then any
+    whitespace. Falls back to a hard cut if none of those land in the
+    later portion of the window (the early-cut guard avoids producing a
+    tiny first part when the only newline is near the very start).
+    """
+
+    if len(text) <= max_chars:
+        return [text]
+    parts: list[str] = []
+    remaining = text
+    min_useful_cut = max(1, max_chars // 4)
+    while len(remaining) > max_chars:
+        window = remaining[:max_chars]
+        cut = -1
+        for sep in ("\n\n", "\n", " "):
+            idx = window.rfind(sep)
+            if idx >= min_useful_cut:
+                cut = idx + len(sep)
+                break
+        if cut < 0:
+            cut = max_chars
+        chunk = remaining[:cut].rstrip()
+        if chunk:
+            parts.append(chunk)
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        parts.append(remaining)
+    return parts
 
 
 def _log_snippet(text: str) -> str:
@@ -181,6 +237,7 @@ class RunPodTransport:
         self._stdout = stdout if stdout is not None else sys.stdout
         self._clock = clock if clock is not None else time.monotonic
         self._sleep = sleep if sleep is not None else time.sleep
+        self._min_request_gap = _resolve_min_request_gap()
         if session is None:
             import requests  # local import so tests that inject a session don't pay the cost
 
@@ -199,8 +256,8 @@ class RunPodTransport:
 
     def _throttle(self) -> None:
         gap = self._clock() - self._last_request_ts
-        if gap < HUB_MIN_REQUEST_GAP:
-            self._sleep(HUB_MIN_REQUEST_GAP - gap)
+        if gap < self._min_request_gap:
+            self._sleep(self._min_request_gap - gap)
         self._last_request_ts = self._clock()
 
     def _persist_seen(self, seq: int) -> None:
@@ -305,43 +362,75 @@ class RunPodTransport:
             )
         return first_returned
 
-    def send(self, text: str) -> None:
+    def send(self, text: str) -> bool:
         if self._closed:
             raise RuntimeError("transport closed")
         if not text or not text.strip():
-            return
-        payload_text = text[:HUB_MAX_CONTENT_CHARS]
+            return True
 
-        self._throttle()
-        try:
-            resp = self._session.post(
-                f"{self.url}/api/message",
-                json={
-                    "agent_name": self.agent_name,
-                    "content": payload_text,
-                    "password": self.password,
-                },
-                timeout=10,
-            )
-        except Exception as exc:
-            self._warn(f"[hub!] send error: {exc}")
-            return
+        if len(text) <= HUB_MAX_CONTENT_CHARS:
+            return self._send_one(text)
 
-        status = getattr(resp, "status_code", 0)
-        if 200 <= status < 300:
-            snippet = _log_snippet(payload_text)
-            self._echo(
-                f"{colors.ts()} {colors.dim('[hub->]')} "
-                f"{colors.agent_label(self.agent_name)}: {snippet}"
-            )
-            return
+        body_max = HUB_MAX_CONTENT_CHARS - HUB_PART_PREFIX_RESERVE
+        parts = _split_for_hub(text, body_max)
+        if not parts:
+            return True
+        total = len(parts)
+        for i, body in enumerate(parts, start=1):
+            prefix = f"(part {i}/{total})\n"
+            payload = (prefix + body)[:HUB_MAX_CONTENT_CHARS]
+            if not self._send_one(payload):
+                self._warn(
+                    f"[hub!] multipart send aborted after failed part {i}/{total}"
+                )
+                return False
+        return True
 
-        body = ""
-        try:
-            body = resp.text[:200] if hasattr(resp, "text") else str(resp.json())[:200]
-        except Exception:
-            pass
-        self._warn(f"[hub!] send failed status={status} body={body}")
+    def _send_one(self, payload_text: str) -> bool:
+        # Retry on 429 so a single rate-limit hit doesn't strand a peer with a
+        # partial multi-part message. Network errors are not retried — they
+        # tend to be persistent on this path.
+        for attempt in range(HUB_SEND_429_RETRIES + 1):
+            self._throttle()
+            try:
+                resp = self._session.post(
+                    f"{self.url}/api/message",
+                    json={
+                        "agent_name": self.agent_name,
+                        "content": payload_text,
+                        "password": self.password,
+                    },
+                    timeout=10,
+                )
+            except Exception as exc:
+                self._warn(f"[hub!] send error: {exc}")
+                return False
+
+            status = getattr(resp, "status_code", 0)
+            if 200 <= status < 300:
+                snippet = _log_snippet(payload_text)
+                self._echo(
+                    f"{colors.ts()} {colors.dim('[hub->]')} "
+                    f"{colors.agent_label(self.agent_name)}: {snippet}"
+                )
+                return True
+
+            body = ""
+            try:
+                body = resp.text[:200] if hasattr(resp, "text") else str(resp.json())[:200]
+            except Exception:
+                pass
+
+            if status == 429 and attempt < HUB_SEND_429_RETRIES:
+                self._warn(
+                    f"[hub!] send 429 (attempt {attempt + 1}/{HUB_SEND_429_RETRIES + 1}), backing off"
+                )
+                self._sleep(HUB_SEND_429_BACKOFF)
+                continue
+
+            self._warn(f"[hub!] send failed status={status} body={body}")
+            return False
+        return False
 
     def close(self) -> None:
         self._closed = True
@@ -361,7 +450,7 @@ class _UnconfiguredTransport:
     def recv(self, timeout: Optional[float] = None) -> Optional[PeerMessage]:
         return None
 
-    def send(self, text: str) -> None:
+    def send(self, text: str) -> bool:
         raise RuntimeError("transport not configured")
 
     def close(self) -> None:

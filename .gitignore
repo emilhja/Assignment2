@@ -36,3 +36,5 @@ Thumbs.db
 
 # Local agent session logs
 *.sqlite3
+
+logs/

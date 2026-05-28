@@ -24,7 +24,10 @@ from budget import Budget
 from claims import ClaimRegistry
 from console_control import ConsoleControl
 from group_chat import (
+    _ProjectState,
+    _build_project_handler,
     _local_workspace_guidance,
+    _project_root,
     _released_without_write_guidance,
     _remote_workspace_guidance,
     _stale_claim_guidance,
@@ -67,7 +70,23 @@ def _patch_chat(monkeypatch, fake):
     monkeypatch.setattr(peer_task, "complete_chat_with_metadata", fake)
 
 
-def _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies, claims=None):
+def _wait_for(predicate, timeout=2.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _setup_run(
+    tmp_path,
+    monkeypatch,
+    peer_lines,
+    scripted_replies,
+    claims=None,
+    console_stdin_text="",
+):
     monkeypatch.setenv("AGENT_ID", "alice")
     monkeypatch.setenv("AGENT_DISPLAY_NAME", "alice-swe")
     monkeypatch.setenv("AGENT_MODE", "stub")
@@ -88,7 +107,13 @@ def _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies, claims=None)
     )
 
     stop = threading.Event()
-    console = ConsoleControl(budget=budget, stop_event=stop, stdin=io.StringIO(""), stdout=io.StringIO())
+    console_stdout = io.StringIO()
+    console = ConsoleControl(
+        budget=budget,
+        stop_event=stop,
+        stdin=io.StringIO(console_stdin_text),
+        stdout=console_stdout,
+    )
     # Don't start the console thread; nothing reads stdin in this test.
 
     def runner():
@@ -109,6 +134,8 @@ def _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies, claims=None)
         "outbox": outbox,
         "transport": transport,
         "fake_chat": fake_chat,
+        "console": console,
+        "console_stdout": console_stdout,
     }
 
 
@@ -119,6 +146,11 @@ def _outbox_replies(outbox):
 def _events(store):
     cur = store.connection.execute("SELECT role, kind, content FROM events ORDER BY id")
     return list(cur.fetchall())
+
+
+class FailingSendTransport(StubTransport):
+    def send(self, text: str) -> bool:
+        return False
 
 
 def test_system_prompt_requires_not_run_without_test_observation():
@@ -185,6 +217,180 @@ def test_direct_mention_triggers_reply_and_chatter_is_skipped(tmp_path, monkeypa
     assert ("system", "reply_decision") in kinds
 
 
+def test_failed_send_is_not_recorded_as_delivered_context(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_ID", "alice")
+    monkeypatch.setenv("AGENT_DISPLAY_NAME", "alice-swe")
+    monkeypatch.setenv("AGENT_MODE", "stub")
+
+    fake_chat = FakeChat([json.dumps({"type": "final", "answer": "Reviewed foo."})])
+    _patch_chat(monkeypatch, fake_chat)
+
+    inbox = io.StringIO(
+        json.dumps({"id": "m1", "sender_id": "human", "text": "@alice-swe review foo"}) + "\n"
+    )
+    outbox = io.StringIO()
+    transport = FailingSendTransport("alice", inbox=inbox, outbox=outbox)
+    store = SessionStore(str(tmp_path / "sess.sqlite3"))
+    budget = Budget(
+        tokens_per_minute=100_000,
+        requests_per_minute=1000,
+        lifetime_tokens=100_000,
+        persist_path=tmp_path / "budget.json",
+    )
+    stop = threading.Event()
+
+    t = threading.Thread(
+        target=lambda: run_group_chat(
+            transport=transport,
+            budget=budget,
+            store=store,
+            stop_event=stop,
+            idle_sleep=0.01,
+        )
+    )
+    t.start()
+    time.sleep(0.5)
+    stop.set()
+    t.join(timeout=5.0)
+
+    assert outbox.getvalue() == ""
+    events = _events(store)
+    assert ("system", "send_failed", "msg_id=m1") in events
+    assert not any(kind == "pending_followup" for _role, kind, _content in events)
+
+
+def test_missing_part_request_guides_model_to_read_last_reported_file(tmp_path, monkeypatch):
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "human", "text": "@alice-swe build snake"}) + "\n",
+        json.dumps({"id": "m2", "sender_id": "human", "text": "@alice-swe where is part 2/3"}) + "\n",
+    ]
+    scripted = [
+        json.dumps(
+            {
+                "type": "final",
+                "answer": "Current file path: /workspace/alice/project1/snake_game.html.",
+            }
+        ),
+        json.dumps({"type": "final", "answer": "I will read it."}),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    assert _wait_for(lambda: ctx["fake_chat"].calls == 2, timeout=5.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    second_call_messages = ctx["fake_chat"].messages[1]
+    joined = "\n".join(message["content"] for message in second_call_messages)
+    assert "missing part or a resend" in joined
+    assert "Call read_file on that exact path" in joined
+    assert "/workspace/project1/snake_game.html" in joined
+    assert "Do not regenerate" in joined
+
+
+def test_direct_share_index_guides_model_to_read_active_project_file(tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    project = shared / "webapp"
+    project.mkdir(parents=True)
+    (project / "index.html").write_text("<main>Hello</main>\n", encoding="utf-8")
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "PROJECT: webapp\n@alice-swe, please share index.html with @alexia-kazim-agent",
+        })
+        + "\n",
+    ]
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "Blocker: I will need to read the file before sharing it.",
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    assert _wait_for(lambda: ctx["fake_chat"].calls == 1, timeout=5.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    joined = "\n".join(message["content"] for message in ctx["fake_chat"].messages[0])
+    assert "asking you to share index.html with a peer" in joined
+    assert "Treat /workspace/shared/webapp/index.html as the source of truth" in joined
+    assert "Call read_file on that exact path" in joined
+    assert "Do not regenerate" in joined
+
+
+def test_direct_share_missing_index_asks_for_exact_path(tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    (shared / "webapp").mkdir(parents=True)
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "PROJECT: webapp\n@alice-swe, please share index.html with @alexia-kazim-agent",
+        })
+        + "\n",
+    ]
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "Blocker: I need the exact workspace file path for index.html.",
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    assert _wait_for(lambda: ctx["fake_chat"].calls == 1, timeout=5.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    joined = "\n".join(message["content"] for message in ctx["fake_chat"].messages[0])
+    assert "cannot find that file in the active project" in joined
+    assert "ask for the exact workspace file path" in joined
+    assert "do not go idle" in joined
+
+
+def test_status_request_guidance_forbids_rewrite(tmp_path, monkeypatch):
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "human", "text": "@alice-swe build snake"}) + "\n",
+        json.dumps({"id": "m2", "sender_id": "human", "text": "@alice-swe are you done?"}) + "\n",
+    ]
+    scripted = [
+        json.dumps(
+            {
+                "type": "final",
+                "answer": "Done: snake at /workspace/alice/project1/snake_game.html. Tests: not run. Blockers: none.",
+            }
+        ),
+        json.dumps(
+            {
+                "type": "final",
+                "answer": "Done: snake at /workspace/alice/project1/snake_game.html. Tests: not run. Blockers: none.",
+            }
+        ),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    assert _wait_for(lambda: ctx["fake_chat"].calls == 2, timeout=5.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    second_call_messages = ctx["fake_chat"].messages[1]
+    joined = "\n".join(message["content"] for message in second_call_messages)
+    assert "The operator is asking for completion status" in joined
+    assert "Do not create, overwrite, or rewrite files just to answer a status request" in joined
+
+
 def test_shutdown_prints_final_token_usage_summary(tmp_path, monkeypatch, capsys):
     peer_lines = [
         json.dumps({"id": "m1", "sender_id": "bob", "text": "@alice please say hi"}) + "\n",
@@ -236,6 +442,45 @@ def test_outbound_reply_is_scrubbed(tmp_path, monkeypatch):
     if replies:
         for payload in replies:
             assert "sk-abcdefghij" not in payload["text"]
+
+
+def test_multipart_inbound_is_reassembled_before_reply_gate(tmp_path, monkeypatch):
+    """Two `(part i/N)` messages from the same sender → one LLM round on the
+    joined payload, not two on the fragments."""
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "bob",
+            "text": "(part 1/2)\n@alice please review:\ndef add(a, b):",
+        }) + "\n",
+        json.dumps({
+            "id": "m2",
+            "sender_id": "bob",
+            "text": "(part 2/2)\n    return a + b",
+        }) + "\n",
+    ]
+    scripted = [json.dumps({"type": "final", "answer": "Reviewed: add looks correct."})]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert len(replies) == 1
+    assert "Reviewed" in replies[0]["text"]
+    # Exactly one LLM round — proves the parts were collapsed before the gate.
+    assert ctx["fake_chat"].calls == 1
+    # The LLM saw the joined body, with both halves of the function present.
+    seen = json.dumps(ctx["fake_chat"].messages[-1])
+    assert "def add(a, b):" in seen
+    assert "return a + b" in seen
+    # Neither raw "(part 1/2)" nor "(part 2/2)" should leak into the prompt —
+    # the header is stripped during reassembly.
+    assert "(part 1/2)" not in seen
+    assert "(part 2/2)" not in seen
 
 
 def test_broadcast_message_triggers_reply(tmp_path, monkeypatch):
@@ -535,11 +780,11 @@ def test_skip_reason_printed_in_runpod_mode(tmp_path, monkeypatch, capsys):
     assert "not addressed" in captured.out
 
 
-def test_runpod_with_existing_projects_defers_and_skips_until_chosen(tmp_path, monkeypatch, capsys):
+def test_runpod_with_existing_projects_still_replies_without_writes(tmp_path, monkeypatch, capsys):
     """When the runpod agent boots and finds existing projectN/ dirs, it must
-    NOT auto-select one — that's how a reconnect silently lands on stale
-    state. Instead it should print the deferred-selection banner and skip
-    inbound messages until the operator runs :project new or :project use N."""
+    NOT auto-select one (reconnect-safety). But it must also NOT park inbound
+    — the agent should still converse, with file-write tools refused at
+    dispatch until the operator runs :project new / :project use N."""
 
     private = tmp_path / "alice"
     private.mkdir()
@@ -550,8 +795,8 @@ def test_runpod_with_existing_projects_defers_and_skips_until_chosen(tmp_path, m
     peer_lines = [
         json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe please continue"}) + "\n",
     ]
-    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies=[])
-    # _setup_run forces AGENT_MODE=stub; flip it to runpod for this test.
+    scripted = [json.dumps({"type": "final", "answer": "ack, no project yet"})]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
     monkeypatch.setenv("AGENT_MODE", "runpod")
 
     t = threading.Thread(target=ctx["runner"])
@@ -560,20 +805,77 @@ def test_runpod_with_existing_projects_defers_and_skips_until_chosen(tmp_path, m
     ctx["stop"].set()
     t.join(timeout=5.0)
 
-    assert ctx["fake_chat"].calls == 0
-    captured = capsys.readouterr()
-    # New unified `[project?]` block — used both on startup-with-existing
-    # and on every skipped inbound, so `docker attach` sees the same prompt
-    # regardless of when the operator joined.
-    assert "[project?] existing: project1, project2" in captured.out
-    assert "no active project" in captured.out
-    assert "PROJECT: <name>" in captured.out  # the third resolution hint
+    # The agent ran the LLM and emitted a reply despite no active project.
+    assert ctx["fake_chat"].calls == 1
+    replies = _outbox_replies(ctx["outbox"])
+    assert len(replies) == 1
+    assert "no project yet" in replies[0]["text"]
 
-    decision_rows = [
-        content for role, kind, content in _events(ctx["store"])
-        if kind == "reply_decision"
+    captured = capsys.readouterr()
+    # Boot-time banner still lists the existing projects so a fresh
+    # `docker attach` sees them.
+    assert "[project?] existing: project1, project2" in captured.out
+    # Per-inbound advisory tells the operator chat is live but writes aren't.
+    assert "replying without writes" in captured.out
+
+    events = _events(ctx["store"])
+    # No park/skip events should fire any more.
+    assert not any(kind == "inbound_parked_no_project" for _role, kind, _content in events)
+    assert any(kind == "no_active_project_advisory" for _role, kind, _content in events)
+
+
+def test_continue_retries_last_request_after_project_selection(tmp_path, monkeypatch):
+    """Runpod reconnect flow: a task can arrive before the operator selects
+    a project. After `:project new`, `:continue` should wake the agent and
+    retry the same request with active-project guidance."""
+
+    private = tmp_path / "alice"
+    private.mkdir()
+    (private / "project1").mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "@alice-swe create calculator.py with add and subtract",
+        })
+        + "\n",
     ]
-    assert any("no_active_project" in row for row in decision_rows)
+    scripted = [
+        json.dumps({"type": "final", "answer": "Cannot write yet; no active project."}),
+        json.dumps({"type": "final", "answer": "Continuing in the active project."}),
+    ]
+    ctx = _setup_run(
+        tmp_path,
+        monkeypatch,
+        peer_lines,
+        scripted,
+        console_stdin_text=":project new\n:continue\n",
+    )
+    monkeypatch.setenv("AGENT_MODE", "runpod")
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    assert _wait_for(lambda: ctx["fake_chat"].calls == 1, timeout=5.0)
+    ctx["console"].start()
+    assert _wait_for(lambda: ctx["fake_chat"].calls == 2, timeout=5.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert (private / "project2").is_dir()
+    assert "[continue queued]" in ctx["console_stdout"].getvalue()
+    replies = _outbox_replies(ctx["outbox"])
+    assert any("Continuing in the active project" in payload["text"] for payload in replies)
+
+    second_call = ctx["fake_chat"].messages[1]
+    combined = "\n".join(m.get("content", "") for m in second_call if isinstance(m, dict))
+    assert "Operator typed :continue" in combined
+    assert "Original request: @alice-swe create calculator.py" in combined
+    assert "/workspace/alice/project2/" in combined
+
+    events = _events(ctx["store"])
+    assert any(kind == "operator_continue" for _role, kind, _content in events)
 
 
 def test_runpod_with_no_existing_projects_auto_creates_project1(tmp_path, monkeypatch, capsys):
@@ -711,13 +1013,14 @@ def test_task_status_acceptance_triggers_internal_continuation(tmp_path, monkeyp
     t.join(timeout=5.0)
 
     replies = _outbox_replies(ctx["outbox"])
-    # The private workspace path is rewritten to /workspace/<self>/ on the wire
-    # (see peer.scrub_outbound) so peers cannot guess sibling project paths.
+    # The agent id segment is stripped on the wire (see peer.scrub_outbound)
+    # so peers cannot guess sibling project paths. The stripped form also
+    # matches what the tool observation layer shows the LLM locally.
     assert [payload["text"] for payload in replies] == [
         "Bekräftat, jag tar: terminal-kalkylator",
         (
             "Klar med: terminal-kalkylator. "
-            "Filer: /workspace/<self>/project1/calculator.py. Tester: inte körda."
+            "Filer: /workspace/project1/calculator.py. Tester: inte körda."
         ),
     ]
     assert (project / "calculator.py").read_text(encoding="utf-8") == content
@@ -945,6 +1248,86 @@ def test_intro_line_is_posted_once_then_suppressed(tmp_path, monkeypatch):
     assert any(kind == "intro_suppressed" for _role, kind, _content in events)
 
 
+def test_prior_intro_in_session_log_suppresses_restart_intro(tmp_path, monkeypatch):
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe please say hi"}) + "\n",
+    ]
+    scripted = [
+        json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+    ctx["store"].record("assistant", "peer_reply_raw", "Hej, jag är alice-swe")
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.5)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    assert _outbox_replies(ctx["outbox"]) == []
+    events = _events(ctx["store"])
+    assert any(kind == "intro_suppressed" for _role, kind, _content in events)
+
+
+def test_direct_actionable_intro_reprompts_not_sent(tmp_path, monkeypatch):
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "@alice-swe, please share index.html with @alexia-kazim-agent",
+        })
+        + "\n",
+    ]
+    scripted = [
+        json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
+        json.dumps({
+            "type": "final",
+            "answer": "Blocker: I need the exact workspace file path for index.html.",
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    assert _wait_for(lambda: ctx["fake_chat"].calls == 2, timeout=5.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert [reply["text"] for reply in replies] == [
+        "Blocker: I need the exact workspace file path for index.html."
+    ]
+    events = _events(ctx["store"])
+    assert any(kind == "user_action_non_action_reprompt" for _role, kind, _content in events)
+
+
+def test_presence_reply_is_not_misclassified_as_intro(tmp_path, monkeypatch):
+    """A Swedish presence answer starts like the intro but is not the canonical
+    one-line intro and must still reach the hub."""
+
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe please say hi"}) + "\n",
+        json.dumps({"id": "m2", "sender_id": "emil-user", "text": "@alice-swe are you here?"}) + "\n",
+    ]
+    scripted = [
+        json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
+        json.dumps({"type": "final", "answer": "Hej, jag är här."}),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(2.5)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert [r["text"] for r in replies] == ["Hej, jag är alice-swe", "Hej, jag är här."]
+
+    events = _events(ctx["store"])
+    assert not any(kind == "intro_suppressed" for _role, kind, _content in events)
+
+
 def test_empty_acknowledgment_reply_is_suppressed(tmp_path, monkeypatch):
     """Reply-discipline runtime gate: "Okej, jag förstår. Jag avvaktar..." is
     a content-free reply and never reaches the hub."""
@@ -971,6 +1354,58 @@ def test_empty_acknowledgment_reply_is_suppressed(tmp_path, monkeypatch):
 
     events = _events(ctx["store"])
     assert any(kind == "acknowledgment_suppressed" for _role, kind, _content in events)
+
+
+def test_direct_coordinator_assignment_reprompts_suppressed_intro(tmp_path, monkeypatch):
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": (
+                "@alice-swe, You are the manager/coordinator for this task; "
+                "delegate implementation, testing, review, bug checking, and documentation."
+            ),
+        })
+        + "\n",
+    ]
+    scripted = [
+        json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
+        json.dumps({
+            "type": "final",
+            "answer": (
+                "Confirmed, I'll take: coordination\n"
+                "TASK @bob-swe: implement calculator.py\n"
+                "TASK @carol-swe: write pytest tests"
+            ),
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(2.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert len(replies) == 1
+    assert replies[0]["text"].startswith("Confirmed, I'll take: coordination")
+    assert "TASK @bob-swe" in replies[0]["text"]
+    assert ctx["fake_chat"].calls == 2
+
+    first_call = "\n".join(
+        m.get("content", "") for m in ctx["fake_chat"].messages[0] if isinstance(m, dict)
+    )
+    assert "Direct coordinator assignment detected" in first_call
+
+    events = _events(ctx["store"])
+    assert any(kind == "intro_suppressed" for _role, kind, _content in events)
+    assert any(kind == "direct_assignment_reprompt" for _role, kind, _content in events)
+    assert any(
+        kind == "task_status_continuation_skipped"
+        and "coordination role status" in content
+        for _role, kind, content in events
+    )
 
 
 def test_substantive_reply_is_not_suppressed(tmp_path, monkeypatch):
@@ -1253,10 +1688,81 @@ def test_remote_mode_auto_allocates_on_project_directive(tmp_path, monkeypatch, 
     assert ctx["fake_chat"].calls == 1
 
 
-def test_no_directive_still_skips_in_remote_mode(tmp_path, monkeypatch, capsys):
-    """An inbound without `PROJECT: <name>` keeps the existing safety brake:
-    no auto-allocate, the rich skip prompt is printed, and the LLM is never
-    called."""
+def test_remote_mode_auto_allocates_on_peer_shared_code(tmp_path, monkeypatch):
+    """Remote (runpod) mode + no active project + inbound carries a fenced
+    code block but NO `PROJECT:` directive → the runtime allocates the next
+    numeric `projectN`, saves the block to disk, and a second fenced-code
+    inbound lands in the SAME project (stickiness)."""
+
+    private = tmp_path / "alice"
+    private.mkdir()
+    # Force the startup "existing projects found" branch so the runtime defers
+    # allocation to the inbound — otherwise an empty workspace auto-allocates
+    # project1 at boot and our message can't drive the code-share branch.
+    (private / "project1").mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    first_text = (
+        "I will take the role of writing the main game logic.\n"
+        "```python\n"
+        "# file: game.py\n"
+        "def play():\n"
+        "    return 42\n"
+        "```\n"
+        "Next, I will wait for others."
+    )
+    second_text = (
+        "Here is the helper too.\n"
+        "```python\n"
+        "# file: helper.py\n"
+        "def helper():\n"
+        "    return 1\n"
+        "```"
+    )
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "sonia-agent", "text": first_text}) + "\n",
+        json.dumps({"id": "m2", "sender_id": "sonia-agent", "text": second_text}) + "\n",
+    ]
+    scripted = [
+        json.dumps({"type": "final", "answer": "ack"}),
+        json.dumps({"type": "final", "answer": "ack2"}),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+    monkeypatch.setenv("AGENT_MODE", "runpod")
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.6)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    events = _events(ctx["store"])
+    alloc = [
+        content for _role, kind, content in events
+        if kind == "project_auto_allocated_from_code"
+    ]
+    assert alloc, "expected a project_auto_allocated_from_code event"
+    assert any(
+        "name=project2" in row and "sender=sonia-agent" in row for row in alloc
+    )
+    # Exactly one auto-allocation across the two inbounds (stickiness).
+    assert len(alloc) == 1
+    # The block from message 1 landed under project2 (project1 was pre-created).
+    assert (private / "project2" / "game.py").is_file()
+    assert "def play()" in (private / "project2" / "game.py").read_text()
+    # The block from message 2 also landed under the same project2.
+    assert (private / "project2" / "helper.py").is_file()
+    # No PROJECT-directive-based allocation event was logged.
+    assert not any(
+        kind == "project_auto_allocated" for _role, kind, _content in events
+    )
+
+
+def test_no_directive_still_converses_without_auto_allocating(tmp_path, monkeypatch, capsys):
+    """An inbound with neither `PROJECT: <name>` nor any fenced code block
+    must NOT auto-allocate a project (that's the reconnect-safety brake),
+    but the agent should still run the LLM and converse. Writes are blocked
+    at dispatch instead of at the inbound gate."""
 
     private = tmp_path / "alice"
     private.mkdir()
@@ -1271,7 +1777,8 @@ def test_no_directive_still_skips_in_remote_mode(tmp_path, monkeypatch, capsys):
         })
         + "\n",
     ]
-    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted_replies=[])
+    scripted = [json.dumps({"type": "final", "answer": "pong"})]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
     monkeypatch.setenv("AGENT_MODE", "runpod")
 
     t = threading.Thread(target=ctx["runner"])
@@ -1280,13 +1787,14 @@ def test_no_directive_still_skips_in_remote_mode(tmp_path, monkeypatch, capsys):
     ctx["stop"].set()
     t.join(timeout=5.0)
 
-    assert ctx["fake_chat"].calls == 0
+    assert ctx["fake_chat"].calls == 1
+    replies = _outbox_replies(ctx["outbox"])
+    assert len(replies) == 1
+    assert replies[0]["text"] == "pong"
     events = _events(ctx["store"])
+    # No project_auto_allocated event — only an explicit PROJECT: directive
+    # can flip the safety brake.
     assert not any(kind == "project_auto_allocated" for _role, kind, _content in events)
-    captured = capsys.readouterr()
-    assert "[project?] no active project" in captured.out
-    assert "msg m1" in captured.out
-    assert "PROJECT: <name>" in captured.out
 
 
 def test_local_mode_auto_allocates_named_dir_on_project_directive(tmp_path, monkeypatch):
@@ -1365,3 +1873,173 @@ def test_system_prompt_has_no_workspace_or_claim_policy_content():
     # Protocol-line templates (CLAIM/RELEASE plus the path shape).
     assert "CLAIM /workspace/shared/" not in prompt
     assert "RELEASE /workspace/shared/" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Runpod no-active-project: chat works, file writes are refused at dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_runpod_no_project_refuses_write_tools(tmp_path, monkeypatch, capsys):
+    """When runpod mode has no active project, the model can still talk, but
+    every CLAIM_GATED write tool (create_file/append_text/edit_section/
+    replace_text/rename_file) is refused at dispatch with the
+    NO_PROJECT_REFUSAL observation. Nothing lands on disk."""
+
+    from peer_task import NO_PROJECT_REFUSAL
+
+    private = tmp_path / "alice"
+    private.mkdir()
+    (private / "project1").mkdir()  # existing → boot defers active selection
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "@alice-swe please create foo.py with print('hi')",
+        })
+        + "\n",
+    ]
+    # The model first emits a create_file (which the runtime refuses) and
+    # then a final answer.
+    scripted = [
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {"path": "foo.py", "content": "print('hi')\n"},
+        }),
+        json.dumps({"type": "final", "answer": "Cannot write yet — no active project."}),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+    monkeypatch.setenv("AGENT_MODE", "runpod")
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    # No project1/foo.py should exist (write refused).
+    assert not (private / "project1" / "foo.py").exists()
+    assert not (private / "foo.py").exists()
+
+    # The refusal was logged as a no_project_block system event.
+    events = _events(ctx["store"])
+    blocks = [
+        content for _role, kind, content in events if kind == "no_project_block"
+    ]
+    assert blocks, "expected a no_project_block event"
+    assert NO_PROJECT_REFUSAL in blocks[0]
+
+    # The second scripted reply reached the wire.
+    replies = _outbox_replies(ctx["outbox"])
+    assert any("Cannot write yet" in payload["text"] for payload in replies)
+
+
+def test_runpod_no_project_passes_conversation_guidance(tmp_path, monkeypatch):
+    """The `_no_project_conversation_guidance()` text must be visible in the
+    prompt sent to `complete_chat_with_metadata` so the model knows it can
+    talk but not write."""
+
+    private = tmp_path / "alice"
+    private.mkdir()
+    (private / "project1").mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe ping"}) + "\n",
+    ]
+    scripted = [json.dumps({"type": "final", "answer": "pong"})]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+    monkeypatch.setenv("AGENT_MODE", "runpod")
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(1.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    # The guidance string is appended to the runtime context for the LLM call.
+    assert ctx["fake_chat"].calls >= 1
+    seen = ctx["fake_chat"].messages[0]
+    combined = "\n".join(m.get("content", "") for m in seen if isinstance(m, dict))
+    # Marker phrase from `_no_project_conversation_guidance()`.
+    assert "no active project is allocated yet" in combined
+
+
+# ---------------------------------------------------------------------------
+# AGENT_MODE=local: docker-compose local-profile default
+# ---------------------------------------------------------------------------
+
+
+def test_project_root_treats_agent_mode_local_as_shared(tmp_path, monkeypatch):
+    """`AGENT_MODE=local` (the docker-compose local-profile default) must
+    activate shared mode when `SHARED_WORKSPACE` is set, matching how
+    `agent-alice` / `agent-bob` containers run. Pins the contract so the
+    compose default flip stays load-bearing."""
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+
+    root, is_shared = _project_root("local", tmp_path / "alice")
+    assert root == shared
+    assert is_shared is True
+
+    monkeypatch.delenv("SHARED_WORKSPACE", raising=False)
+    root, is_shared = _project_root("local", tmp_path / "alice")
+    assert root is None
+    assert is_shared is False
+
+    # And runpod still wins regardless of SHARED_WORKSPACE.
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+    root, is_shared = _project_root("runpod", tmp_path / "alice")
+    assert root == tmp_path / "alice"
+    assert is_shared is False
+
+
+# ---------------------------------------------------------------------------
+# Project handler: `:project new/use/info/list` mutates state correctly
+# ---------------------------------------------------------------------------
+
+
+def test_project_handler_mutates_active_for_each_command(tmp_path):
+    """`_build_project_handler` is called from the console daemon thread.
+    Mutating commands (`new`, `use N`) update `project_state.active`; reading
+    commands (`info`, `list`) do not. Invalid `use N` is a no-op error."""
+
+    root = tmp_path / "alice"
+    root.mkdir()
+    (root / "project1").mkdir()
+
+    state = _ProjectState()
+    state.root = root
+    state.active = None
+
+    handler = _build_project_handler(state)
+
+    # :project new -> allocates project2
+    out = handler("new", [])
+    assert out.startswith("active=project2")
+    assert state.active is not None
+    assert state.active.name == "project2"
+
+    # :project use 1 -> switches to project1
+    out = handler("use", ["1"])
+    assert out == "active=project1"
+    assert state.active.name == "project1"
+
+    # :project info -> READ only
+    out = handler("info", [])
+    assert out == "active=project1"
+    assert state.active.name == "project1"
+
+    # :project list -> READ only
+    handler("list", [])
+    assert state.active.name == "project1"
+
+    # :project use with invalid N -> error, state unchanged
+    out = handler("use", ["999999"])
+    assert out.startswith("[project error]")
+    assert state.active.name == "project1"

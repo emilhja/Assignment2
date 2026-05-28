@@ -35,6 +35,9 @@ PROJECT_DIRECTIVE_PATTERN = re.compile(
 PYTEST_REQUEST_PATTERN = re.compile(r"(?i)\b(?:pytest|tests?)\b")
 PYTEST_FIX_PATTERN = re.compile(r"(?i)\b(?:fix|repair|update|debug)\b.*\b(?:pytest|tests?)\b")
 SHARED_TEST_PATH_PATTERN = re.compile(r"(?P<path>/workspace/shared/(?:test_[^\s:;,]+|[^\s:;,]+_test)\.py)")
+PRIVATE_TEST_PATH_PATTERN = re.compile(
+    r"(?P<path>/workspace/[A-Za-z0-9_-]+/project\d+/(?:test_[^\s:;,]+|[^\s:;,]+_test)\.py)"
+)
 STATUS_REQUEST_PATTERN = re.compile(
     r"(?i)(?:\bare\s+you\s+(?:done|finished)\b"
     r"|\b(?:did|have)\s+you\s+(?:finish|complete)(?:ed)?\b"
@@ -341,6 +344,29 @@ def _latest_shared_test_path(recent_context: Iterable[dict[str, str]]) -> str | 
     return _test_path_for_source(plan.path)
 
 
+def _latest_self_test_path(
+    recent_context: Iterable[dict[str, str]],
+    agent_aliases: set[str],
+) -> str | None:
+    """Return the agent's own most recent private-workspace test path.
+
+    In runpod-private mode there is no `/workspace/shared/...` test path —
+    each agent writes under `/workspace/<agent_id>/projectN/`. Scanning
+    only the agent's own prior chat messages (matched via aliases) avoids
+    surfacing a peer's path into this agent's status hint.
+    """
+
+    for entry in reversed(list(recent_context)):
+        sender = str(entry.get("sender_id") or "").lower()
+        if sender not in agent_aliases:
+            continue
+        text = str(entry.get("text") or "")
+        match = PRIVATE_TEST_PATH_PATTERN.search(text)
+        if match:
+            return match.group("path").rstrip(".")
+    return None
+
+
 def _claim_sender_matches(sender: str, peer: str) -> bool:
     sender_norm = sender.lower()
     peer_norm = peer.lower().lstrip("@")
@@ -440,7 +466,9 @@ def status_request_guidance(
 
     if not isinstance(text, str) or STATUS_REQUEST_PATTERN.search(text) is None:
         return None
-    test_path = _latest_shared_test_path(recent_context or [])
+    test_path = _latest_shared_test_path(recent_context or []) or _latest_self_test_path(
+        recent_context or [], _agent_aliases(agent_id, display_name)
+    )
     test_hint = (
         f" If you have not yet run pytest for your scope, call run_tests on {test_path} first."
         if test_path
@@ -460,6 +488,7 @@ def status_request_guidance(
         "'Done: <one-line summary of what you implemented> at </workspace/shared/...>. "
         "Tests: <ran and passed | ran and failed | not run> (include the test file path if you ran them). "
         "Blockers: <none | brief description>.' "
+        "Do not create, overwrite, or rewrite files just to answer a status request. "
         "Do not invent results — only report tests as ran if a successful run_tests observation exists "
         f"in this round.{test_hint}{blocker_hint}"
     )

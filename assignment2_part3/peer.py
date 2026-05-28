@@ -84,6 +84,41 @@ def peer_intent_refusal(text: str) -> Optional[str]:
     return None
 
 
+MAX_OUTBOUND_WORDS = 4000
+
+
+def truncate_message(
+    text: str,
+    max_words: int = MAX_OUTBOUND_WORDS,
+) -> tuple[str, bool]:
+    """Truncate `text` to `max_words` whitespace-separated words.
+
+    Returns `(text, was_truncated)`. When truncation fires, the result is
+    the kept prefix plus a `... [truncated: N more words]` marker so the
+    receiver can see that content was dropped. Whitespace-only or empty
+    input is returned unchanged.
+
+    Word boundaries are runs of non-whitespace characters. The kept
+    portion preserves the original spacing/newlines up to the boundary
+    after the `max_words`-th word.
+    """
+
+    if not isinstance(text, str) or not text:
+        return text or "", False
+    total = len(text.split())
+    if total <= max_words:
+        return text, False
+    if max_words <= 0:
+        return f"... [truncated: {total} more words]", True
+    last_end = 0
+    for idx, match in enumerate(re.finditer(r"\S+", text), start=1):
+        last_end = match.end()
+        if idx == max_words:
+            break
+    dropped = total - max_words
+    return f"{text[:last_end]}\n... [truncated: {dropped} more words]", True
+
+
 # Outbound scrubbing. Each entry is (kind_label, regex). Matches are replaced
 # with `[REDACTED:<kind>]` before the text leaves the process.
 CREDENTIAL_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -110,10 +145,11 @@ def scrub_outbound(
     """Redact credential-shaped strings and private workspace paths.
 
     Return (scrubbed_text, kinds_hit). When `agent_id` is provided, any
-    `/workspace/<agent_id>/...` prefix is rewritten to `/workspace/<self>/...`
-    so peers cannot see the literal id or guess sibling project paths. The
-    show-your-work protocol still works for the agent itself because the
-    rewrite happens only on the wire.
+    `/workspace/<agent_id>/...` prefix is stripped to `/workspace/...` so
+    peers cannot see the literal id or guess sibling project paths. The
+    stripped form also matches what the tool observation layer (Part 2's
+    `_display_workspace_path`) shows the LLM, so the outbound text is
+    consistent with what the agent saw locally.
     """
 
     if not isinstance(text, str) or not text:
@@ -134,9 +170,13 @@ def scrub_outbound(
         private_pattern = re.compile(
             rf"/workspace/{re.escape(agent_id)}(?=/|\b)"
         )
-        new_text, count = private_pattern.subn("/workspace/<self>", scrubbed)
+        new_text, count = private_pattern.subn("/workspace", scrubbed)
         if count:
             hits.append("private_workspace_path")
             scrubbed = new_text
+
+    scrubbed, truncated = truncate_message(scrubbed)
+    if truncated:
+        hits.append("truncated_words")
 
     return scrubbed, hits

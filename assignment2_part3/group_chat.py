@@ -8,13 +8,15 @@ Tiny by design: every concern lives in its own module. This file only:
   4. Loops: recv → should_reply → run_peer_task → transport.send.
 
 Local console only handles operator commands (`:budget`, `:limit`,
-`:pause`, `:resume`, `:approve`, `:deny`, `:stop`). It never carries the
-agent's conversation — that goes through the transport only (P3.4).
+`:pause`, `:resume`, `:continue`, `:approve`, `:deny`, `:project`,
+`:stop`). It never carries ordinary agent conversation — that goes through
+the transport only (P3.4).
 """
 
 from __future__ import annotations
 
 import os
+import queue
 import re
 import sys
 import threading
@@ -50,6 +52,7 @@ from coordination import (
     status_request_guidance,
 )
 from console_control import ConsoleControl
+from message_assembler import MultipartAssembler
 from peer import PeerMessage
 from peer_task import run_peer_task
 from reply_policy import CollisionInfo, should_reply
@@ -96,11 +99,37 @@ CONFIRMATION_REQUEST_PATTERN = re.compile(
     r")\b"
 )
 TEST_REQUEST_PATTERN = re.compile(r"(?i)\b(?:pytest|tests?|tester)\b")
+MISSING_PART_REQUEST_PATTERN = re.compile(
+    r"(?is)("
+    r"\b(?:where\s+is|missing|lost|send|resend|provide|show)\b.{0,120}\bpart\s+\d+\s*/\s*\d+\b"
+    r"|"
+    r"\bpart\s+\d+\s*/\s*\d+\b.{0,120}\b(?:missing|lost|where|send|resend|provide|show)\b"
+    r")"
+)
+RESEND_CODE_REQUEST_PATTERN = re.compile(
+    r"(?is)\b(?:send|resend|provide|show|paste)\b.{0,80}\b(?:full|complete|current)?\s*"
+    r"(?:code|file|contents?)\b"
+)
+DIRECT_ACTION_REQUEST_PATTERN = re.compile(
+    r"(?i)\b(?:share|shares|sharing|send|sends|sending|show|shows|showing|"
+    r"paste|pastes|pasting|read|reads|reading|run|runs|running|test|testing|"
+    r"review|reviews|reviewing|create|creates|creating|update|updates|updating|"
+    r"fix|fixes|fixing)\b"
+)
+DIRECT_FILE_SHARE_PATTERN = re.compile(
+    r"(?is)\b(?:share|send|show|paste|read)\b.{0,80}\b"
+    r"(?P<filename>[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})\b"
+)
+WORKSPACE_PATH_PATTERN = re.compile(r"(/workspace/[^\s`'\"<>),;]+)")
 # Matches the canonical one-line intro the system prompt requires (P3.7).
-# Used to suppress a second intro in the same session — the prompt forbids
-# repeating it, but the model occasionally regresses on long sessions, so the
-# runtime enforces it too.
-INTRO_LINE_PATTERN = re.compile(r"^\s*hej,?\s*jag\s+(?:är|ar)\s+\S+", re.IGNORECASE)
+# Used to suppress a second intro in the same session. Keep this exact to the
+# configured display name so presence replies like "Hej, jag är här" are not
+# mistaken for a repeated introduction.
+INTRO_LINE_TEMPLATE = r"^\s*hej,?\s*jag\s+(?:är|ar)\s+@?{display_name}\s*[\.!]?\s*$"
+COORDINATOR_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)\b(?:you\s+are|act\s+as|be)\s+(?:the\s+)?"
+    r"(?:manager|coordinator|lead|samordnare|projektledare)\b"
+)
 
 
 @dataclass
@@ -169,6 +198,31 @@ def _remote_workspace_guidance(agent_id: str, project_name: str) -> str:
         "peers see and reuse what you produced on a no-shared-filesystem hub. "
         "When you have run pytest, also include the pytest result line so "
         "everyone knows what was verified."
+    )
+
+
+def _no_project_conversation_guidance() -> str:
+    """Runtime guidance shown to runpod agents that have no active project.
+
+    The agent is still expected to converse with the hub — answer questions,
+    plan, ask for clarification — but the runtime will refuse any
+    create_file/append_text/edit_section/replace_text/rename_file call until
+    `:project new` is run or a broadcast carries `PROJECT: <name>`. This
+    string tells the model both halves so it does not assert "done" or "wrote"
+    for work that has not been performed.
+    """
+
+    return (
+        "Remote hub mode, but no active project is allocated yet. You may "
+        "converse, plan, ask clarifying questions, and read existing files. "
+        "Do NOT call create_file, append_text, edit_section, replace_text, "
+        "or rename_file in this round — the runtime will refuse them with "
+        "\"refused: no active project ...\". If the task requires writing "
+        "files, ask the operator (in chat) to type `:project new` in the "
+        "agent console, or to include `PROJECT: <name>` in their next "
+        "broadcast. Truthful-completion rule still applies: do not claim "
+        "'done', 'created', 'wrote', or 'saved' for work that has not been "
+        "performed."
     )
 
 
@@ -279,9 +333,7 @@ def _local_workspace_guidance(agent_id: str, project_dir: Path) -> str:
     )
 
 
-def _build_project_handler(
-    project_state: _ProjectState,
-):
+def _build_project_handler(project_state: _ProjectState):
     def _root() -> Path | None:
         return project_state.root
 
@@ -374,17 +426,13 @@ def _log(store: SessionStore, kind: str, content: str) -> None:
     store.record("system", kind, content)
 
 
-def _render_no_project_prompt(
-    project_root: Path,
-    msg_id: str | None,
-    sender_id: str | None,
-) -> str:
+def _render_no_project_prompt(project_root: Path) -> str:
     """Multi-line `[project?]` block for the docker-attach reconnect flow.
 
-    Shown both at startup (when existing projects are found, no active project
-    is set yet) and on every skipped inbound. Lists existing `projectN`
-    directories and the three ways to move forward — so a late `docker attach`
-    sees the same instructions regardless of when the operator joined.
+    Shown at startup (when existing projects are found, no active project is
+    set yet). The agent still talks to the hub in this state, but file-write
+    tools are refused at dispatch until the operator picks a project — so the
+    banner spells out both halves: chat works, writes don't.
     """
     existing: list[str] = []
     if project_root.exists():
@@ -396,13 +444,10 @@ def _render_no_project_prompt(
             ),
             key=lambda n: int(n[len("project"):]),
         )
-    if msg_id is not None and sender_id is not None:
-        header = (
-            f"[project?] no active project — inbound msg {msg_id} from "
-            f"{sender_id} skipped."
-        )
-    else:
-        header = "[project?] no active project."
+    header = (
+        "[project?] no active project — replying to chat is enabled, "
+        "but file-write tools are refused until you choose one."
+    )
     return colors.dim(
         header
         + "\n[project?] existing: "
@@ -460,6 +505,30 @@ def _task_status_continuation_message(original: PeerMessage, status: TaskStatus)
     )
 
 
+def _operator_continue_message(original: PeerMessage, active_project: str | None) -> PeerMessage:
+    project_hint = (
+        f"The active project is now {active_project}. "
+        if active_project
+        else "There is still no active project. "
+    )
+    text = (
+        "Operator typed :continue in the local console. "
+        "Continue or retry the last actionable hub request now. "
+        f"{project_hint}"
+        "If you previously stopped because no project was active, do not repeat "
+        "that blocker when an active project is available; use the appropriate "
+        "tools now. "
+        f"Original sender: {original.sender_id}. "
+        f"Original request: {original.text}"
+    )
+    return PeerMessage(
+        id=f"{original.id}:operator-continue:{int(time.time())}",
+        sender_id="runtime",
+        text=text,
+        addressed_to=(original.sender_id,),
+    )
+
+
 def _is_claim_continuation_message(message: PeerMessage) -> bool:
     return message.sender_id == "runtime" and ":claim-continuation:" in message.id
 
@@ -472,6 +541,134 @@ def _context_entry(sender_id: str, text: str, message_id: str | None = None) -> 
     if message_id is not None:
         entry["message_id"] = message_id
     return entry
+
+
+def _latest_self_workspace_path(
+    recent_context: list[dict[str, str]] | None,
+    *,
+    agent_id: str,
+    display_name: str,
+) -> str | None:
+    """Return the newest workspace path this agent reported to chat."""
+
+    self_names = {
+        name.lower()
+        for name in (agent_id, display_name)
+        if isinstance(name, str) and name.strip()
+    }
+    for entry in reversed(recent_context or []):
+        sender = str(entry.get("sender_id") or "").lower()
+        if sender not in self_names:
+            continue
+        text = str(entry.get("text") or "")
+        matches = [match.rstrip(".:") for match in WORKSPACE_PATH_PATTERN.findall(text)]
+        if matches:
+            return matches[-1]
+    return None
+
+
+def _is_directly_addressed(text: str, agent_id: str, display_name: str) -> bool:
+    lowered = (text or "").lower()
+    return (
+        f"@{display_name.lower()}" in lowered
+        or f"@{agent_id.lower()}" in lowered
+        or re.search(rf"(?i)^\s*{re.escape(display_name)}\b\s*[:,\-]", text or "") is not None
+        or re.search(rf"(?i)^\s*{re.escape(agent_id)}\b\s*[:,\-]", text or "") is not None
+    )
+
+
+def _direct_file_share_filename(text: str) -> str | None:
+    match = DIRECT_FILE_SHARE_PATTERN.search(text or "")
+    if match is None:
+        return None
+    filename = match.group("filename").strip()
+    # Only accept a basename. The guidance path must come from runtime state,
+    # not from untrusted prose that may smuggle traversal or a private path.
+    if filename in {"", ".", ".."} or "/" in filename or "\\" in filename:
+        return None
+    return filename
+
+
+def _active_project_tool_path(
+    filename: str,
+    *,
+    active_project: Path | None,
+    is_shared: bool,
+    runpod: bool,
+    agent_id: str,
+) -> str | None:
+    if active_project is None:
+        return None
+    candidate = active_project / filename
+    if not candidate.is_file():
+        return None
+    if is_shared:
+        return f"/workspace/shared/{active_project.name}/{filename}"
+    if runpod:
+        return f"/workspace/{agent_id}/{active_project.name}/{filename}"
+    return None
+
+
+def _resend_request_guidance(
+    text: str,
+    *,
+    agent_id: str,
+    display_name: str,
+    recent_context: list[dict[str, str]] | None = None,
+    active_project: Path | None = None,
+    project_is_shared: bool = False,
+    runpod: bool = False,
+) -> str | None:
+    if not isinstance(text, str):
+        return None
+    requested_filename = _direct_file_share_filename(text)
+    if requested_filename is not None:
+        path = _active_project_tool_path(
+            requested_filename,
+            active_project=active_project,
+            is_shared=project_is_shared,
+            runpod=runpod,
+            agent_id=agent_id,
+        )
+        if path is None:
+            return (
+                f"The operator is asking you to share {requested_filename}, but the "
+                "runtime cannot find that file in the active project. Do not regenerate "
+                "it from chat memory, do not create a replacement, and do not go idle. "
+                "Reply with a concrete blocker and ask for the exact workspace file path."
+            )
+        return (
+            f"The operator is asking you to share {requested_filename} with a peer. "
+            f"Treat {path} as the source of truth. Call read_file on that exact path "
+            "before answering. After read_file, paste the current contents or summarize "
+            "them to the requested @agent. Do not regenerate the file from chat memory, "
+            "do not create a new sibling file, and do not overwrite the existing file."
+        )
+    if (
+        MISSING_PART_REQUEST_PATTERN.search(text) is None
+        and RESEND_CODE_REQUEST_PATTERN.search(text) is None
+    ):
+        return None
+    path = _latest_self_workspace_path(
+        recent_context,
+        agent_id=agent_id,
+        display_name=display_name,
+    )
+    if path is None:
+        return (
+            "The operator is asking for missing or resent code, but no prior "
+            "workspace file path from your own replies is visible in recent context. "
+            "Do not regenerate from memory or overwrite files. Reply with the current "
+            "status and ask for the exact path if a file resend is required."
+        )
+    return (
+        "The operator is asking for a missing part or a resend of code you already "
+        f"reported. Treat {path} as the source of truth. Call read_file on that exact "
+        "path before answering. Do not regenerate the file from memory, do not create "
+        "a new sibling file, and do not overwrite the existing file. After read_file, "
+        "paste the current file contents; if the hub splits the reply, rely on the "
+        "runtime multipart sender."
+    )
 
 
 def _normalized_short_reply(text: str) -> str:
@@ -498,6 +695,83 @@ def _looks_like_operator_sender(sender_id: str, agent_id: str) -> bool:
 def _answer_invites_followup(answer: str) -> bool:
     text = (answer or "").strip()
     return bool(text) and (text.endswith("?") or CONFIRMATION_REQUEST_PATTERN.search(text) is not None)
+
+
+def _is_intro_line(text: str, display_name: str) -> bool:
+    intro_pattern = INTRO_LINE_TEMPLATE.format(display_name=re.escape(display_name))
+    return bool(re.match(intro_pattern, text or "", re.IGNORECASE))
+
+
+def _intro_seen_in_store(store: SessionStore, display_name: str) -> bool:
+    connection = getattr(store, "connection", None)
+    if connection is None:
+        return False
+    try:
+        rows = connection.execute(
+            "SELECT content FROM events ORDER BY id DESC LIMIT 256"
+        ).fetchall()
+    except Exception:
+        return False
+    return any(_is_intro_line(str(row[0] or ""), display_name) for row in rows)
+
+
+def _direct_actionable_request_guidance(message: PeerMessage, agent_id: str, display_name: str) -> str | None:
+    text = message.text or ""
+    if not _is_directly_addressed(text, agent_id, display_name):
+        return None
+    if COORDINATOR_ASSIGNMENT_PATTERN.search(text) is not None:
+        return _direct_coordinator_assignment_guidance(message, agent_id, display_name)
+    if DIRECT_ACTION_REQUEST_PATTERN.search(text) is None:
+        return None
+    return (
+        "Direct actionable request detected. Do not answer with an intro, a readiness "
+        "note, or vague coordination. Perform the requested action using tools, or "
+        "state the concrete blocker that prevents the tool call. For share/send/show/"
+        "paste/read requests about a file, call read_file on the current workspace "
+        "path before answering."
+    )
+
+
+def _direct_coordinator_assignment_guidance(message: PeerMessage, agent_id: str, display_name: str) -> str | None:
+    text = message.text or ""
+    if not _is_directly_addressed(text, agent_id, display_name):
+        return None
+    if COORDINATOR_ASSIGNMENT_PATTERN.search(text) is None:
+        return None
+    return (
+        "Direct coordinator assignment detected. Do not answer with an intro, "
+        "a readiness note, or an invitation for volunteers. Your first visible "
+        "reply must begin exactly `Confirmed, I'll take: coordination` and then "
+        "assign concrete tasks with explicit `TASK @agent-name: <task>` lines. "
+        "As coordinator, do not implement or test unless the operator explicitly "
+        "reassigns you; collect status, enforce no duplicate work, verify the "
+        "final test result, and summarize final run instructions."
+    )
+
+
+def _direct_actionable_reprompt_message(original: PeerMessage, reason: str, *, coordinator: bool) -> PeerMessage:
+    if coordinator:
+        text = (
+            "Your last reply was suppressed because it was a "
+            f"{reason}. The human directly assigned you the coordinator role. "
+            "Reply now with a concrete status message that starts exactly "
+            "`Confirmed, I'll take: coordination`, then provide explicit "
+            "`TASK @agent-name: <task>` assignment lines. Do not introduce "
+            "yourself, say you are merely ready, or ask agents to volunteer."
+        )
+    else:
+        text = (
+            "Your last reply was suppressed because it was a "
+            f"{reason}. The human directly asked you to perform an action. "
+            "Perform the requested action using tools, or state the concrete "
+            "blocker. Do not introduce yourself, say you are ready, or post "
+            "vague coordination."
+        )
+    return PeerMessage(
+        id=f"{original.id}:direct-action-reprompt",
+        sender_id="runtime",
+        text=text,
+    )
 
 
 def _stale_claim_guidance(active_claims: list[Claim]) -> str | None:
@@ -588,6 +862,43 @@ def run_group_chat(
 
     project_state = _ProjectState()
     project_handler = None
+    continue_requests: queue.Queue[float] = queue.Queue()
+    last_wakeable_message: PeerMessage | None = None
+
+    multipart_assembler = MultipartAssembler()
+    multipart_ready: list[PeerMessage] = []
+
+    def _recv_assembled(timeout: float) -> PeerMessage | None:
+        """Receive next downstream-ready message through the multi-part assembler.
+
+        May return None even when the transport delivered a message — that
+        means the message was a part that's still waiting for its siblings.
+        The caller should re-poll. Also surfaces any incomplete groups that
+        have timed out since the last call.
+        """
+        if multipart_ready:
+            return multipart_ready.pop(0)
+        for stale in multipart_assembler.flush_expired(time.time()):
+            multipart_ready.append(stale)
+        if multipart_ready:
+            return multipart_ready.pop(0)
+        raw = transport.recv(timeout=timeout)
+        if raw is None:
+            return None
+        for ready in multipart_assembler.feed(raw, time.time()):
+            multipart_ready.append(ready)
+        if multipart_ready:
+            return multipart_ready.pop(0)
+        return None
+
+    def _queue_continue() -> str:
+        if last_wakeable_message is None:
+            return "[continue] no prior actionable hub message to continue"
+        if runpod and project_state.active is None:
+            return "[continue] no active project; type :project new or :project use N first"
+        continue_requests.put(time.time())
+        return f"[continue queued] retrying msg {last_wakeable_message.id}"
+
     ws_env = os.environ.get("AGENT_WORKSPACE")
     agent_workspace = Path(ws_env) if ws_env else None
     project_root, is_shared = _project_root(mode, agent_workspace)
@@ -614,7 +925,7 @@ def run_group_chat(
                 # Existing projects found — defer to operator so reconnect is explicit.
                 # Render via the same prompt the skip-path uses so a late
                 # `docker attach` sees a consistent message.
-                print(_render_no_project_prompt(project_root, None, None), flush=True)
+                print(_render_no_project_prompt(project_root), flush=True)
         else:
             # Local-hub shared mode: defer allocation. The first inbound message
             # that names /workspace/shared/<name>/ or includes a PROJECT: line
@@ -633,8 +944,14 @@ def run_group_chat(
             stop_event=stop_event,
             send_fn=transport.send,
             project_handler=project_handler,
+            continue_handler=_queue_continue,
         )
         console.start()
+    else:
+        if project_handler is not None and console.project_handler is None:
+            console.project_handler = project_handler
+        if console.continue_handler is None:
+            console.continue_handler = _queue_continue
 
     system_prompt = load_system_prompt(agent_id, display_name)
     recent_replies: list[tuple[float, str]] = []
@@ -648,7 +965,7 @@ def run_group_chat(
         _env_float("PENDING_FOLLOWUP_SECONDS", DEFAULT_PENDING_FOLLOWUP_SECONDS),
     )
     pending_followup: PendingFollowup | None = None
-    intro_sent: bool = False
+    intro_sent: bool = _intro_seen_in_store(store, display_name)
     _log(
         store,
         "session_start",
@@ -668,26 +985,16 @@ def run_group_chat(
         tag = colors.dim(f"[hub{arrow}]")
         print(f"{colors.ts()} {tag} {colors.agent_label(sender)}: {snippet}", flush=True)
 
-    def _print_no_project_prompt(message: PeerMessage) -> None:
-        if project_state.root is None:
-            return
-        print(
-            _render_no_project_prompt(
-                project_state.root, message.id, message.sender_id
-            ),
-            flush=True,
-        )
-
     def _peer_console_log(kind: str, detail: str) -> None:
         """Live-attach trace of LLM/tool/refusal events. Runpod mode only."""
         if not runpod:
             return
         print(f"{colors.ts()} {colors.dim(f'[{kind}]')} {detail}", flush=True)
 
-    def _send_answer(answer: str, msg_id: str) -> None:
+    def _send_answer(answer: str, msg_id: str, *, suppress_intro: bool = False) -> str | None:
         nonlocal pending_followup, intro_sent
-        is_intro = bool(INTRO_LINE_PATTERN.match(answer or ""))
-        if is_intro and intro_sent:
+        is_intro = _is_intro_line(answer or "", display_name)
+        if is_intro and (intro_sent or suppress_intro):
             # Defense-in-depth for the system prompt's "post intro at most once"
             # rule: if the model regresses and posts another intro after a peer
             # broadcast, drop it on the floor instead of sending duplicates to
@@ -700,7 +1007,9 @@ def run_group_chat(
                 del recent_replies[:-64]
             pending_followup = None
             budget.save()
-            return
+            reason = "intro" if suppress_intro and not intro_sent else "duplicate intro"
+            _peer_console_log("suppress", f"{reason} msg_id={msg_id}")
+            return reason
         if not is_intro and looks_like_empty_acknowledgment(answer):
             # Reply-discipline runtime gate: "Okej, jag förstår... Jag avvaktar"
             # carries no peer-unique value, so spend nothing on it. Counted
@@ -711,8 +1020,15 @@ def run_group_chat(
                 del recent_replies[:-64]
             pending_followup = None
             budget.save()
-            return
-        transport.send(answer)
+            _peer_console_log("suppress", f"empty acknowledgment msg_id={msg_id}")
+            return "empty acknowledgment"
+        send_ok = transport.send(answer)
+        if send_ok is False:
+            _log(store, "send_failed", f"msg_id={msg_id}")
+            pending_followup = None
+            budget.save()
+            _peer_console_log("hub!", f"send failed msg_id={msg_id}")
+            return "send failed"
         if is_intro:
             intro_sent = True
         if not runpod:
@@ -729,6 +1045,7 @@ def run_group_chat(
         else:
             pending_followup = None
         budget.save()
+        return None
 
     def _run_task_for_message(
         message: PeerMessage,
@@ -745,6 +1062,13 @@ def run_group_chat(
             )
             if guidance:
                 runtime_guidance.append(guidance)
+        guidance = _direct_coordinator_assignment_guidance(
+            message,
+            agent_id=agent_id,
+            display_name=display_name,
+        )
+        if guidance:
+            runtime_guidance.append(guidance)
         guidance = followup_assignment_guidance(
             message.text,
             agent_id=agent_id,
@@ -758,6 +1082,24 @@ def run_group_chat(
             agent_id=agent_id,
             display_name=display_name,
             recent_context=prior_context or [],
+        )
+        if guidance:
+            runtime_guidance.append(guidance)
+        guidance = _resend_request_guidance(
+            message.text,
+            agent_id=agent_id,
+            display_name=display_name,
+            recent_context=prior_context or [],
+            active_project=project_state.active,
+            project_is_shared=project_state.is_shared,
+            runpod=runpod,
+        )
+        if guidance:
+            runtime_guidance.append(guidance)
+        guidance = _direct_actionable_request_guidance(
+            message,
+            agent_id=agent_id,
+            display_name=display_name,
         )
         if guidance:
             runtime_guidance.append(guidance)
@@ -818,6 +1160,8 @@ def run_group_chat(
                 runtime_guidance.append(
                     _local_workspace_guidance(agent_id, project_state.active)
                 )
+        elif runpod:
+            runtime_guidance.append(_no_project_conversation_guidance())
         try:
             return run_peer_task(
                 message,
@@ -832,6 +1176,11 @@ def run_group_chat(
                 collision=collision,
                 runtime_guidance=runtime_guidance,
                 console_log=_peer_console_log,
+                # Only the runpod path gates writes on the active project.
+                # Local-shared mode lets writes go to /workspace/shared/ directly
+                # (CLAIM/claim-gate handles serialization), so `project_active`
+                # stays True when not running against runpod.
+                project_active=((not runpod) or project_state.active is not None),
             )
         except RuntimeError as exc:
             # Most often: every LLM provider was rate-limited or unreachable.
@@ -848,9 +1197,67 @@ def run_group_chat(
             _log(store, "llm_failure", f"msg_id={message.id} error={exc}")
             return None
 
+    def _send_with_direct_assignment_reprompt(
+        message: PeerMessage,
+        answer: str,
+        prior_context: list[dict[str, str]] | None,
+    ) -> str:
+        coordinator_assignment = (
+            _looks_like_operator_sender(message.sender_id, agent_id)
+            and _direct_coordinator_assignment_guidance(
+                message,
+                agent_id=agent_id,
+                display_name=display_name,
+            )
+            is not None
+        )
+        direct_action = (
+            _looks_like_operator_sender(message.sender_id, agent_id)
+            and _direct_actionable_request_guidance(
+                message,
+                agent_id=agent_id,
+                display_name=display_name,
+            )
+            is not None
+        )
+        suppression = _send_answer(
+            answer,
+            message.id,
+            suppress_intro=direct_action,
+        )
+        if suppression is None:
+            return answer
+        if suppression == "send failed":
+            return ""
+        if not direct_action:
+            return answer
+
+        continuation = _direct_actionable_reprompt_message(
+            message,
+            suppression,
+            coordinator=coordinator_assignment,
+        )
+        _log(
+            store,
+            "direct_assignment_reprompt" if coordinator_assignment else "direct_action_reprompt",
+            f"reason={suppression} from_msg={message.id}",
+        )
+        reprompt_context = list(prior_context or [])
+        reprompt_context.append(_context_entry(message.sender_id, message.text, message.id))
+        reprompt_answer = _run_task_for_message(continuation, reprompt_context)
+        if reprompt_answer is None:
+            return answer
+        _send_answer(reprompt_answer, continuation.id)
+        return reprompt_answer
+
     def _remember_inbound(message: PeerMessage) -> list[dict[str, str]]:
+        nonlocal intro_sent
         prior_context = list(recent_context)
         recent_context.append(_context_entry(message.sender_id, message.text, message.id))
+        sender = (message.sender_id or "").strip().lower()
+        self_names = {agent_id.lower(), display_name.lower()}
+        if sender in self_names and _is_intro_line(message.text or "", display_name):
+            intro_sent = True
         if len(recent_context) > MAX_RECENT_CONTEXT_ENTRIES:
             del recent_context[:-MAX_RECENT_CONTEXT_ENTRIES]
         return prior_context
@@ -894,7 +1301,7 @@ def run_group_chat(
         return None
 
     def _process_message(message: PeerMessage, *, allow_claim_continuation: bool = True) -> None:
-        nonlocal pending_followup
+        nonlocal pending_followup, last_wakeable_message
         if not runpod:
             _hub_echo("<-", message.sender_id, message.text)
 
@@ -929,52 +1336,79 @@ def run_group_chat(
                         )
 
         # Remote mode: auto-allocate the next numeric project on an explicit
-        # `PROJECT: <name>` directive. The directive name itself is logged but
-        # the dir keeps the numeric `projectN` form (remote workspaces are
-        # private, so project names don't need to match across agents). Plain
-        # @-mentions or path-only mentions still fall through to the skip path
-        # below — that's the reconnect-safety brake against stale broadcasts.
+        # `PROJECT: <name>` directive, OR on the first inbound that carries at
+        # least one markdown code fence. The directive name (or sender id, for
+        # the code-share path) is logged but the dir keeps the numeric
+        # `projectN` form (remote workspaces are private, so project names
+        # don't need to match across agents). Plain text without a directive
+        # or fences still falls through to the skip path below — that's the
+        # reconnect-safety brake against stale broadcasts.
         if (
             runpod
             and project_state.active is None
             and project_state.root is not None
         ):
             directive_name = parse_project_directive(message.text or "")
-            if directive_name:
+            has_shared_code = (
+                not directive_name and bool(extract_code_blocks(message.text or ""))
+            )
+            if directive_name or has_shared_code:
                 new_dir = next_project_dir(project_state.root)
                 if new_dir is not None:
                     project_state.active = new_dir
-                    _log(
-                        store,
-                        "project_auto_allocated",
-                        (
-                            f"name={new_dir.name} reason=directive "
-                            f"directive_name={directive_name} msg_id={message.id}"
-                        ),
-                    )
-                    print(
-                        colors.dim(
-                            f"[project] auto-allocated active={new_dir.name} "
-                            f"from PROJECT: {directive_name}"
-                        ),
-                        flush=True,
-                    )
+                    if directive_name:
+                        _log(
+                            store,
+                            "project_auto_allocated",
+                            (
+                                f"name={new_dir.name} reason=directive "
+                                f"directive_name={directive_name} msg_id={message.id}"
+                            ),
+                        )
+                        print(
+                            colors.dim(
+                                f"[project] auto-allocated active={new_dir.name} "
+                                f"from PROJECT: {directive_name}"
+                            ),
+                            flush=True,
+                        )
+                    else:
+                        _log(
+                            store,
+                            "project_auto_allocated_from_code",
+                            (
+                                f"name={new_dir.name} reason=code_share "
+                                f"sender={message.sender_id} msg_id={message.id}"
+                            ),
+                        )
+                        print(
+                            colors.dim(
+                                f"[project] auto-allocated active={new_dir.name} "
+                                f"from peer-shared code by {message.sender_id}"
+                            ),
+                            flush=True,
+                        )
 
-        # Runpod mode requires an explicit active project before any inbound
-        # is processed (each agent has its own private workspace and the
-        # operator must :project new / :project use N to opt in). Local
-        # shared mode is permissive: writes still go through the CLAIM gate
-        # under /workspace/shared/ even without an "active project" subfolder,
-        # so we only skip when runpod genuinely has nothing to write to.
+        # Runpod mode no longer parks inbound on missing project: the agent
+        # still converses with the hub, but file-write tools are refused at
+        # dispatch (see peer_task._maybe_no_project_refusal) until the
+        # operator runs `:project new` or a broadcast carries `PROJECT:
+        # <name>`. We log a one-line advisory so the operator still sees the
+        # state in the container console.
         if runpod and project_state.active is None:
-            _absorb_inbound_claims(message)
             _log(
                 store,
-                "reply_decision",
-                f"respond=False reason=no_active_project msg_id={message.id} sender={message.sender_id}",
+                "no_active_project_advisory",
+                f"msg_id={message.id} sender={message.sender_id}",
             )
-            _print_no_project_prompt(message)
-            return
+            print(
+                f"{colors.ts()} "
+                + colors.dim(
+                    "[project?] no active project — replying without writes; "
+                    "type :project new or :project use N to enable file tools"
+                ),
+                flush=True,
+            )
 
         # Save peer-shared code blocks to the active project even when the
         # reply gate will skip this message. Otherwise broadcasts of code
@@ -1025,6 +1459,7 @@ def run_group_chat(
                 f"respond=True reason={reason} msg_id={message.id} sender={message.sender_id}",
             )
             pending_followup = None
+            last_wakeable_message = message
             answer = _run_task_for_message(
                 message, prior_context, code_guidance=code_guidance
             )
@@ -1032,10 +1467,14 @@ def run_group_chat(
                 _absorb_inbound_claims(message)
                 return
             _absorb_inbound_claims(message)
-            _send_answer(answer, message.id)
+            sent_answer = _send_with_direct_assignment_reprompt(
+                message,
+                answer,
+                prior_context,
+            )
 
             if allow_claim_continuation:
-                _continue_claims(message, answer)
+                _continue_claims(message, sent_answer)
             return
 
         if pending_followup is not None and now - pending_followup.timestamp > pending_followup_seconds:
@@ -1063,6 +1502,7 @@ def run_group_chat(
         if decision.delay_seconds > 0:
             time.sleep(decision.delay_seconds)
 
+        last_wakeable_message = message
         answer = _run_task_for_message(
             message, prior_context, decision.collision, code_guidance=code_guidance
         )
@@ -1070,11 +1510,75 @@ def run_group_chat(
             _absorb_inbound_claims(message)
             return
         _absorb_inbound_claims(message)
-        _send_answer(answer, message.id)
+        sent_answer = _send_with_direct_assignment_reprompt(
+            message,
+            answer,
+            prior_context,
+        )
 
         if allow_claim_continuation:
-            _continue_task_status(message, answer)
-            _continue_claims(message, answer)
+            _continue_task_status(message, sent_answer)
+            _continue_claims(message, sent_answer)
+
+    def _code_guidance_for_active_project(message: PeerMessage) -> str | None:
+        if project_state.active is None:
+            return None
+        block_path = _peer_claim_blocking_save(message)
+        if block_path is not None:
+            _log(
+                store,
+                "code_save_skipped_claim_conflict",
+                f"path={block_path} msg_id={message.id} sender={message.sender_id}",
+            )
+            return (
+                "A peer message contained a code block for a file currently "
+                f"covered by another agent's active CLAIM ({block_path}). The "
+                "runtime did not auto-save it. read_file the path the peer "
+                "names; do not overwrite their in-flight work."
+            )
+        code_guidance = process_shared_code(
+            message.text,
+            agent_id,
+            project_state.active,
+            auto_pytest=not project_state.is_shared,
+            shared_root=project_state.root if project_state.is_shared else None,
+        )
+        if code_guidance:
+            _log(
+                store,
+                "code_saved_on_continue",
+                f"msg_id={message.id} sender={message.sender_id}",
+            )
+        return code_guidance
+
+    def _continue_from_console() -> None:
+        original = last_wakeable_message
+        if original is None:
+            _log(store, "operator_continue_skipped", "no prior actionable message")
+            return
+        active_name = project_state.active.name if project_state.active is not None else None
+        continuation = _operator_continue_message(original, active_name)
+        _log(
+            store,
+            "operator_continue",
+            f"from_msg={original.id} active={active_name or '<none>'}",
+        )
+        prior_context = list(recent_context)
+        recent_context.append(
+            _context_entry(continuation.sender_id, continuation.text, continuation.id)
+        )
+        if len(recent_context) > MAX_RECENT_CONTEXT_ENTRIES:
+            del recent_context[:-MAX_RECENT_CONTEXT_ENTRIES]
+        answer = _run_task_for_message(
+            continuation,
+            prior_context,
+            code_guidance=_code_guidance_for_active_project(original),
+        )
+        if answer is None:
+            return
+        _send_answer(answer, continuation.id)
+        _continue_task_status(continuation, answer)
+        _continue_claims(continuation, answer)
 
     def _continue_task_status(original: PeerMessage, answer: str, depth: int = 0) -> None:
         if depth >= 3:
@@ -1082,6 +1586,16 @@ def run_group_chat(
             return
         status = parse_task_status(answer)
         if status is None or status.kind not in {"taking", "accepted"}:
+            return
+        if any(
+            marker in status.task.lower()
+            for marker in ("coordination", "coordinator", "manager", "samordn")
+        ):
+            _log(
+                store,
+                "task_status_continuation_skipped",
+                f"coordination role status from_msg={original.id}",
+            )
             return
 
         continuation = _task_status_continuation_message(original, status)
@@ -1117,7 +1631,7 @@ def run_group_chat(
             deadline = time.time() + claim_grace_seconds
             while time.time() < deadline and not stop_event.is_set():
                 remaining = max(0.0, deadline - time.time())
-                peer_message = transport.recv(timeout=min(remaining, 0.5))
+                peer_message = _recv_assembled(timeout=min(remaining, 0.5))
                 if peer_message is None:
                     time.sleep(min(remaining, idle_sleep))
                     continue
@@ -1171,7 +1685,14 @@ def run_group_chat(
 
     try:
         while not stop_event.is_set():
-            message = transport.recv(timeout=1.0)
+            try:
+                continue_requests.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                _continue_from_console()
+                continue
+            message = _recv_assembled(timeout=1.0)
             if message is None:
                 time.sleep(idle_sleep)
                 continue

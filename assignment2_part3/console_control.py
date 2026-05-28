@@ -15,6 +15,7 @@ Commands (one per line, `:` prefix):
     :limit total <N>            set lifetime token cap
     :pause                      stop outbound LLM calls
     :resume                     undo :pause
+    :continue                   retry the last actionable hub request
     :approve                    approve the pending bash/budget request (if any)
     :deny                       deny the pending bash/budget request
     :say <text>                 post a message to the group chat as this agent
@@ -42,6 +43,7 @@ HELP_TEXT = (
     "  :budget                       show current usage and limits\n"
     "  :limit tpm|rpm|total <N>      set a runtime limit\n"
     "  :pause / :resume              stop or resume outbound LLM calls\n"
+    "  :continue                     retry the last actionable hub request\n"
     "  :approve / :deny              answer the pending bash/budget approval\n"
     "  :say <text>                   post a message to the group chat as this agent\n"
     "  :project                      show active remote-hub project\n"
@@ -75,6 +77,7 @@ class ConsoleControl:
         stdout: Optional[IO[str]] = None,
         send_fn: Optional[Callable[[str], None]] = None,
         project_handler: Optional[Callable[[str, list[str]], str]] = None,
+        continue_handler: Optional[Callable[[], str]] = None,
     ):
         self.budget = budget
         self.stop_event = stop_event
@@ -82,6 +85,7 @@ class ConsoleControl:
         self.stdout = stdout if stdout is not None else sys.stdout
         self.send_fn = send_fn
         self.project_handler = project_handler
+        self.continue_handler = continue_handler
         self._approval_lock = threading.Lock()
         self._pending: Optional[BashApproval] = None
         self._pending_budget: Optional[BudgetApproval] = None
@@ -199,6 +203,8 @@ class ConsoleControl:
             self.budget.resume()
             self.budget.save()
             self._print(colors.paint("[budget resumed]", colors.GREEN))
+        elif cmd == "continue":
+            self._cmd_continue()
         elif cmd == "approve":
             if self._resolve_pending(True):
                 self._print(colors.paint("[approved]", colors.BOLD, colors.GREEN))
@@ -241,6 +247,16 @@ class ConsoleControl:
             result = self.project_handler(action, rest)
         except Exception as exc:
             result = f"[project error] {exc}"
+        self._print(result)
+
+    def _cmd_continue(self) -> None:
+        if self.continue_handler is None:
+            self._print("[continue not enabled in this mode]")
+            return
+        try:
+            result = self.continue_handler()
+        except Exception as exc:
+            result = f"[continue error] {exc}"
         self._print(result)
 
     def _cmd_limit(self, args: list[str]) -> None:

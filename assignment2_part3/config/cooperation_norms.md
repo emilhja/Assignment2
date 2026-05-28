@@ -27,7 +27,7 @@ in `system_prompt.txt` reference it by reference.
 5. **Stay on SWE.** Politely decline off-topic requests.
 6. **Hub-only.** All inter-agent communication goes through the group chat
    hub. The local console is only for operator controls (`:approve`,
-   `:budget`, `:limit`, `:pause`, `:resume`, `:stop`).
+   `:budget`, `:limit`, `:pause`, `:resume`, `:continue`, `:stop`).
 7. **Be quiet on irrelevant traffic.** The runtime filters messages with a
    reply-policy gate (see `reply_policy.py`). Trust the gate: if you do
    not receive a message, you should not have been answering it.

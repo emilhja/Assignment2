@@ -844,6 +844,58 @@ def test_failed_shared_write_flag_persists_when_no_recovery(tmp_path, monkeypatc
     assert "peer_reply_corrected" in {kind for _role, kind, _content in _events(store)}
 
 
+def test_create_file_exists_guidance_tells_agent_to_read_existing_file(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=10_000, requests_per_minute=10, lifetime_tokens=10_000)
+    msg = PeerMessage(
+        id="m1",
+        sender_id="human",
+        text="@alice-swe create the snake game file",
+    )
+    calls = []
+    responses = iter(
+        [
+            json.dumps(
+                {
+                    "type": "tool_call",
+                    "tool": "create_file",
+                    "args": {
+                        "path": "/workspace/alice/project1/snake_game.html",
+                        "content": "<html></html>",
+                    },
+                }
+            ),
+            json.dumps({"type": "final", "answer": "Blocked: file already exists."}),
+        ]
+    )
+
+    def chat_fn(messages):
+        calls.append(messages)
+        return next(responses)
+
+    def fake_run_tool(tool, args):
+        assert tool == "create_file"
+        return "Edit blocked: file already exists: /workspace/alice/project1/snake_game.html"
+
+    monkeypatch.setattr("peer_task.run_tool", fake_run_tool)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="alice",
+    )
+
+    assert answer == "Blocked: file already exists."
+    assert len(calls) == 2
+    second_call = "\n".join(message["content"] for message in calls[1])
+    assert "target file already exists" in second_call
+    assert "Call read_file on /workspace/alice/project1/snake_game.html first" in second_call
+    assert "do not invent a sibling filename" in second_call
+
+
 def test_claim_continuation_reprompts_repeated_claim_then_writes(tmp_path, monkeypatch):
     private = tmp_path / "alice"
     shared = tmp_path / "shared"
@@ -2238,6 +2290,46 @@ def test_user_action_request_with_prose_stall_reprompts(tmp_path, monkeypatch):
     kinds = [kind for _role, kind, _content in _events(store)]
     assert kinds.count("user_action_prose_stall_reprompt") == 2
     assert "claim_continuation_giveup" in kinds
+
+
+def test_direct_share_request_intro_reprompts_without_tool(tmp_path, monkeypatch):
+    private = tmp_path / "alice"
+    private.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_share_intro",
+        sender_id="emil-user",
+        text="@alice-swe, please share index.html with @alexia-kazim-agent",
+    )
+    responses = iter([
+        json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
+        json.dumps({
+            "type": "final",
+            "answer": "Blocker: I need the exact workspace file path for index.html.",
+        }),
+    ])
+    calls: list[int] = []
+
+    def chat_fn(messages):
+        calls.append(len(messages))
+        return next(responses)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="alice",
+    )
+
+    assert answer == "Blocker: I need the exact workspace file path for index.html."
+    assert len(calls) == 2
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert "user_action_non_action_reprompt" in kinds
 
 
 def test_fix_request_with_ensure_implemented_reprompts_on_reread_stall(tmp_path, monkeypatch):

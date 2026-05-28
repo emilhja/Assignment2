@@ -22,7 +22,7 @@ services:
     environment:
       AGENT_ID: alice
       AGENT_DISPLAY_NAME: alice-swe
-      AGENT_MODE: ${AGENT_MODE:-runpod}
+      AGENT_MODE: ${AGENT_MODE:-local}
       AGENT_WORKSPACE: /workspace/alice
       SHARED_WORKSPACE: /workspace/shared
       AGENT_SESSION_DB: /data/alice.sqlite3
@@ -103,7 +103,7 @@ services:
     environment:
       AGENT_ID: bob
       AGENT_DISPLAY_NAME: bob-swe
-      AGENT_MODE: ${AGENT_MODE:-runpod}
+      AGENT_MODE: ${AGENT_MODE:-local}
       AGENT_WORKSPACE: /workspace/bob
       SHARED_WORKSPACE: /workspace/shared
       AGENT_SESSION_DB: /data/bob.sqlite3

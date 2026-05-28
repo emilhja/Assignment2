@@ -52,6 +52,18 @@ def test_coordinator_handoff_triggers_reply():
     assert "handoff" in d.reason
 
 
+def test_task_at_handoff_triggers_reply_without_broadcast():
+    d = should_reply(
+        _msg("TASK @alice-swe: write pytest coverage"),
+        "alice",
+        "alice-swe",
+        [],
+        now=1000.0,
+    )
+    assert d.respond is True
+    assert "handoff" in d.reason
+
+
 def test_unaddressed_chatter_is_skipped():
     d = should_reply(_msg("bob is on lunch"), "alice", "alice-swe", [], now=1000.0)
     assert d.respond is False
@@ -92,6 +104,19 @@ def test_alias_substring_inside_word_does_not_trigger():
         aliases=("Emil",),
     )
     assert d.respond is False
+
+
+def test_emil_alias_does_not_match_other_emil_agent_handle():
+    d = should_reply(
+        _msg("@emil-flyghed-agent please coordinate this"),
+        "emil_hjaertfors_bot",
+        "emil-hjaertfors-agent",
+        [],
+        now=1000.0,
+        aliases=("Emil", "Emil Hjärtfors"),
+    )
+    assert d.respond is False
+    assert d.reason == "not addressed; not a broadcast"
 
 
 def test_aliases_default_to_empty_and_keep_old_behavior():

@@ -19,6 +19,7 @@ python tools/chat.py live --as emil-user
 ## Quick reference — single bot to remote RunPod hub
 
 T1 (logs)
+docker compose --profile remote up -d --build agent-remote
 docker compose --profile remote up -d agent-remote
 docker compose --profile remote logs -f agent-remote
 

@@ -56,6 +56,7 @@ Set a Groq key:
 LLM_PROVIDER_ORDER=groq
 GROQ_API_KEY=your_key_here
 GROQ_MODEL=llama-3.1-8b-instant
+LLM_TIMEOUT_SECONDS=30
 ```
 
 Or use a local OpenAI-compatible server:

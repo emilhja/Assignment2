@@ -40,6 +40,7 @@ def test_extract_single_python_block_with_directive():
     assert len(blocks) == 1
     assert blocks[0].lang == "python"
     assert blocks[0].filename == "calc.py"
+    assert blocks[0].canonical is True
     # Directive line is stripped from saved content.
     assert "file:" not in blocks[0].content
     assert "def add(a, b):" in blocks[0].content
@@ -94,6 +95,7 @@ def test_extract_multiple_blocks_filename_fallback():
     )
     blocks = extract_code_blocks(text)
     assert [b.filename for b in blocks] == ["snippet1.py", "snippet2.py"]
+    assert [b.canonical for b in blocks] == [False, False]
 
 
 def test_extract_language_extension_mapping():
@@ -281,6 +283,21 @@ def test_process_shared_code_end_to_end_no_tests(tmp_path, monkeypatch):
     assert "/workspace/alice/project1/calc.py" in guidance
     assert "Auto-pytest: not run" in guidance
     assert (project / "calc.py").exists()
+
+
+def test_process_shared_code_marks_unnamed_blocks_as_noncanonical(tmp_path, monkeypatch):
+    project = tmp_path / "project1"
+    project.mkdir()
+
+    def _no_subprocess(*args, **kwargs):  # pragma: no cover — must not run
+        raise AssertionError("pytest should not run when no test_*.py exists")
+
+    monkeypatch.setattr(subprocess, "run", _no_subprocess)
+    text = "```python\ndef add(a, b):\n    return a + b\n```\n"
+    guidance = process_shared_code(text, "alice", project)
+    assert guidance is not None
+    assert "/workspace/alice/project1/snippet1.py (snippet; no # file directive)" in guidance
+    assert "untrusted non-canonical context" in guidance
 
 
 def test_process_shared_code_end_to_end_with_tests(tmp_path, monkeypatch):

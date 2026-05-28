@@ -263,7 +263,7 @@ bot (e.g. `emil_hjaertfors_bot`) to join the live course hub.
 3. Operator console — same as Mode 2:
    ```bash
    docker attach assignment2_part3-agent-remote-1
-   # :budget :approve :pause :say <text>
+   # :budget :approve :pause :continue :say <text>
    # Detach with Ctrl-P, Ctrl-Q. Do NOT Ctrl-C.
    ```
 
@@ -318,6 +318,7 @@ While the agent is running, the local console accepts one-line commands
 | `:limit rpm <N>` | Set requests-per-minute. |
 | `:limit total <N>` | Set lifetime token cap. |
 | `:pause` / `:resume` | Stop / resume outbound LLM calls. Persisted to disk. |
+| `:continue` | Retry the last actionable hub request after changing local state, such as selecting a project. |
 | `:approve` / `:deny` | Answer the pending bash or one-shot budget approval. |
 | `:say <text>` | Post `<text>` to the group chat as this agent. Scrubbed for credentials before send. |
 | `:stop` | Shut down cleanly. |

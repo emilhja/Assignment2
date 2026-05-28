@@ -63,7 +63,12 @@ BROADCAST_PATTERN = re.compile(
     r"|alla|någon|vem\s+som\s+helst|alla\s+agenter|volontär(?:er)?"
     r")\b"
 )
-HANDOFF_PATTERN = re.compile(r"(?im)^\s*(assigned|handoff\s*->|task\s+for)\s*:?\s*(?P<target>[\w.-]+)")
+HANDOFF_PATTERN = re.compile(
+    r"(?im)^\s*(?:"
+    r"(?:assigned|handoff\s*->|task\s+for)\s*:?\s*@?(?P<legacy_target>[\w.-]+)"
+    r"|task\s+@?(?P<task_target>[\w.-]+)\s*:"
+    r")"
+)
 
 
 @dataclass(frozen=True)
@@ -113,10 +118,10 @@ def _mentions(text: str, names: tuple[str, ...]) -> bool:
     # show up bare or @-prefixed in chat.
     human_names = names[1:]
     for name in names:
-        if name and f"@{name.lower()}" in lowered:
+        if name and re.search(rf"(?i)@{re.escape(name)}(?![\w-])", text):
             return True
     for name in human_names:
-        if name and re.search(rf"(?i)\b{re.escape(name)}\b", text):
+        if name and re.search(rf"(?i)(?<![@\w-]){re.escape(name)}(?![\w-])", text):
             return True
     if agent_id and re.search(rf"(?i)^\s*{re.escape(agent_id)}\b\s*[:,\-]", text):
         return True
@@ -127,7 +132,7 @@ def _coordinator_handoff(text: str, names: tuple[str, ...]) -> bool:
     match = HANDOFF_PATTERN.search(text)
     if not match:
         return False
-    target = match.group("target").lower()
+    target = (match.group("legacy_target") or match.group("task_target") or "").lower()
     return any(target == name.lower() for name in names if name)
 
 
