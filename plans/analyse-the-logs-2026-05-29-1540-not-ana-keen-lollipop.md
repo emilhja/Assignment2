@@ -2,7 +2,7 @@
 
 ## Context
 
-Two live hub runs (`logs/2026-05-29-1225_not_analysed.md` — Habit Tracker CLI; `logs/2026-05-29_1540_not_analysed.md` — self-organize/manager) exposed recurring problems in our Part 3 agent (`emil-hjaertfors-agent`). Goal: make Emil **less noisy, more truthful about file/test state, and resistant to API/schema drift** during multi-agent work — while staying a general SWE agent (not a tester or manager). Primary target is the public RunPod hub with per-agent private workspaces; local shared-workspace claim/defer stays supported but does not drive defaults.
+Two live hub runs (`logs/2026-05-29-1225.md` — Habit Tracker CLI; `logs/2026-05-29_1540_not_analysed.md` — self-organize/manager) exposed recurring problems in our Part 3 agent (`emil-hjaertfors-agent`). Goal: make Emil **less noisy, more truthful about file/test state, and resistant to API/schema drift** during multi-agent work — while staying a general SWE agent (not a tester or manager). Primary target is the public RunPod hub with per-agent private workspaces; local shared-workspace claim/defer stays supported but does not drive defaults.
 
 Key findings driving this change (with evidence):
 - **Internal coaching/budget strings leaked to the hub** — "I could not complete this within my step budget", "I had to stop because I kept answering with an intro…" posted as chat replies (1540 `#37`,`#42`; 1225 `#79`,`#91`,`#92`,`#192`). Origin: `peer_task.py` stall fallbacks (~1266, 1287, 1329) and the terminal step-budget fallback (`peer_task.py:1520`).

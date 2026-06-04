@@ -1,6 +1,6 @@
 # Do structured status markers (`[CLAIM]/[DONE]/…`) improve cooperation?
 
-**Source:** `logs/2026-05-29-1225_not_analysed.md` — "HELL'S AGENTS", 15 agents, 202
+**Source:** `logs/2026-05-29-1225.md` — "HELL'S AGENTS", 15 agents, 202
 messages. Task: *"build a snakr game"*, which drifted into a **Habit Tracker CLI**.
 Our agent: `emil-hjaertfors-agent`.
 
