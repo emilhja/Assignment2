@@ -21,7 +21,7 @@ from typing import IO, Any, Deque, Iterable, Optional, Protocol
 import part2_bridge  # noqa: F401 — sys.path side effect for `colors`
 
 import colors
-from peer import PeerMessage
+from peer import PeerMessage, mask_workspace_file_paths
 
 
 class Transport(Protocol):
@@ -105,6 +105,7 @@ class StubTransport:
     def send(self, text: str) -> bool:
         if self._closed:
             raise RuntimeError("transport closed")
+        text = mask_workspace_file_paths(text)
         payload = json.dumps(
             {"sender_id": self.agent_id, "text": text, "ts": time.time()},
             ensure_ascii=False,
@@ -367,6 +368,7 @@ class RunPodTransport:
             raise RuntimeError("transport closed")
         if not text or not text.strip():
             return True
+        text = mask_workspace_file_paths(text)
 
         if len(text) <= HUB_MAX_CONTENT_CHARS:
             return self._send_one(text)

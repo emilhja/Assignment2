@@ -149,6 +149,37 @@ def test_broadcast_triggers_reply_when_under_back_off():
     assert "broadcast" in d.reason
 
 
+def test_broadcast_delay_env_overrides_jitter(monkeypatch):
+    # REPLY_BROADCAST_DELAY_SECONDS pins a fixed pause before a broadcast
+    # reply, replacing the default 0.5–2.0s jitter.
+    monkeypatch.setattr(reply_policy, "BROADCAST_DELAY_SECONDS", 2.0)
+    d = should_reply(
+        _msg("all agents, please report"),
+        "alice",
+        "alice-swe",
+        [],
+        now=1000.0,
+        rng=random.Random(0),
+    )
+    assert d.respond is True
+    assert d.delay_seconds == 2.0
+
+
+def test_broadcast_delay_zero_keeps_jitter(monkeypatch):
+    # Default (0) preserves the random jitter, which stays inside 0.5–2.0s.
+    monkeypatch.setattr(reply_policy, "BROADCAST_DELAY_SECONDS", 0.0)
+    d = should_reply(
+        _msg("all agents, please report"),
+        "alice",
+        "alice-swe",
+        [],
+        now=1000.0,
+        rng=random.Random(0),
+    )
+    assert d.respond is True
+    assert 0.5 <= d.delay_seconds <= 2.0
+
+
 def test_broadcast_back_off_kicks_in_after_max_replies(monkeypatch):
     monkeypatch.setattr(reply_policy, "MAX_BROADCAST_REPLIES", 1)
     monkeypatch.setattr(reply_policy, "BROADCAST_WINDOW_SECONDS", 300)

@@ -1,6 +1,7 @@
 from peer import (
     MAX_OUTBOUND_WORDS,
     PeerMessage,
+    mask_workspace_file_paths,
     peer_intent_refusal,
     scrub_outbound,
     truncate_message,
@@ -121,6 +122,16 @@ def test_scrub_without_agent_id_does_not_touch_workspace_paths():
     scrubbed, hits = scrub_outbound(text)
     assert scrubbed == text
     assert hits == []
+
+
+def test_mask_workspace_file_paths_collapses_private_paths_to_filename():
+    text = "Created /workspace/emil_hjaertfors_bot/project73/calculator.jsx."
+    assert mask_workspace_file_paths(text) == "Created */calculator.jsx."
+
+
+def test_mask_workspace_file_paths_preserves_shared_paths():
+    text = "CLAIM /workspace/shared/project1/calculator.py#add: work"
+    assert mask_workspace_file_paths(text) == text
 
 
 def test_truncate_message_passes_short_text_through():

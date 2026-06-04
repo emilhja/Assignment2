@@ -14,8 +14,10 @@ from claims import ClaimRegistry
 from peer import PeerMessage
 from peer_task import (
     OVERRIDE_BASH_TIMEOUT_SECONDS,
+    SUPPRESSED_STALL_NOTICE,
     _STALL_SILENT,
     _ensure_peer_mentions,
+    _share_was_requested,
     _run_tool_with_approval,
     run_peer_task,
 )
@@ -2451,10 +2453,23 @@ def test_fix_request_with_ensure_implemented_reprompts_on_reread_stall(tmp_path,
     assert "claim_continuation_giveup" in kinds
 
 
-def test_stall_giveup_is_suppressed_from_hub_by_default(tmp_path, monkeypatch):
-    """With SUPPRESS_STALL_REPLIES on, a terminal stall must not post internal
-    coaching to the hub: run_peer_task returns the silence sentinel, the
-    diagnostic is still logged, and no peer_reply carries the coaching string."""
+def test_share_was_requested_matches_swedish_inflected_kod():
+    # Regression: "dela koden" / "visa koden" (definite form) previously slipped
+    # past the share detector because the pattern only matched the bare "kod".
+    assert _share_was_requested("kan du dela koden för calculator.py")
+    assert _share_was_requested("dela koden")
+    assert _share_was_requested("visa koden tack")
+    assert _share_was_requested("dela filen calculator.py")
+    # English share requests still match, plain chatter still does not.
+    assert _share_was_requested("can you share the code for calculator.py")
+    assert not _share_was_requested("jag kodar på en ny funktion")
+    assert not _share_was_requested("how is the project going?")
+
+
+def test_stall_giveup_surfaces_short_notice_by_default(tmp_path, monkeypatch):
+    """With SUPPRESS_STALL_REPLIES on, a terminal stall must not post the verbose
+    internal coaching to the hub, but must still surface the short honest notice
+    instead of going silent. The detailed diagnostic is still logged for audit."""
 
     private = tmp_path / "bob"
     shared = tmp_path / "shared"
@@ -2492,7 +2507,9 @@ def test_stall_giveup_is_suppressed_from_hub_by_default(tmp_path, monkeypatch):
         agent_id="bob",
     )
 
-    assert answer is _STALL_SILENT
+    # The agent surfaces the short honest notice rather than the silence
+    # sentinel or the verbose coaching.
+    assert answer == SUPPRESSED_STALL_NOTICE
     events = list(_events(store))
     kinds = [kind for _role, kind, _content in events]
     # The diagnostic survives in the log for offline audit...
@@ -2958,3 +2975,200 @@ def test_remote_hub_real_write_passes_through(tmp_path, monkeypatch):
     assert "peer_reply_corrected" not in kinds
     assert "Done:" in answer
     assert "calculator.py" in answer
+
+
+def test_share_request_without_read_is_reprompted_then_reads(tmp_path, monkeypatch):
+    """A share request answered with a fenced block but no read_file this round
+    is reprompted; the agent then reads and the read-backed paste is returned."""
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_share",
+        sender_id="emil-user",
+        text="@alice-swe share the contents of App.css",
+    )
+    responses = iter([
+        # 1) Hallucinated paste: a fenced block with no read this round.
+        json.dumps({
+            "type": "final",
+            "answer": "```css\n.App { color: blue; }\n```",
+        }),
+        # 2) After the reprompt, actually read the file.
+        json.dumps({
+            "type": "tool_call",
+            "tool": "read_file",
+            "args": {"path": "/workspace/alice/project1/App.css"},
+        }),
+        # 3) Paste the real, read-backed content.
+        json.dumps({
+            "type": "final",
+            "answer": "```css\n# file: src/App.css\n.calculator { color: red; }\n```",
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    def fake_run_tool(tool, args):
+        assert tool == "read_file"
+        return "--- /workspace/project1/App.css ---\n.calculator { color: red; }\n"
+
+    monkeypatch.setattr("peer_task.run_tool", fake_run_tool)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="alice",
+    )
+
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert "share_requires_read_reprompt" in kinds
+    assert ".calculator { color: red; }" in answer
+    assert ".App { color: blue; }" not in answer
+
+
+def test_share_request_after_read_passes(tmp_path, monkeypatch):
+    """A share request answered after a successful read_file is returned as-is."""
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_share2",
+        sender_id="emil-user",
+        text="@alice-swe please show me the contents of App.css",
+    )
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "read_file",
+            "args": {"path": "/workspace/alice/project1/App.css"},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "```css\n# file: src/App.css\n.calculator { color: red; }\n```",
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    def fake_run_tool(tool, args):
+        return "--- /workspace/project1/App.css ---\n.calculator { color: red; }\n"
+
+    monkeypatch.setattr("peer_task.run_tool", fake_run_tool)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="alice",
+    )
+
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert "share_requires_read_reprompt" not in kinds
+    assert ".calculator { color: red; }" in answer
+
+
+def test_share_guidance_injected_for_file_share_request(tmp_path, monkeypatch):
+    """A share request injects the up-front enumerate/read-all guidance."""
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_share3",
+        sender_id="emil-user",
+        text="@alice-swe share the files in the project",
+    )
+    calls = []
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "read_file",
+            "args": {"path": "/workspace/alice/project1/App.js"},
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": "```javascript\n# file: src/App.js\nexport default App;\n```",
+        }),
+    ])
+
+    def chat_fn(messages):
+        calls.append(messages)
+        return next(responses)
+
+    def fake_run_tool(tool, args):
+        return "--- /workspace/project1/App.js ---\nexport default App;\n"
+
+    monkeypatch.setattr("peer_task.run_tool", fake_run_tool)
+
+    run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="alice",
+    )
+
+    first_call = "\n".join(message["content"] for message in calls[0])
+    assert "Share all requested files" in first_call
+    assert "Never reconstruct contents from memory" in first_call
+
+
+def test_write_then_paste_not_gated_as_share(tmp_path, monkeypatch):
+    """When the agent writes a file this round, a share-style fenced paste is
+    legitimate (the content is in-context) and must not be reprompted."""
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_share4",
+        sender_id="emil-user",
+        text="@alice create calculator.py and share its contents",
+    )
+    responses = iter([
+        json.dumps({
+            "type": "tool_call",
+            "tool": "create_file",
+            "args": {
+                "path": "/workspace/alice/project1/calculator.py",
+                "content": "def add(a, b):\n    return a + b\n",
+            },
+        }),
+        json.dumps({
+            "type": "final",
+            "answer": (
+                "Done: created /workspace/alice/project1/calculator.py.\n"
+                "```python\n# file: calculator.py\ndef add(a, b):\n    return a + b\n```"
+            ),
+        }),
+    ])
+
+    def chat_fn(messages):
+        return next(responses)
+
+    def fake_run_tool(tool, args):
+        assert tool == "create_file"
+        return "Created file in /workspace/project1/calculator.py."
+
+    monkeypatch.setattr("peer_task.run_tool", fake_run_tool)
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="alice",
+    )
+
+    kinds = [kind for _role, kind, _content in _events(store)]
+    assert "share_requires_read_reprompt" not in kinds
+    assert "peer_reply_corrected" not in kinds
+    assert "def add(a, b):" in answer

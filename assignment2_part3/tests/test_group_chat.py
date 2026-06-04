@@ -1080,14 +1080,14 @@ def test_task_status_acceptance_triggers_internal_continuation(tmp_path, monkeyp
     t.join(timeout=5.0)
 
     replies = _outbox_replies(ctx["outbox"])
-    # The agent id segment is stripped on the wire (see peer.scrub_outbound)
-    # so peers cannot guess sibling project paths. The stripped form also
-    # matches what the tool observation layer shows the LLM locally.
+    # Workspace file paths collapse to */<filename> on the wire (see
+    # peer.scrub_outbound) so peers see only the filename, never the real
+    # directory tree or the owner's id.
     assert [payload["text"] for payload in replies] == [
         "Bekräftat, jag tar: terminal-kalkylator",
         (
             "Klar med: terminal-kalkylator. "
-            "Filer: /workspace/project1/calculator.py. Tester: inte körda."
+            "Filer: */calculator.py. Tester: inte körda."
         ),
     ]
     assert (project / "calculator.py").read_text(encoding="utf-8") == content

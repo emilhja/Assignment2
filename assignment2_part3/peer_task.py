@@ -62,22 +62,35 @@ MAX_CONTEXT_CHARS = 2000
 _STALL_SILENT = object()
 """Sentinel reply meaning "end the turn, send nothing to the hub".
 
-Returned by ``run_peer_task`` when an anti-stall/step-budget fallback would
-otherwise post internal coaching text to the chat and SUPPRESS_STALL_REPLIES
-is on. ``group_chat._run_task_for_message`` converts it to ``None`` (the
-existing "no reply" signal). A sentinel rather than ``None`` is used inside
-the run loop because ``None`` already means "keep reprompting" there.
+Retained for backward compatibility — ``group_chat`` still converts it to
+``None`` (the existing "no reply" signal) — but ``run_peer_task`` no longer
+produces it: a suppressed stall now posts ``SUPPRESSED_STALL_NOTICE`` instead
+of going completely silent (see ``_suppress_stall_replies``).
+"""
+
+
+SUPPRESSED_STALL_NOTICE = (
+    "I wasn't able to finish that just now — I kept hitting an internal error "
+    "before I could complete the step. Could you rephrase it or break it into "
+    "a smaller request?"
+)
+"""Short, honest line posted when a terminal stall is suppressed.
+
+Replaces the verbose internal coaching ("I had to stop because I repeated a
+CLAIM…") so the agent surfaces a brief, user-facing acknowledgment instead of
+going silent, while the detailed diagnostic is still logged for audit.
 """
 
 
 def _suppress_stall_replies() -> bool:
-    """Whether terminal stall/step-budget fallbacks stay off the hub.
+    """Whether terminal stall/step-budget fallbacks hide the verbose coaching.
 
     When on (default), the agent's internal anti-stall coaching ("I had to
     stop because…", "I could not complete this within my step budget…") is
-    written to the session log only and no message is sent to peers — those
-    strings are diagnostics, not useful chat. Set ``SUPPRESS_STALL_REPLIES=0``
-    to restore the old behavior of posting the fallback text.
+    written to the session log only and the agent posts the short
+    ``SUPPRESSED_STALL_NOTICE`` to the hub instead — so a stall surfaces as a
+    brief honest line rather than total silence. Set ``SUPPRESS_STALL_REPLIES=0``
+    to post the full verbose fallback text instead.
     """
 
     return os.environ.get("SUPPRESS_STALL_REPLIES", "1").strip().lower() not in {
@@ -498,6 +511,36 @@ def _action_was_requested(text: str) -> bool:
     # Stricter than _pytest_was_requested: only True when the operator/peer
     # told the agent to do something, not when tests are merely discussed.
     return bool(_ACTION_REQUEST_RE.search(text or ""))
+
+
+# Narrower than _ACTION_REQUEST_RE: only fires when the user asked to surface
+# the *contents* of existing file(s) — share/show/paste/display/print/post/send
+# tied to a file/content/code reference, "contents of", or the Swedish
+# dela/visa/klistra/innehåll. Used to force a read_file this round before the
+# agent pastes contents, so it cannot reconstruct (hallucinate) them from memory.
+_SHARE_REQUEST_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:share|show|shows|showing|paste|pastes|pasting|display|displays|"
+    r"print|prints|post|posts|send|sends|sending)\b[\w\s'/,.-]{0,40}?"
+    r"\b(?:file|files|content|contents|code|\S+\.(?:js|jsx|ts|tsx|css|py|html|json|md|txt))\b"
+    r"|\bcontents?\s+of\b"
+    r"|\b(?:dela|visa|visar|klistra)\b[\w\s'/,.-]{0,40}?\b(?:fil|filer|filen|filerna|innehåll|kod\w*)\b"
+    r"|\binnehåll(?:et)?\s+(?:i|av)\b"
+    r")"
+)
+
+
+def _share_was_requested(text: str) -> bool:
+    return bool(_SHARE_REQUEST_RE.search(text or ""))
+
+
+_FILE_PASTE_MARKER_RE = re.compile(r"```|^\s*#\s*file:", re.IGNORECASE | re.MULTILINE)
+
+
+def _answer_pastes_file_contents(answer: str) -> bool:
+    """True when the answer embeds file contents (a fenced block or `# file:`)."""
+
+    return bool(_FILE_PASTE_MARKER_RE.search(answer or ""))
 
 
 def _test_target_for_claim(target: str | None) -> str | None:
@@ -995,6 +1038,7 @@ def run_peer_task(
     saw_successful_test_run = False
     saw_any_successful_write = False  # any /workspace path, not just shared
     saw_any_tool_observation = False
+    saw_successful_read = False  # a read_file that returned contents this round
     continuation_reprompt_counts: dict[str, int] = {}
 
     def _continuation_reprompt_or_stop(
@@ -1017,11 +1061,15 @@ def run_peer_task(
                     _json({"impl_target": target or "", "test_target": test_target}),
                 )
             if _suppress_stall_replies():
-                # The fallback is internal coaching, not chat. Log it and return
-                # the silence sentinel; the loop's "None means keep reprompting"
-                # contract stays intact, and group_chat sends nothing.
+                # The verbose fallback is internal coaching, not chat. Log it for
+                # audit but surface only the short honest notice so the agent
+                # acknowledges the stall instead of going silent. Returning a
+                # non-None value keeps the loop's "None means keep reprompting"
+                # contract intact.
                 _log("system", "stall_reply_suppressed", f"{kind}: {fallback}")
-                return _STALL_SILENT
+                scrubbed, _hits = scrub_outbound(SUPPRESSED_STALL_NOTICE, agent_id=self_id)
+                _log("assistant", "peer_reply_raw", SUPPRESSED_STALL_NOTICE)
+                return scrubbed
             scrubbed, _hits = scrub_outbound(fallback, agent_id=self_id)
             _log("assistant", "peer_reply_raw", fallback)
             return scrubbed
@@ -1049,6 +1097,17 @@ def run_peer_task(
             continue
         _log("system", "runtime_guidance_injection", guidance_text)
         messages.append(_runtime_guidance_message(guidance_text))
+
+    if not _is_claim_continuation(message) and _share_was_requested(message.text):
+        share_guidance = (
+            "To share file contents: list the project directory first if you are "
+            "unsure which files exist (`ls -R`), then call read_file on EACH file "
+            "and paste every one in its own fenced block (`# file: <path>` as the "
+            "first line). Share all requested files, not only the ones you "
+            "remember. Never reconstruct contents from memory."
+        )
+        _log("system", "share_request_guidance", share_guidance)
+        messages.append(_runtime_guidance_message(share_guidance))
 
     empty_streak = 0
     max_steps = MAX_CLAIM_CONTINUATION_STEPS if _is_claim_continuation(message) else MAX_STEPS
@@ -1417,6 +1476,34 @@ def run_peer_task(
                 if stopped is not None:
                     return stopped
                 continue
+            if (
+                not _is_claim_continuation(message)
+                and _share_was_requested(message.text)
+                and _answer_pastes_file_contents(answer)
+                and not saw_successful_read
+                and not saw_any_successful_write  # write-then-paste stays legitimate
+            ):
+                # The user asked to share file contents and the reply embeds a
+                # fenced block, but no read_file succeeded this round — the model
+                # is pasting contents reconstructed from memory, which is
+                # unreliable across turns (no cross-turn history). Force a real
+                # read before the paste reaches the hub.
+                guidance = (
+                    "You pasted file contents but did not read any file this round. Do not "
+                    "reconstruct file contents from memory — they are not reliable across "
+                    "turns. Call read_file on the exact workspace path for each file you "
+                    "intend to share, then paste each file from the read_file observation in "
+                    "its own fenced block with `# file: <path>` as the first line. If you are "
+                    "unsure which files exist, run `ls -R` on the project directory first."
+                )
+                stopped = _continuation_reprompt_or_stop(
+                    "share_requires_read_reprompt",
+                    guidance,
+                    "I had to stop because I kept pasting file contents without reading the files first.",
+                )
+                if stopped is not None:
+                    return stopped
+                continue
             scrubbed, hits = scrub_outbound(answer, agent_id=self_id)
             _log("assistant", "peer_reply_raw", answer)
             if hits:
@@ -1545,6 +1632,11 @@ def run_peer_task(
                 # answer can honestly report `Tests: ran and failed` instead of
                 # being reprompted into a loop.
                 saw_successful_test_run = True
+            if parsed.tool == "read_file" and not observation.startswith("Edit blocked:"):
+                # The agent actually read a file this round, so a fenced reply
+                # that pastes contents is grounded in a tool observation rather
+                # than reconstructed from memory.
+                saw_successful_read = True
             _log(
                 "tool",
                 parsed.tool,
@@ -1584,7 +1676,9 @@ def run_peer_task(
     fallback = "I could not complete this within my step budget. Please rephrase or split the task."
     if _suppress_stall_replies():
         _log("system", "stall_reply_suppressed", f"step_budget: {fallback}")
-        return _STALL_SILENT
+        scrubbed, _ = scrub_outbound(SUPPRESSED_STALL_NOTICE, agent_id=self_id)
+        _log("assistant", "peer_reply_raw", SUPPRESSED_STALL_NOTICE)
+        return scrubbed
     scrubbed, _ = scrub_outbound(fallback, agent_id=self_id)
     _log("assistant", "peer_reply_raw", fallback)
     return scrubbed

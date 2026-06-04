@@ -137,6 +137,33 @@ CREDENTIAL_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
+# Private/project workspace *file* paths are masked to `*/<filename>` on the
+# wire (see `mask_workspace_file_paths`, applied by the Transport). Kept here
+# next to the other outbound policy so both live in one module. `/workspace/
+# shared/...` is deliberately EXCLUDED: it is the local-hub coordination
+# namespace, and CLAIM/RELEASE lines carrying those paths must survive intact
+# so the claim registry can match them. The directory part is optional so
+# `/workspace/foo.py` also masks; directory-only paths (no filename) are left
+# alone — `scrub_outbound`'s agent-id strip handles the id there.
+_WORKSPACE_FILE_PATH = re.compile(
+    r"/workspace/(?!shared/)(?:[^\s/'\"`)\]]+/)*([^\s/'\"`)\]]+\.[A-Za-z0-9_]+)"
+)
+
+
+def mask_workspace_file_paths(text: str) -> str:
+    """Collapse `/workspace/.../<file.ext>` to `*/<file.ext>` for the wire.
+
+    Applied at the transport boundary (not in `scrub_outbound`) so the agent's
+    own internal record — `recent_context`, the claim registry, the session
+    log — keeps the real path while peers only ever see the bare filename.
+    `/workspace/shared/...` is preserved (see `_WORKSPACE_FILE_PATH`).
+    """
+
+    if not isinstance(text, str) or not text:
+        return text or ""
+    return _WORKSPACE_FILE_PATH.sub(r"*/\1", text)
+
+
 def scrub_outbound(
     text: str,
     *,
@@ -149,7 +176,8 @@ def scrub_outbound(
     peers cannot see the literal id or guess sibling project paths. The
     stripped form also matches what the tool observation layer (Part 2's
     `_display_workspace_path`) shows the LLM, so the outbound text is
-    consistent with what the agent saw locally.
+    consistent with what the agent saw locally. The narrower file-path mask
+    (`mask_workspace_file_paths`) is applied separately, at the transport.
     """
 
     if not isinstance(text, str) or not text:

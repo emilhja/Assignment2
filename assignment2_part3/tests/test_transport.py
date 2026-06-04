@@ -41,6 +41,23 @@ def test_send_writes_json_line():
     assert "ts" in payload
 
 
+def test_stub_send_masks_private_workspace_file_paths():
+    outbox = io.StringIO()
+    t = StubTransport("alice", inbox=io.StringIO(""), outbox=outbox)
+    assert t.send("Created /workspace/emil_hjaertfors_bot/project73/calculator.jsx.") is True
+    payload = json.loads(outbox.getvalue().strip())
+    assert payload["text"] == "Created */calculator.jsx."
+
+
+def test_stub_send_preserves_shared_workspace_paths():
+    outbox = io.StringIO()
+    t = StubTransport("alice", inbox=io.StringIO(""), outbox=outbox)
+    text = "CLAIM /workspace/shared/project1/calculator.py#add: work"
+    assert t.send(text) is True
+    payload = json.loads(outbox.getvalue().strip())
+    assert payload["text"] == text
+
+
 def test_close_blocks_send():
     t = StubTransport("alice", inbox=io.StringIO(""), outbox=io.StringIO())
     t.close()
@@ -155,6 +172,13 @@ def test_runpod_send_posts_expected_payload(tmp_path):
     assert url == "https://hub.example/api/message"
     assert body == {"agent_name": "emil-tester", "content": "hello hub", "password": "pw"}
     assert "[hub->]" in stdout.getvalue()
+
+
+def test_runpod_send_masks_private_workspace_file_paths(tmp_path):
+    t, session, _, _ = _make_transport(tmp_path)
+    assert t.send("Open /workspace/emil_hjaertfors_bot/project73/calculator.jsx") is True
+    _, body = session.post_calls[0]
+    assert body["content"] == "Open */calculator.jsx"
 
 
 def test_runpod_send_treats_201_created_as_success(tmp_path):

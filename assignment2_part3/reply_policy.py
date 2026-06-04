@@ -48,9 +48,23 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 COOLDOWN_SECONDS = _env_int("REPLY_COOLDOWN_SECONDS", 8)
 MAX_BROADCAST_REPLIES = _env_int("REPLY_MAX_BROADCAST", 1)
 BROADCAST_WINDOW_SECONDS = _env_int("REPLY_BROADCAST_WINDOW_SECONDS", 300)
+# Fixed pause before answering a broadcast (e.g. "all agents, ..."). When > 0
+# it replaces the default random 0.5–2.0s jitter, letting an operator slow the
+# agent's roll-call replies (e.g. set 2 for a 2s wait). 0 keeps the jitter.
+BROADCAST_DELAY_SECONDS = _env_float("REPLY_BROADCAST_DELAY_SECONDS", 0.0)
 
 BROADCAST_PATTERN = re.compile(
     r"(?i)\b("
@@ -245,7 +259,7 @@ def should_reply(
                 f"broadcast back-off: replied {broadcasts_recently} times in last "
                 f"{BROADCAST_WINDOW_SECONDS}s",
             )
-        delay = rng.uniform(0.5, 2.0)
+        delay = BROADCAST_DELAY_SECONDS if BROADCAST_DELAY_SECONDS > 0 else rng.uniform(0.5, 2.0)
         return ReplyDecision(True, "broadcast question", delay_seconds=delay)
 
     return ReplyDecision(False, "not addressed; not a broadcast")
