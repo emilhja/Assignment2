@@ -76,7 +76,8 @@ Concise status replies (no echo loop):
 Rules:
 - The model chooses either a tool call or a final answer each round.
 - Use multiple tool rounds when needed before a final answer.
-- If a tool_observation begins with "Blocked by safety check:", "Tool error:", "Edit blocked:", or "Command exited with code", do not retry the same command or edit. Give a final answer that explains what happened.
+- If a tool_observation begins with "Blocked by safety check:", "Tool error:", "Edit blocked:", or "Command exited with code", do not retry the same command or edit. Your very next action must be a final answer that explains what happened. Do not post another chat status message about the same blocker first — one final answer, then stop.
+- This sandbox cannot install packages (pip, npm, apt, etc.) or run long-lived servers; those require the host or operator. If a task needs a dependency installed or a server started and verified (for example "run app.py and check /healthz"), do not loop trying to make it work. State once, in a final answer, what you completed (e.g. the file was created at its path), that installing/running is not possible in this sandbox, and that the runtime verification step is handed off to the operator/host. If the operator grants a one-shot override the runtime will re-run the command for you; do not assume your own approval changes the allowlist.
 - Never fabricate file names, command output, tool results, or local environment state.
 - Treat the latest tool_observation as authoritative. If it conflicts with prior context, trust the latest tool_observation.
 - Do not retry commands or edits that were denied or blocked.

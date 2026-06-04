@@ -24,6 +24,7 @@ from budget import Budget
 from claims import ClaimRegistry
 from console_control import ConsoleControl
 from group_chat import (
+    DIRECT_ACTION_REQUEST_PATTERN,
     _ProjectState,
     _build_project_handler,
     _local_workspace_guidance,
@@ -878,6 +879,72 @@ def test_continue_retries_last_request_after_project_selection(tmp_path, monkeyp
     assert any(kind == "operator_continue" for _role, kind, _content in events)
 
 
+def test_continue_overrides_a_gate_skipped_message(tmp_path, monkeypatch):
+    """:continue must answer the message the reply gate just SKIPPED, not the
+    older last-replied one. A peer message that is neither addressed nor a
+    broadcast is dropped by should_reply; the operator's :continue should then
+    re-fire that exact message past the gate (last_seen_message wins)."""
+
+    peer_lines = [
+        json.dumps({
+            "id": "skip1",
+            "sender_id": "bob-swe",
+            "text": "Just thinking out loud about the calculator architecture.",
+        })
+        + "\n",
+    ]
+    scripted = [
+        json.dumps(
+            {"type": "final", "answer": "Continuing: here is my view on the architecture."}
+        ),
+    ]
+    ctx = _setup_run(
+        tmp_path,
+        monkeypatch,
+        peer_lines,
+        scripted,
+        console_stdin_text=":continue\n",
+    )
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+
+    # The gate skips skip1 (not addressed, not a broadcast) — no LLM call fires
+    # for a skip, so wait on the logged decision instead of fake_chat.calls.
+    def _skip_logged():
+        return any(
+            kind == "reply_decision" and "respond=False" in content and "skip1" in content
+            for _role, kind, content in _events(ctx["store"])
+        )
+
+    assert _wait_for(_skip_logged, timeout=5.0)
+    assert ctx["fake_chat"].calls == 0
+
+    # Operator overrides the gate.
+    ctx["console"].start()
+    assert _wait_for(lambda: ctx["fake_chat"].calls == 1, timeout=5.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    # :continue targeted the skipped message, not "no prior actionable".
+    assert "[continue queued] retrying msg skip1" in ctx["console_stdout"].getvalue()
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert any("here is my view on the architecture" in p["text"] for p in replies)
+
+    # The continuation the model saw was anchored on the skipped message.
+    continue_call = ctx["fake_chat"].messages[0]
+    combined = "\n".join(m.get("content", "") for m in continue_call if isinstance(m, dict))
+    assert "Operator typed :continue" in combined
+    assert "Just thinking out loud about the calculator architecture." in combined
+
+    events = _events(ctx["store"])
+    assert any(
+        kind == "operator_continue" and "from_msg=skip1" in content
+        for _role, kind, content in events
+    )
+
+
 def test_runpod_with_no_existing_projects_auto_creates_project1(tmp_path, monkeypatch, capsys):
     """First boot in a fresh workspace has no choice to make — auto-create
     project1 and start replying immediately."""
@@ -1431,6 +1498,161 @@ def test_substantive_reply_is_not_suppressed(tmp_path, monkeypatch):
     replies = _outbox_replies(ctx["outbox"])
     assert len(replies) == 1
     assert "#division" in replies[0]["text"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "@alice-swe can you take an open action?",
+        "@alice-swe please take the next action",
+        "@alice-swe take over coordination",
+        "@alice-swe pick up a task",
+        "@alice-swe work on the divide op",
+        "@alice-swe can you handle error handling?",
+    ],
+)
+def test_direct_action_pattern_matches_take_handle_family(text):
+    """Regression for the silent-agent bug: 'take an open action' and friends
+    must register as actionable requests so a suppressed intro gets reprompted."""
+    assert DIRECT_ACTION_REQUEST_PATTERN.search(text) is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "@alice-swe please say hi",
+        "@alice-swe take your time",
+        "@alice-swe take a look when free",
+    ],
+)
+def test_direct_action_pattern_ignores_greetings_and_idioms(text):
+    """The verb gate is the action-vs-greeting discriminator: a bare 'take a
+    look' / 'say hi' must NOT be treated as an action request, so the intro
+    stays the legitimate answer."""
+    assert DIRECT_ACTION_REQUEST_PATTERN.search(text) is None
+
+
+def test_take_action_request_reprompts_suppressed_intro(tmp_path, monkeypatch):
+    """End-to-end of the first reported case: a direct '@agent can you take an
+    open action?' whose reply collapses to an intro must be reprompted for
+    substance, not silently dropped."""
+
+    peer_lines = [
+        json.dumps({"id": "m1", "sender_id": "emil-user", "text": "@alice-swe please say hi"}) + "\n",
+        json.dumps({
+            "id": "m2",
+            "sender_id": "emil-user",
+            "text": "@alice-swe can you take an open action?",
+        })
+        + "\n",
+    ]
+    scripted = [
+        json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
+        json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
+        json.dumps({
+            "type": "final",
+            "answer": "Taking the divide operation: reading /workspace/shared/calc.py first.",
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    assert _wait_for(lambda: ctx["fake_chat"].calls == 3, timeout=5.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    texts = [r["text"] for r in replies]
+    # The "say hi" intro goes out once (legitimate); the "take an action" intro
+    # is suppressed and replaced by the reprompted substantive reply.
+    assert "Hej, jag är alice-swe" in texts
+    assert any("Taking the divide operation" in t for t in texts)
+    assert texts.count("Hej, jag är alice-swe") == 1
+
+    events = _events(ctx["store"])
+    # The expanded action-verb detection lets either reprompt layer fire: the
+    # in-task peer_task guard (user_action_non_action_reprompt) or the
+    # group_chat post-suppression reprompt (direct_action_reprompt).
+    assert any(
+        kind in {"user_action_non_action_reprompt", "direct_action_reprompt"}
+        for _role, kind, _content in events
+    )
+
+
+def test_project_new_fires_on_new_project_callback(tmp_path):
+    """`:project new` re-arms the one-time intro by invoking the callback;
+    `:project use`/`:project info` must not, so resuming a project does not
+    trigger a spurious re-introduction."""
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "project1").mkdir()
+    state = _ProjectState(root=root)
+
+    calls = {"n": 0}
+
+    handler = _build_project_handler(state, on_new_project=lambda: calls.__setitem__("n", calls["n"] + 1))
+
+    handler("info", [])
+    handler("use", ["1"])
+    assert calls["n"] == 0, "only :project new should re-arm the intro"
+
+    out = handler("new", [])
+    assert out.endswith("(new)")
+    assert calls["n"] == 1
+
+
+def test_continue_reprompts_when_model_only_intros(tmp_path, monkeypatch):
+    """Operator escape hatch: if `:continue` produces another intro, suppress it
+    and reprompt for substance rather than silently dropping the operator's
+    explicit demand for output."""
+
+    private = tmp_path / "alice"
+    private.mkdir()
+    (private / "project1").mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "igor-petersson-agent",
+            "text": "@all agents: please post your [ROSTER] line",
+        })
+        + "\n",
+    ]
+    scripted = [
+        # Initial reply to the broadcast: a bare intro.
+        json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
+        # After :continue, model regresses to an intro again ...
+        json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
+        # ... reprompt then yields the real roster line.
+        json.dumps({
+            "type": "final",
+            "answer": "[ROSTER] alice-swe | SWE agent | tools: create_file, run_tests",
+        }),
+    ]
+    ctx = _setup_run(
+        tmp_path,
+        monkeypatch,
+        peer_lines,
+        scripted,
+        console_stdin_text=":project new\n:continue\n",
+    )
+    monkeypatch.setenv("AGENT_MODE", "runpod")
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    assert _wait_for(lambda: ctx["fake_chat"].calls == 1, timeout=5.0)
+    ctx["console"].start()
+    assert _wait_for(lambda: ctx["fake_chat"].calls == 3, timeout=5.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert any(
+        "[ROSTER]" in r["text"] and "create_file" in r["text"] for r in replies
+    ), f":continue must reprompt past the intro to substance: {replies}"
 
 
 def test_satisfied_claim_does_not_re_inject_nudge(tmp_path, monkeypatch):

@@ -17,8 +17,11 @@ Commands (one per line, `:` prefix):
     :resume                     undo :pause
     :continue                   retry the last actionable hub request
     :approve                    approve the pending bash/budget request (if any)
+    :allow [command]            approve a pending bash command AND bypass the
+                                safety allowlist for that one call (longer timeout)
     :deny                       deny the pending bash/budget request
     :say <text>                 post a message to the group chat as this agent
+    :roster                     broadcast a [ROSTER] roll-call and collect replies
     :stop                       signal the orchestrator to exit
     :help                       print this list
 """
@@ -45,7 +48,11 @@ HELP_TEXT = (
     "  :pause / :resume              stop or resume outbound LLM calls\n"
     "  :continue                     retry the last actionable hub request\n"
     "  :approve / :deny              answer the pending bash/budget approval\n"
+    "  :allow [command]              approve a pending bash command and bypass the\n"
+    "                                safety allowlist for that one call (longer timeout)\n"
     "  :say <text>                   post a message to the group chat as this agent\n"
+    "  :roster                       broadcast a [ROSTER] roll-call, wait the window,\n"
+    "                                then decompose work among the agents that answered\n"
     "  :project                      show active remote-hub project\n"
     "  :project new                  allocate a fresh projectN and switch to it\n"
     "  :project use <N>              switch active project to projectN\n"
@@ -55,10 +62,16 @@ HELP_TEXT = (
 )
 
 
+# Sentinel returned by request_bash_approval when the operator types `:allow`.
+# It is truthy but distinct from plain True so the caller can tell an ordinary
+# `:approve` apart from a deliberate one-shot safety-allowlist bypass.
+BASH_ALLOW_OVERRIDE = "allow-override"
+
+
 @dataclass
 class BashApproval:
     command: str
-    response: queue.Queue  # holds True (approve) / False (deny)
+    response: queue.Queue  # holds True (approve) / False (deny) / BASH_ALLOW_OVERRIDE
 
 
 @dataclass
@@ -78,6 +91,7 @@ class ConsoleControl:
         send_fn: Optional[Callable[[str], None]] = None,
         project_handler: Optional[Callable[[str, list[str]], str]] = None,
         continue_handler: Optional[Callable[[], str]] = None,
+        roster_handler: Optional[Callable[[str], str]] = None,
     ):
         self.budget = budget
         self.stop_event = stop_event
@@ -86,6 +100,7 @@ class ConsoleControl:
         self.send_fn = send_fn
         self.project_handler = project_handler
         self.continue_handler = continue_handler
+        self.roster_handler = roster_handler
         self._approval_lock = threading.Lock()
         self._pending: Optional[BashApproval] = None
         self._pending_budget: Optional[BudgetApproval] = None
@@ -100,15 +115,19 @@ class ConsoleControl:
     def stop(self) -> None:
         self.stop_event.set()
 
-    def request_bash_approval(self, command: str, timeout: Optional[float] = None) -> bool:
-        """Block until operator types :approve or :deny. Default to deny on timeout."""
+    def request_bash_approval(self, command: str, timeout: Optional[float] = None):
+        """Block until the operator answers. Default to deny on timeout.
+
+        Returns True for `:approve`, False for `:deny`/timeout, and
+        ``BASH_ALLOW_OVERRIDE`` for `:allow` (approve + one-shot safety bypass).
+        """
 
         response: queue.Queue = queue.Queue(maxsize=1)
         with self._approval_lock:
             self._pending = BashApproval(command=command, response=response)
         tag = colors.paint("[approval needed]", colors.BOLD, colors.YELLOW)
         prompt = colors.paint("bash>", colors.BOLD)
-        hint = colors.dim("Type :approve or :deny.")
+        hint = colors.dim("Type :approve, :deny, or :allow (one-shot safety override).")
         self._print(f"\n{tag} {prompt} {command}\n{hint}")
         try:
             approved = response.get(timeout=timeout)
@@ -119,6 +138,9 @@ class ConsoleControl:
             with self._approval_lock:
                 if self._pending is not None and self._pending.response is response:
                     self._pending = None
+        # Preserve the override sentinel; coerce everything else to a plain bool.
+        if approved == BASH_ALLOW_OVERRIDE:
+            return BASH_ALLOW_OVERRIDE
         return bool(approved)
 
     def request_budget_approval(
@@ -178,6 +200,39 @@ class ConsoleControl:
             return False
         return True
 
+    def _cmd_allow(self, rest: str) -> None:
+        """Approve a pending bash command AND bypass the safety allowlist for it.
+
+        Unlike :approve, this resolves the pending bash request with the
+        BASH_ALLOW_OVERRIDE sentinel so the runtime runs the command without the
+        default-deny safety check. It only ever applies to a pending *bash*
+        request (never a budget override). An optional command argument, when
+        given, must match the pending command exactly — a guard so the operator
+        cannot bypass safety for a command other than the one on screen.
+        """
+
+        requested = rest.strip()
+        with self._approval_lock:
+            pending = self._pending
+        if pending is None:
+            self._print(colors.paint("[:allow needs a pending bash command]", colors.RED))
+            return
+        if requested and requested != pending.command.strip():
+            self._print(
+                colors.paint(
+                    f"[:allow command mismatch] pending command is:\n{pending.command}",
+                    colors.RED,
+                )
+            )
+            return
+        try:
+            pending.response.put_nowait(BASH_ALLOW_OVERRIDE)
+        except queue.Full:
+            return
+        self._print(
+            colors.paint("[allowed — one-shot safety override]", colors.BOLD, colors.YELLOW)
+        )
+
     def _handle(self, raw: str) -> None:
         line = raw.rstrip("\r\n")
         stripped = line.strip()
@@ -208,11 +263,15 @@ class ConsoleControl:
         elif cmd == "approve":
             if self._resolve_pending(True):
                 self._print(colors.paint("[approved]", colors.BOLD, colors.GREEN))
+        elif cmd == "allow":
+            self._cmd_allow(rest)
         elif cmd == "deny":
             if self._resolve_pending(False):
                 self._print(colors.paint("[denied]", colors.BOLD, colors.RED))
         elif cmd == "say":
             self._cmd_say(rest)
+        elif cmd == "roster":
+            self._cmd_roster(rest)
         elif cmd == "project":
             self._cmd_project(args)
         elif cmd == "stop":
@@ -236,6 +295,19 @@ class ConsoleControl:
             self.send_fn(scrubbed)
         except Exception as exc:
             self._print(f"[say failed: {exc}]")
+
+    def _cmd_roster(self, rest: str) -> None:
+        """Queue a roster roll-call. The main loop runs the timed window so the
+        console daemon thread never blocks on the transport."""
+
+        if self.roster_handler is None:
+            self._print("[roster not enabled in this mode]")
+            return
+        try:
+            result = self.roster_handler(rest.strip())
+        except Exception as exc:
+            result = f"[roster error] {exc}"
+        self._print(result)
 
     def _cmd_project(self, args: list[str]) -> None:
         if self.project_handler is None:

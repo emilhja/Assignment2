@@ -57,7 +57,7 @@ python tools/audit.py trace <trace_id>
 python tools/audit.py tail --agent alice --kind tool
 ```
 
-Useful event kinds: `claim_observed`, `claim_block`, `peer_refusal`, `peer_refusal_tool_args`, `budget_exceeded`, `tool`, `raw_json`.
+Useful event kinds: `claim_observed`, `claim_block`, `peer_refusal`, `peer_refusal_tool_args`, `budget_exceeded`, `safety_override_approved`, `tool`, `raw_json`.
 
 ## Docker rebuild discipline
 

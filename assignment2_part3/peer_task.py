@@ -34,15 +34,20 @@ from runtime_helpers import (
 )
 from safety import safety_check
 from session_store import SessionStore
-from tools import TOOL_REGISTRY, _resolve_workspace_path, run_tool
+from tools import TOOL_REGISTRY, _resolve_workspace_path, run_bash, run_tool
 
 from budget import Budget, BudgetExceeded, estimate_tokens
 from claims import CLAIM_PATTERN, DEFER_PATTERN, RELEASE_PATTERN, ClaimRegistry, split_claim_target
-from console_control import ConsoleControl
+from console_control import BASH_ALLOW_OVERRIDE, ConsoleControl
 from peer import PeerMessage, peer_intent_refusal, scrub_outbound
 from reply_policy import CollisionInfo
 from task_status import parse_task_status
 
+
+# The operator `:allow` override runs the command without the safety allowlist,
+# so it gets a longer wall-clock budget than the default 10s — package installs
+# and short-lived server boots need more than the model's normal read-only path.
+OVERRIDE_BASH_TIMEOUT_SECONDS = 120
 
 MAX_STEPS = 8
 MAX_CLAIM_CONTINUATION_STEPS = 12
@@ -312,13 +317,31 @@ def _run_tool_with_approval(
     tool: str,
     args: dict,
     console: Optional[ConsoleControl],
+    log_fn: Optional[Callable[..., None]] = None,
 ) -> str:
     if tool == "bash":
         command = args.get("command")
         if not isinstance(command, str) or not command.strip():
             return "Tool error: bash requires a non-empty string command."
         if console is not None and not _is_auto_approvable_bash_command(command):
-            if not console.request_bash_approval(command):
+            decision = console.request_bash_approval(command)
+            if decision == BASH_ALLOW_OVERRIDE:
+                # Operator explicitly bypassed the safety allowlist for this one
+                # command (e.g. `pip install`). Run it with safety off and a
+                # longer timeout, and log a loud audit event so the override is
+                # always reconstructable from the trace.
+                if log_fn is not None:
+                    log_fn(
+                        "system",
+                        "safety_override_approved",
+                        _json({"command": command, "timeout": OVERRIDE_BASH_TIMEOUT_SECONDS}),
+                    )
+                return run_bash(
+                    command,
+                    override=True,
+                    timeout=OVERRIDE_BASH_TIMEOUT_SECONDS,
+                )
+            if not decision:
                 return "The command was denied by the operator, so I did not run it."
     return run_tool(tool, args)
 
@@ -449,6 +472,11 @@ _ACTION_REQUEST_RE = re.compile(
     r"|read(?:s|ing)?"
     r"|test(?:ed|ing)?"
     r"|execute"
+    r"|handle(?:d|s|ing)?"
+    r"|take[\w\s'/-]{0,30}action"
+    r"|take\s+(?:over|on|charge)"
+    r"|pick\s+up"
+    r"|work\s+on"
     r"|use\s+tools?"
     r"|call\s+run_tests"
     r"|run\s+pytest"
@@ -1460,7 +1488,7 @@ def run_peer_task(
                 continue
 
             _emit("tool", f"{parsed.tool} {_tool_arg_summary(parsed.tool, parsed.args)}")
-            observation = _run_tool_with_approval(parsed.tool, parsed.args, console)
+            observation = _run_tool_with_approval(parsed.tool, parsed.args, console, _log)
             observation = _truncate(observation)
             _emit("tool=", _observation_summary(observation))
             saw_any_tool_observation = True

@@ -3,7 +3,7 @@ import threading
 import time
 
 from budget import Budget
-from console_control import ConsoleControl
+from console_control import BASH_ALLOW_OVERRIDE, ConsoleControl
 
 
 def _wait_for(predicate, timeout=2.0):
@@ -76,6 +76,27 @@ def test_approve_releases_pending_bash():
     stop.set()
 
 
+def test_roster_command_invokes_handler():
+    calls = []
+
+    def roster_handler(purpose):
+        calls.append(purpose)
+        return "[roster queued] collecting for 60s"
+
+    cc, budget, stop, stdout = _start_console(
+        ":roster develop the calculator\n", roster_handler=roster_handler
+    )
+    assert _wait_for(lambda: calls == ["develop the calculator"])
+    assert _wait_for(lambda: "[roster queued]" in stdout.getvalue())
+    stop.set()
+
+
+def test_roster_command_without_handler_reports_disabled():
+    cc, budget, stop, stdout = _start_console(":roster\n")
+    assert _wait_for(lambda: "[roster not enabled in this mode]" in stdout.getvalue())
+    stop.set()
+
+
 def test_deny_releases_pending_bash():
     cc, budget, stop, stdout = _build_console(":deny\n")
     result_holder = {}
@@ -87,6 +108,70 @@ def test_deny_releases_pending_bash():
     cc.start()
     t.join(timeout=3.0)
     assert result_holder.get("approved") is False
+    stop.set()
+
+
+def test_allow_releases_pending_bash_with_override():
+    cc, budget, stop, stdout = _build_console(":allow\n")
+    result_holder = {}
+
+    def worker():
+        result_holder["decision"] = cc.request_bash_approval(
+            "pip install flask", timeout=2.0
+        )
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert _wait_for(lambda: cc._pending is not None)
+    cc.start()
+    t.join(timeout=3.0)
+    assert result_holder.get("decision") == BASH_ALLOW_OVERRIDE
+    assert "one-shot safety override" in stdout.getvalue()
+    stop.set()
+
+
+def test_allow_with_matching_command_overrides():
+    cc, budget, stop, stdout = _build_console(":allow pip install flask\n")
+    result_holder = {}
+
+    def worker():
+        result_holder["decision"] = cc.request_bash_approval(
+            "pip install flask", timeout=2.0
+        )
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert _wait_for(lambda: cc._pending is not None)
+    cc.start()
+    t.join(timeout=3.0)
+    assert result_holder.get("decision") == BASH_ALLOW_OVERRIDE
+    stop.set()
+
+
+def test_allow_with_mismatched_command_does_not_override():
+    cc, budget, stop, stdout = _build_console(":allow rm -rf /home\n")
+    result_holder = {}
+
+    def worker():
+        # Short timeout: the mismatch must NOT resolve the request, so it
+        # falls through to deny-on-timeout instead of running anything.
+        result_holder["decision"] = cc.request_bash_approval(
+            "pip install flask", timeout=0.5
+        )
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert _wait_for(lambda: cc._pending is not None)
+    cc.start()
+    t.join(timeout=3.0)
+    assert result_holder.get("decision") is False
+    assert "command mismatch" in stdout.getvalue()
+    stop.set()
+
+
+def test_allow_without_pending_warns():
+    cc, budget, stop, stdout = _start_console(":allow\n")
+    assert _wait_for(lambda: "needs a pending bash command" in stdout.getvalue())
     stop.set()
 
 

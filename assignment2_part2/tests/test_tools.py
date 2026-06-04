@@ -94,6 +94,33 @@ def test_run_bash_blocks_dangerous_command_before_subprocess(monkeypatch):
     assert output.startswith("Blocked by safety check:")
 
 
+def test_run_bash_override_bypasses_safety_allowlist(monkeypatch):
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return SimpleNamespace(stdout="installed", stderr="", returncode=0)
+
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+
+    # `pip` is not on the allowlist; without override this would be blocked.
+    output = tools.run_bash("pip install flask", override=True, timeout=120)
+
+    assert output == "installed"
+    assert captured["timeout"] == 120
+
+
+def test_run_bash_without_override_still_blocks_unsafe(monkeypatch):
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("unsafe command should not reach subprocess")
+
+    monkeypatch.setattr(tools.subprocess, "run", fail_if_called)
+
+    output = tools.run_bash("pip install flask")
+
+    assert output.startswith("Blocked by safety check:")
+
+
 def test_run_tool_bash_uses_safety_guard(monkeypatch):
     def fail_if_called(*_args, **_kwargs):
         raise AssertionError("unsafe command should not reach subprocess")

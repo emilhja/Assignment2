@@ -13,11 +13,13 @@ from budget import Budget
 from claims import ClaimRegistry
 from peer import PeerMessage
 from peer_task import (
+    OVERRIDE_BASH_TIMEOUT_SECONDS,
     _STALL_SILENT,
     _ensure_peer_mentions,
     _run_tool_with_approval,
     run_peer_task,
 )
+from console_control import BASH_ALLOW_OVERRIDE
 from reply_policy import CollisionInfo
 from thread_safe_store import ThreadSafeSessionStore
 
@@ -140,6 +142,68 @@ def test_unsafe_ls_variants_require_approval_and_remain_safety_blocked(command):
 
     assert console.requests == [command]
     assert observation.startswith("Blocked by safety check:")
+
+
+def test_allow_override_runs_bash_with_safety_off_and_longer_timeout(monkeypatch):
+    console = _BashApprovalConsole(approved=BASH_ALLOW_OVERRIDE)
+    captured = {}
+
+    def fake_run_bash(command, *, override=False, timeout=None):
+        captured["command"] = command
+        captured["override"] = override
+        captured["timeout"] = timeout
+        return "Successfully installed flask"
+
+    def fake_run_tool(tool, args):
+        raise AssertionError("override path must call run_bash directly, not run_tool")
+
+    monkeypatch.setattr("peer_task.run_bash", fake_run_bash)
+    monkeypatch.setattr("peer_task.run_tool", fake_run_tool)
+
+    events = []
+
+    def log_fn(role, kind, content):
+        events.append((role, kind, content))
+
+    observation = _run_tool_with_approval(
+        "bash",
+        {"command": "pip install flask"},
+        console,
+        log_fn,
+    )
+
+    assert observation == "Successfully installed flask"
+    assert console.requests == ["pip install flask"]
+    assert captured == {
+        "command": "pip install flask",
+        "override": True,
+        "timeout": OVERRIDE_BASH_TIMEOUT_SECONDS,
+    }
+    # The override is logged as a loud, reconstructable audit event.
+    assert len(events) == 1
+    role, kind, content = events[0]
+    assert role == "system"
+    assert kind == "safety_override_approved"
+    assert "pip install flask" in content
+
+
+def test_allow_override_works_without_log_fn(monkeypatch):
+    console = _BashApprovalConsole(approved=BASH_ALLOW_OVERRIDE)
+
+    def fake_run_bash(command, *, override=False, timeout=None):
+        assert override is True
+        return "ran with override"
+
+    monkeypatch.setattr("peer_task.run_bash", fake_run_bash)
+
+    # log_fn defaults to None — the override must still run.
+    observation = _run_tool_with_approval(
+        "bash",
+        {"command": "pip install flask"},
+        console,
+    )
+
+    assert observation == "ran with override"
 
 
 def test_budget_override_denial_stops_without_llm_call(tmp_path):

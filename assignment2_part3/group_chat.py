@@ -58,6 +58,12 @@ from message_assembler import MultipartAssembler
 from peer import PeerMessage
 from peer_task import _STALL_SILENT, run_peer_task
 from reply_policy import CollisionInfo, should_reply
+from roster import (
+    RosterRegistry,
+    build_roster_line,
+    roster_guidance,
+    roster_request_text,
+)
 from task_status import TaskStatus, looks_like_empty_acknowledgment, parse_task_status
 from transport import Transport, build_transport
 
@@ -113,10 +119,19 @@ RESEND_CODE_REQUEST_PATTERN = re.compile(
     r"(?:code|file|contents?)\b"
 )
 DIRECT_ACTION_REQUEST_PATTERN = re.compile(
-    r"(?i)\b(?:share|shares|sharing|send|sends|sending|show|shows|showing|"
+    r"(?i)(?:"
+    r"\b(?:share|shares|sharing|send|sends|sending|show|shows|showing|"
     r"paste|pastes|pasting|read|reads|reading|run|runs|running|test|testing|"
     r"review|reviews|reviewing|create|creates|creating|update|updates|updating|"
-    r"fix|fixes|fixing)\b"
+    r"fix|fixes|fixing|handle|handles|handling|implement|implements|implementing)\b"
+    # "can you take an open action?", "pick up a task", "work on the divide op",
+    # "take over coordination". A bare "take" is too noisy ("take a look",
+    # "take your time"), so only match the action-bearing collocations.
+    r"|\btake(?:s|n|ing)?\b[\w\s'/-]{0,30}\baction\b"
+    r"|\btake\s+(?:over|on|charge|the\s+lead|a\s+task|an?\s+\w+\s+task)\b"
+    r"|\bpick(?:s|ing)?\s+up\b"
+    r"|\bwork(?:s|ing)?\s+on\b"
+    r")"
 )
 DIRECT_FILE_SHARE_PATTERN = re.compile(
     r"(?is)\b(?:share|send|show|paste|read)\b.{0,80}\b"
@@ -335,7 +350,7 @@ def _local_workspace_guidance(agent_id: str, project_dir: Path) -> str:
     )
 
 
-def _build_project_handler(project_state: _ProjectState):
+def _build_project_handler(project_state: _ProjectState, on_new_project=None):
     def _root() -> Path | None:
         return project_state.root
 
@@ -353,6 +368,12 @@ def _build_project_handler(project_state: _ProjectState):
             if nxt is None:
                 return f"[project error] cap reached ({MAX_PROJECTS} projects)"
             project_state.active = nxt
+            # A fresh project is a deliberate restart: re-allow exactly one
+            # intro so the agent is not stuck silently dropping every reply
+            # that happens to be intro-shaped (a stale intro from an earlier
+            # project in the same persisted session log).
+            if on_new_project is not None:
+                on_new_project()
             return f"active={nxt.name} (new)"
         if action == "use":
             if not rest:
@@ -865,7 +886,32 @@ def run_group_chat(
     project_state = _ProjectState()
     project_handler = None
     continue_requests: queue.Queue[float] = queue.Queue()
+    # `last_wakeable_message` is the last message the agent actually engaged with
+    # (replied to or ran a task for). `last_seen_message` is the last *peer*
+    # message the reply gate SKIPPED — kept separately so the operator can use
+    # :continue to override the gate and answer that exact message, instead of
+    # re-firing the older last-engaged one. It is set on a skip and cleared the
+    # moment the agent engages any message.
     last_wakeable_message: PeerMessage | None = None
+    last_seen_message: PeerMessage | None = None
+
+    # Roster roll-call (P3): the registry tracks an attendance window opened by
+    # `:roster` or the per-project auto-trigger. `roster_present` holds the
+    # agents that answered the most recent window so their capabilities can be
+    # injected into the next decomposition. `roster_requests` carries operator
+    # `:roster` requests from the console thread to the main loop (the timed
+    # window must run on the loop thread, never the console daemon).
+    roster = RosterRegistry()
+    roster_present: list = []
+    roster_pending_guidance: bool = False
+    roster_requests: queue.Queue[str] = queue.Queue()
+    roster_auto_enabled = _env_int("ROSTER_AUTO", 0) == 1
+    roster_done_projects: set[str] = set()
+
+    def _queue_roster(purpose: str = "") -> str:
+        roster_requests.put(purpose or "")
+        window = int(roster.window_seconds)
+        return f"[roster queued] broadcasting roll-call, collecting for {window}s"
 
     multipart_assembler = MultipartAssembler()
     multipart_ready: list[PeerMessage] = []
@@ -894,12 +940,25 @@ def run_group_chat(
         return None
 
     def _queue_continue() -> str:
-        if last_wakeable_message is None:
+        # Prefer a freshly-skipped message: if the gate just dropped a peer
+        # message, :continue means "answer that one" — not the older message we
+        # last replied to.
+        target = last_seen_message or last_wakeable_message
+        if target is None:
             return "[continue] no prior actionable hub message to continue"
         if runpod and project_state.active is None:
             return "[continue] no active project; type :project new or :project use N first"
         continue_requests.put(time.time())
-        return f"[continue queued] retrying msg {last_wakeable_message.id}"
+        return f"[continue queued] retrying msg {target.id}"
+
+    def _reset_intro_for_new_project() -> None:
+        # Runs on the console daemon thread when the operator types
+        # `:project new`. Re-arms the one-time intro for the fresh project so a
+        # stale intro from an earlier project in the persisted session log does
+        # not keep every intro-shaped reply suppressed.
+        nonlocal intro_sent
+        intro_sent = False
+        _log(store, "intro_reset", "operator started new project")
 
     ws_env = os.environ.get("AGENT_WORKSPACE")
     agent_workspace = Path(ws_env) if ws_env else None
@@ -908,7 +967,9 @@ def run_group_chat(
         project_root.mkdir(parents=True, exist_ok=True)
         project_state.root = project_root
         project_state.is_shared = is_shared
-        project_handler = _build_project_handler(project_state)
+        project_handler = _build_project_handler(
+            project_state, on_new_project=_reset_intro_for_new_project
+        )
         if runpod:
             most_recent = most_recent_project_dir(project_root)
             if most_recent is None:
@@ -947,6 +1008,7 @@ def run_group_chat(
             send_fn=transport.send,
             project_handler=project_handler,
             continue_handler=_queue_continue,
+            roster_handler=_queue_roster,
         )
         console.start()
     else:
@@ -954,6 +1016,8 @@ def run_group_chat(
             console.project_handler = project_handler
         if console.continue_handler is None:
             console.continue_handler = _queue_continue
+        if console.roster_handler is None:
+            console.roster_handler = _queue_roster
 
     system_prompt = load_system_prompt(agent_id, display_name)
     recent_replies: list[tuple[float, str]] = []
@@ -1055,7 +1119,15 @@ def run_group_chat(
         collision: CollisionInfo | None = None,
         code_guidance: str | None = None,
     ) -> str | None:
+        nonlocal roster_pending_guidance
         runtime_guidance = []
+        # One-shot: the first task after a roster window closes carries the list
+        # of agents that answered so the model decomposes work among them only.
+        if roster_pending_guidance and roster_present:
+            roster_block = roster_guidance(roster_present)
+            if roster_block:
+                runtime_guidance.append(roster_block)
+            roster_pending_guidance = False
         if not _is_claim_continuation_message(message):
             guidance = assignment_guidance(
                 message.text,
@@ -1225,6 +1297,8 @@ def run_group_chat(
         message: PeerMessage,
         answer: str,
         prior_context: list[dict[str, str]] | None,
+        *,
+        force_reprompt: bool = False,
     ) -> str:
         coordinator_assignment = (
             _looks_like_operator_sender(message.sender_id, agent_id)
@@ -1244,16 +1318,21 @@ def run_group_chat(
             )
             is not None
         )
+        # ``force_reprompt`` is set by the operator :continue path: the operator
+        # explicitly demanded output, so an intro/empty-ack must not be the final
+        # word — suppress it and reprompt for substance even when the (synthetic
+        # runtime) message carries no action verb.
+        reprompt = direct_action or force_reprompt
         suppression = _send_answer(
             answer,
             message.id,
-            suppress_intro=direct_action,
+            suppress_intro=reprompt,
         )
         if suppression is None:
             return answer
         if suppression == "send failed":
             return ""
-        if not direct_action:
+        if not reprompt:
             return answer
 
         continuation = _direct_actionable_reprompt_message(
@@ -1325,7 +1404,7 @@ def run_group_chat(
         return None
 
     def _process_message(message: PeerMessage, *, allow_claim_continuation: bool = True) -> None:
-        nonlocal pending_followup, last_wakeable_message
+        nonlocal pending_followup, last_wakeable_message, last_seen_message
         if not runpod:
             _hub_echo("<-", message.sender_id, message.text)
 
@@ -1434,6 +1513,11 @@ def run_group_chat(
                 flush=True,
             )
 
+        # Auto roll-call: once a project/coordination phase starts, the
+        # designated coordinator (ROSTER_AUTO=1) queues a roster window so the
+        # next decomposition only assigns work to agents that answer.
+        _maybe_auto_roster()
+
         # Save peer-shared code blocks to the active project even when the
         # reply gate will skip this message. Otherwise broadcasts of code
         # (e.g. peers posting `hangman.py` without addressing this agent)
@@ -1484,6 +1568,7 @@ def run_group_chat(
             )
             pending_followup = None
             last_wakeable_message = message
+            last_seen_message = None
             answer = _run_task_for_message(
                 message, prior_context, code_guidance=code_guidance
             )
@@ -1516,6 +1601,10 @@ def run_group_chat(
         )
         if not decision.respond:
             _absorb_inbound_claims(message)
+            # Remember the skipped peer message so :continue can override the
+            # gate and answer this exact message. Never target our own message.
+            if message.sender_id != agent_id:
+                last_seen_message = message
             if runpod:
                 print(
                     f"{colors.ts()} {colors.dim(f'[skip] {decision.reason}')}",
@@ -1526,7 +1615,10 @@ def run_group_chat(
         if decision.delay_seconds > 0:
             time.sleep(decision.delay_seconds)
 
+        # Engaging this message: it becomes the wakeable target and clears any
+        # pending skipped message so :continue won't re-fire a stale skip.
         last_wakeable_message = message
+        last_seen_message = None
         answer = _run_task_for_message(
             message, prior_context, decision.collision, code_guidance=code_guidance
         )
@@ -1576,10 +1668,17 @@ def run_group_chat(
         return code_guidance
 
     def _continue_from_console() -> None:
-        original = last_wakeable_message
+        nonlocal last_wakeable_message, last_seen_message
+        # A freshly-skipped message wins: the operator typed :continue to push
+        # past the reply gate on the message it just dropped. Promote it to the
+        # wakeable message and consume the skip so a second :continue won't redo
+        # it.
+        original = last_seen_message or last_wakeable_message
         if original is None:
             _log(store, "operator_continue_skipped", "no prior actionable message")
             return
+        last_wakeable_message = original
+        last_seen_message = None
         active_name = project_state.active.name if project_state.active is not None else None
         continuation = _operator_continue_message(original, active_name)
         _log(
@@ -1600,9 +1699,145 @@ def run_group_chat(
         )
         if answer is None:
             return
-        _send_answer(answer, continuation.id)
-        _continue_task_status(continuation, answer)
-        _continue_claims(continuation, answer)
+        # Force a reprompt: if the model answers the operator's :continue with
+        # another intro/empty-ack, suppressing it silently would leave the
+        # operator's explicit demand unanswered. Reprompt for substance instead.
+        sent_answer = _send_with_direct_assignment_reprompt(
+            continuation,
+            answer,
+            prior_context,
+            force_reprompt=True,
+        )
+        if not sent_answer:
+            return
+        _continue_task_status(continuation, sent_answer)
+        _continue_claims(continuation, sent_answer)
+
+    def _own_roster_line() -> str:
+        backend = os.environ.get("AGENT_LLM_PROVIDER_ORDER") or mode
+        return build_roster_line(
+            display_name,
+            role=os.environ.get("AGENT_ROLE", "SWE agent"),
+            actions=(
+                "bash",
+                "create_file",
+                "edit_section",
+                "replace_text",
+                "read_file",
+                "yield",
+            ),
+            backend=backend,
+        )
+
+    def _roster_decompose_message(anchor: PeerMessage | None) -> PeerMessage:
+        present_names = ", ".join(f"@{e.name}" for e in roster_present)
+        anchor_clause = (
+            f" Original request to decompose: {anchor.text}" if anchor is not None else ""
+        )
+        text = (
+            "Roster roll-call complete. Agents present and available for "
+            f"assignment: {present_names}. Decompose the work into concrete "
+            "subtasks and assign each to one of these present agents only; do not "
+            "assign work to, or wait on, agents that did not answer the roll-call."
+            f"{anchor_clause}"
+        )
+        anchor_id = anchor.id if anchor is not None else "none"
+        return PeerMessage(
+            id=f"{anchor_id}:roster-decompose:{int(time.time())}",
+            sender_id="runtime",
+            text=text,
+            addressed_to=(),
+        )
+
+    def _run_roster_window(purpose: str = "") -> None:
+        """Broadcast a [ROSTER] roll-call, collect replies for the configured
+        window, then decompose work among the agents that answered.
+
+        Runs on the main loop thread (never the console daemon) so it can block
+        on the transport for the duration of the window.
+        """
+
+        nonlocal roster_pending_guidance
+        now = time.time()
+        # Mark the active project's roster as done so the auto-trigger does not
+        # fire a redundant second window right after a manual :roster.
+        if project_state.active is not None:
+            roster_done_projects.add(project_state.active.name)
+        roster.open(now)
+        own_line = _own_roster_line()
+        request = roster_request_text(purpose or None, own_line=own_line)
+        # Seed self so the coordinator counts as present even if its own
+        # broadcast is not echoed back by the hub.
+        roster.observe(agent_id, own_line, now)
+        sent = transport.send(request)
+        window = int(roster.window_seconds)
+        _log(
+            store,
+            "roster_open",
+            f"window_s={window} sent={sent} purpose={purpose or '<none>'}",
+        )
+        print(
+            colors.dim(f"[roster] roll-call sent — collecting [ROSTER] lines for {window}s"),
+            flush=True,
+        )
+
+        deadline = roster.deadline() or now
+        while time.time() < deadline and not stop_event.is_set():
+            remaining = max(0.0, deadline - time.time())
+            peer_message = _recv_assembled(timeout=min(remaining, 0.5))
+            if peer_message is None:
+                time.sleep(min(remaining, idle_sleep))
+                continue
+            added = roster.observe(peer_message.sender_id, peer_message.text, time.time())
+            for entry in added:
+                _log(
+                    store,
+                    "roster_observed",
+                    f"name={entry.name} sender={entry.agent_id} actions={','.join(entry.actions)}",
+                )
+            # Still handle the message normally so claims/code/replies aren't
+            # dropped during the window. Disable claim continuation to avoid
+            # deep reentrancy while the roster loop owns the receive path.
+            _process_message(peer_message, allow_claim_continuation=False)
+
+        present = roster.close(time.time())
+        roster_present[:] = list(present)
+        names = ", ".join(e.name for e in present) or "<none>"
+        _log(store, "roster_closed", f"present_count={len(present)} present={names}")
+        print(
+            colors.dim(f"[roster] window closed — present: {names}"),
+            flush=True,
+        )
+        if not present:
+            return
+
+        # "Continue with those that have done roster": run one decomposition
+        # turn anchored on the last actionable request, with the present-set
+        # injected as guidance. If there is no prior request, leave the one-shot
+        # flag armed so the operator's next task picks the roster up.
+        roster_pending_guidance = True
+        if last_wakeable_message is None:
+            return
+        synth = _roster_decompose_message(last_wakeable_message)
+        prior_context = list(recent_context)
+        recent_context.append(_context_entry(synth.sender_id, synth.text, synth.id))
+        if len(recent_context) > MAX_RECENT_CONTEXT_ENTRIES:
+            del recent_context[:-MAX_RECENT_CONTEXT_ENTRIES]
+        answer = _run_task_for_message(synth, prior_context)
+        if answer is not None:
+            _send_answer(answer, synth.id)
+
+    def _maybe_auto_roster() -> None:
+        """Fire the roster once per project when ROSTER_AUTO=1 (coordinator)."""
+
+        if not roster_auto_enabled or project_state.active is None:
+            return
+        key = project_state.active.name
+        if key in roster_done_projects:
+            return
+        roster_done_projects.add(key)
+        roster_requests.put("")
+        _log(store, "roster_auto_queued", f"project={key}")
 
     def _continue_task_status(original: PeerMessage, answer: str, depth: int = 0) -> None:
         if depth >= 3:
@@ -1715,6 +1950,13 @@ def run_group_chat(
                 pass
             else:
                 _continue_from_console()
+                continue
+            try:
+                roster_purpose = roster_requests.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                _run_roster_window(roster_purpose)
                 continue
             message = _recv_assembled(timeout=1.0)
             if message is None:

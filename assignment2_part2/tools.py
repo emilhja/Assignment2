@@ -167,12 +167,22 @@ def _bash_subprocess_env(root: Path) -> dict:
     return env
 
 
-def run_bash(command: str) -> str:
-    """Run one Bash command and return the text the agent should see."""
+def run_bash(command: str, *, override: bool = False, timeout: int | None = None) -> str:
+    """Run one Bash command and return the text the agent should see.
 
-    allowed, reason = safety_check(command)
-    if not allowed:
-        return reason or "Blocked by safety check."
+    `override=True` skips the safety allowlist/blocklist. This is reserved for
+    Part 3's explicit operator `:allow` escape hatch — the model's own tool path
+    never sets it, so default-deny still holds for anything the LLM proposes.
+    `timeout` overrides the default 10s cap (the override path needs longer for
+    package installs); it never shortens normal calls.
+    """
+
+    if not override:
+        allowed, reason = safety_check(command)
+        if not allowed:
+            return reason or "Blocked by safety check."
+
+    effective_timeout = COMMAND_TIMEOUT_SECONDS if timeout is None else timeout
 
     bash_path = shutil.which("bash")
     if bash_path is None:
@@ -191,7 +201,7 @@ def run_bash(command: str) -> str:
             cwd=root,
             capture_output=True,
             text=True,
-            timeout=COMMAND_TIMEOUT_SECONDS,
+            timeout=effective_timeout,
             env=_bash_subprocess_env(root),
         )
     except FileNotFoundError:
@@ -206,9 +216,9 @@ def run_bash(command: str) -> str:
 
         if partial_output:
             return _truncate(
-                f"I stopped the command after {COMMAND_TIMEOUT_SECONDS} seconds.\n{partial_output}"
+                f"I stopped the command after {effective_timeout} seconds.\n{partial_output}"
             )
-        return f"I stopped the command after {COMMAND_TIMEOUT_SECONDS} seconds."
+        return f"I stopped the command after {effective_timeout} seconds."
 
     if completed.stdout:
         output = completed.stdout.strip()

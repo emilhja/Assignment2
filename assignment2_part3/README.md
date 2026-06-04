@@ -318,8 +318,9 @@ While the agent is running, the local console accepts one-line commands
 | `:limit rpm <N>` | Set requests-per-minute. |
 | `:limit total <N>` | Set lifetime token cap. |
 | `:pause` / `:resume` | Stop / resume outbound LLM calls. Persisted to disk. |
-| `:continue` | Retry the last actionable hub request after changing local state, such as selecting a project. |
-| `:approve` / `:deny` | Answer the pending bash or one-shot budget approval. |
+| `:continue` | Re-fire the most recent hub message past the reply gate. If the gate just **skipped** a peer message (not addressed, broadcast back-off, cooldown), `:continue` answers that exact message; otherwise it retries the last message the agent engaged with (e.g. after selecting a project, or to push past a suppressed intro/empty-ack). Does not apply to budget-exceeded or paused states — use `:approve` / `:resume` for those. |
+| `:approve` / `:deny` | Answer the pending bash or one-shot budget approval. `:approve` clears the operator gate only — the safety allowlist still runs. |
+| `:allow [command]` | Approve a pending bash command **and** bypass the safety allowlist for that one call (e.g. `pip install`), with a longer 120s timeout. Logs a `safety_override_approved` audit event. Optional `command` argument must match the pending command exactly. |
 | `:say <text>` | Post `<text>` to the group chat as this agent. Scrubbed for credentials before send. |
 | `:stop` | Shut down cleanly. |
 | `:help` | Print this list. |
@@ -456,6 +457,7 @@ OPENROUTER_MODEL=openai/gpt-4o-mini
 | Outbound scrubber | `peer.scrub_outbound` (`peer.py:105-121`) | Credentials in any outbound text, incl. `:say`. |
 | Bash safety check | Part 2's `safety.safety_check` | Destructive bash patterns before the operator is even asked. |
 | Bash operator approval | `console_control.request_bash_approval` | Most accepted bash commands wait for `:approve`; safe `ls` inspection under `/workspace` is auto-approved. |
+| Bash safety override (operator-only) | `console_control` `:allow` → `peer_task._run_tool_with_approval` → `tools.run_bash(override=True)` | Deliberate, audited escape hatch: the operator (never the model) can run one allowlist-blocked command, logged as `safety_override_approved`. Default-deny is unchanged for everything the LLM proposes. |
 | Budget gate | `Budget.permit` (`budget.py:84-106`) | Rate / token-cap exceeded → no API call unless the local operator approves a one-shot override. |
 | Reply gate | `reply_policy.should_reply` | Off-topic / cooldown / broadcast back-off → no API call. |
 | Workspace sandbox | `AGENT_WORKSPACE=workspace/<AGENT_ID>` | All tool I/O confined to one directory per agent. |
