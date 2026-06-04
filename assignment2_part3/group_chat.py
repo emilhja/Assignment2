@@ -42,6 +42,7 @@ from code_share import (
 from coordination import (
     SHARED_PATH_PATTERN,
     assignment_guidance,
+    contract_first_guidance,
     fix_blockers_guidance,
     followup_assignment_guidance,
     handoff_guidance,
@@ -49,12 +50,13 @@ from coordination import (
     private_workspace_guidance,
     proactive_assignment_guidance,
     project_name_from_shared_path,
+    schema_stability_guidance,
     status_request_guidance,
 )
 from console_control import ConsoleControl
 from message_assembler import MultipartAssembler
 from peer import PeerMessage
-from peer_task import run_peer_task
+from peer_task import _STALL_SILENT, run_peer_task
 from reply_policy import CollisionInfo, should_reply
 from task_status import TaskStatus, looks_like_empty_acknowledgment, parse_task_status
 from transport import Transport, build_transport
@@ -1149,6 +1151,21 @@ def run_group_chat(
         )
         if guidance:
             runtime_guidance.append(guidance)
+        guidance = contract_first_guidance(
+            message.text,
+            agent_id=agent_id,
+            display_name=display_name,
+        )
+        if guidance:
+            runtime_guidance.append(guidance)
+        guidance = schema_stability_guidance(
+            message.text,
+            agent_id=agent_id,
+            display_name=display_name,
+            recent_context=prior_context or [],
+        )
+        if guidance:
+            runtime_guidance.append(guidance)
         if project_state.active is not None:
             if code_guidance:
                 runtime_guidance.append(code_guidance)
@@ -1163,7 +1180,7 @@ def run_group_chat(
         elif runpod:
             runtime_guidance.append(_no_project_conversation_guidance())
         try:
-            return run_peer_task(
+            result = run_peer_task(
                 message,
                 store=store,
                 budget=budget,
@@ -1182,6 +1199,13 @@ def run_group_chat(
                 # stays True when not running against runpod.
                 project_active=((not runpod) or project_state.active is not None),
             )
+            if result is _STALL_SILENT:
+                # Anti-stall/step-budget fallback fired with SUPPRESS_STALL_REPLIES
+                # on: the diagnostic is already logged inside run_peer_task. Send
+                # nothing to the hub rather than posting internal coaching text.
+                _log(store, "stall_reply_suppressed", f"msg_id={message.id}")
+                return None
+            return result
         except RuntimeError as exc:
             # Most often: every LLM provider was rate-limited or unreachable.
             # Logging the failure and continuing means the agent stays online

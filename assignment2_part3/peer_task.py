@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import re
 import shlex
 import threading
@@ -51,6 +52,35 @@ MAX_CLAIM_CONTINUATION_STEPS = 12
 MAX_CONTINUATION_REPROMPTS_PER_REASON = 2
 MAX_CONTEXT_MESSAGES = 24
 MAX_CONTEXT_CHARS = 2000
+
+
+_STALL_SILENT = object()
+"""Sentinel reply meaning "end the turn, send nothing to the hub".
+
+Returned by ``run_peer_task`` when an anti-stall/step-budget fallback would
+otherwise post internal coaching text to the chat and SUPPRESS_STALL_REPLIES
+is on. ``group_chat._run_task_for_message`` converts it to ``None`` (the
+existing "no reply" signal). A sentinel rather than ``None`` is used inside
+the run loop because ``None`` already means "keep reprompting" there.
+"""
+
+
+def _suppress_stall_replies() -> bool:
+    """Whether terminal stall/step-budget fallbacks stay off the hub.
+
+    When on (default), the agent's internal anti-stall coaching ("I had to
+    stop because…", "I could not complete this within my step budget…") is
+    written to the session log only and no message is sent to peers — those
+    strings are diagnostics, not useful chat. Set ``SUPPRESS_STALL_REPLIES=0``
+    to restore the old behavior of posting the fallback text.
+    """
+
+    return os.environ.get("SUPPRESS_STALL_REPLIES", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "",
+    }
 
 CLAIM_GATED_TOOLS = workspace_mutation_tools()
 SHARED_PATH_PREFIX = "/workspace/shared/"
@@ -958,6 +988,12 @@ def run_peer_task(
                     "pytest_skipped_due_to_impl_failure",
                     _json({"impl_target": target or "", "test_target": test_target}),
                 )
+            if _suppress_stall_replies():
+                # The fallback is internal coaching, not chat. Log it and return
+                # the silence sentinel; the loop's "None means keep reprompting"
+                # contract stays intact, and group_chat sends nothing.
+                _log("system", "stall_reply_suppressed", f"{kind}: {fallback}")
+                return _STALL_SILENT
             scrubbed, _hits = scrub_outbound(fallback, agent_id=self_id)
             _log("assistant", "peer_reply_raw", fallback)
             return scrubbed
@@ -1518,6 +1554,9 @@ def run_peer_task(
             messages.append({"role": "user", "content": guidance})
 
     fallback = "I could not complete this within my step budget. Please rephrase or split the task."
+    if _suppress_stall_replies():
+        _log("system", "stall_reply_suppressed", f"step_budget: {fallback}")
+        return _STALL_SILENT
     scrubbed, _ = scrub_outbound(fallback, agent_id=self_id)
     _log("assistant", "peer_reply_raw", fallback)
     return scrubbed

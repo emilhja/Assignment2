@@ -1,5 +1,6 @@
 from coordination import (
     assignment_guidance,
+    contract_first_guidance,
     fix_blockers_guidance,
     followup_assignment_guidance,
     handoff_guidance,
@@ -8,8 +9,139 @@ from coordination import (
     private_workspace_guidance,
     proactive_assignment_guidance,
     project_name_from_shared_path,
+    schema_stability_guidance,
     status_request_guidance,
 )
+
+
+# A contract post mirrors what emil-hjaertfors-agent actually sent in the
+# 2026-05-29 hub session: a python fence naming habit_logic.py with public defs.
+_CONTRACT_POST = {
+    "sender_id": "emil-hjaertfors-agent",
+    "text": (
+        "Done with: habit_logic.py\n"
+        "```python\n"
+        "# file: habit_logic.py\n"
+        "def add_habit(habits: list, name: str) -> dict:\n"
+        "    ...\n"
+        "def complete_habit(habits: list, habit_id: int, date: str) -> dict:\n"
+        "    ...\n"
+        "def _find(habits, habit_id):\n"
+        "    ...\n"
+        "```\n"
+    ),
+}
+
+
+def test_schema_stability_fires_when_named_file_already_contracted():
+    guidance = schema_stability_guidance(
+        "emil-hjaertfors-agent, please post your final habit_logic.py",
+        agent_id="emil-hjaertfors-agent",
+        display_name="emil-hjaertfors-agent",
+        recent_context=[_CONTRACT_POST],
+    )
+    assert guidance is not None
+    assert "habit_logic.py" in guidance
+    # Public signatures are surfaced; the private/_find helper is excluded.
+    assert "add_habit(habits: list, name: str)" in guidance
+    assert "complete_habit(" in guidance
+    assert "_find" not in guidance
+
+
+def test_schema_stability_fires_on_bare_repost_request_without_filename():
+    guidance = schema_stability_guidance(
+        "Can you share your final version with the agreed signatures?",
+        agent_id="emil-hjaertfors-agent",
+        display_name="emil-hjaertfors-agent",
+        recent_context=[_CONTRACT_POST],
+    )
+    assert guidance is not None
+    assert "habit_logic.py" in guidance
+
+
+def test_schema_stability_silent_without_prior_contract():
+    # First delivery: the agent has not posted anything yet.
+    assert (
+        schema_stability_guidance(
+            "post your final habit_logic.py",
+            agent_id="emil-hjaertfors-agent",
+            display_name="emil-hjaertfors-agent",
+            recent_context=[],
+        )
+        is None
+    )
+
+
+def test_schema_stability_silent_on_unrelated_traffic():
+    # A contract exists, but the message neither names it nor asks for a re-post.
+    assert (
+        schema_stability_guidance(
+            "what's the status of the persistence module?",
+            agent_id="emil-hjaertfors-agent",
+            display_name="emil-hjaertfors-agent",
+            recent_context=[_CONTRACT_POST],
+        )
+        is None
+    )
+
+
+def test_schema_stability_ignores_other_agents_posts():
+    # The contract was posted by a peer, not this agent — do not fire.
+    peer_post = {**_CONTRACT_POST, "sender_id": "josef-agent"}
+    assert (
+        schema_stability_guidance(
+            "post your final habit_logic.py",
+            agent_id="emil-hjaertfors-agent",
+            display_name="emil-hjaertfors-agent",
+            recent_context=[peer_post],
+        )
+        is None
+    )
+
+
+def test_contract_first_guidance_fires_on_build_with_schema():
+    guidance = contract_first_guidance(
+        "all agents: build a habit tracker. Agree on the habit schema first, "
+        "then implement habit_logic.py, persistence.py and main.py.",
+        agent_id="emil-hjaertfors-agent",
+        display_name="emil-hjaertfors-agent",
+    )
+    assert guidance is not None
+    assert "contract" in guidance.lower()
+
+
+def test_contract_first_guidance_fires_on_signatures():
+    guidance = contract_first_guidance(
+        "Let's implement the calculator. Please confirm the function signatures "
+        "before writing the modules.",
+        agent_id="bob-swe",
+        display_name="bob-swe",
+    )
+    assert guidance is not None
+
+
+def test_contract_first_guidance_silent_without_contract_concept():
+    # A build request with no shared-contract concept should not fire.
+    assert (
+        contract_first_guidance(
+            "build a small script that prints hello",
+            agent_id="bob-swe",
+            display_name="bob-swe",
+        )
+        is None
+    )
+
+
+def test_contract_first_guidance_silent_on_pure_status():
+    # No build/implement verb → no hint, even if "schema" is mentioned.
+    assert (
+        contract_first_guidance(
+            "what's the status of the schema discussion?",
+            agent_id="bob-swe",
+            display_name="bob-swe",
+        )
+        is None
+    )
 
 
 def test_parse_multi_agent_writes_scopes():

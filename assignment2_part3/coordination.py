@@ -29,6 +29,13 @@ SIGNATURE_AGREEMENT_PATTERN = re.compile(
     r"(?i)\b(?:agree|agreement|state\s+agreement|propose|confirm)\s+"
     r"(?:on\s+)?(?:the\s+)?(?:function\s+)?signatures?\b"
 )
+CONTRACT_CONCEPT_PATTERN = re.compile(
+    r"(?i)\b("
+    r"schemas?|signatures?|interfaces?|contracts?|api|apis|"
+    r"json\s+(?:shape|schema|structure|format)|data\s+structures?|fields?|"
+    r"funktionssignaturer?|gränssnitt|datastruktur(?:er)?|dataschema|schemat?"
+    r")\b"
+)
 PROJECT_DIRECTIVE_PATTERN = re.compile(
     r"(?im)^\s*PROJECT:\s*(?P<name>[A-Za-z0-9_\-]+)\s*$"
 )
@@ -639,6 +646,179 @@ def proactive_assignment_guidance(
         "`CLAIM /workspace/shared/<path>#<scope>: <reason>` for the local "
         "hub — then make the actual write tool call. Do not post an empty "
         "acknowledgment; either commit to a slice or stay silent."
+    )
+
+
+def contract_first_guidance(
+    text: str,
+    *,
+    agent_id: str,
+    display_name: str,
+) -> str | None:
+    """Nudge the agent to settle a shared contract before dependent files.
+
+    Fires when a build/implement request also references a shared contract
+    concept (schema, signatures, JSON shape, interface, API, fields — plus the
+    common Swedish equivalents). This is the deterministic counterpart to the
+    system-prompt "contract first" norm and is broader than
+    ``_signature_agreement_guidance`` (which only triggers on an explicit
+    "agree on signatures" request inside a parsed coordination plan).
+
+    Returns ``None`` for non-build chatter or messages with no contract concept
+    so it stays quiet on ordinary status/coordination traffic.
+    """
+
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if PROACTIVE_WRITE_VERB_PATTERN.search(text) is None:
+        return None
+    if CONTRACT_CONCEPT_PATTERN.search(text) is None:
+        return None
+    return (
+        "Contract-first hint: this is multi-file work with a shared contract "
+        "(schema / function signatures / JSON shape / API). Post or confirm that "
+        "contract once before implementing files that depend on it, then implement "
+        "to it. If a peer already posted a contract or matching code, build on it "
+        "instead of proposing a competing shape, and do not silently change a "
+        "contract you already shared."
+    )
+
+
+REPOST_REQUEST_PATTERN = re.compile(
+    r"(?i)\b("
+    r"post|repost|re-post|share|paste|send|provide|show|give\s+us|"
+    r"implement|finalize|final\s+version|latest\s+version|"
+    r"skicka|posta|dela|visa|implementera|slutlig\w*|färdig\w*"
+    r")\b"
+)
+_PY_FENCE_PATTERN = re.compile(r"```(?:python|py)?\b")
+_DEF_SIGNATURE_PATTERN = re.compile(r"(?m)^\s*def\s+(?P<name>\w+)\s*\((?P<params>[^)]*)\)")
+_PY_FILENAME_PATTERN = re.compile(r"\b(?P<fname>[A-Za-z_][\w-]*\.py)\b")
+
+
+@dataclass(frozen=True)
+class PostedContract:
+    filename: str
+    signatures: tuple[str, ...]
+
+
+def _normalize_params(params: str) -> str:
+    """Collapse whitespace/newlines so a multi-line signature compares stably.
+
+    Intentionally does NOT split on commas — type hints like
+    ``List[Dict[str, Any]]`` contain commas that a naive split would mangle.
+    """
+
+    return re.sub(r"\s+", " ", params).strip()
+
+
+def _own_posted_contracts(
+    recent_context: Iterable[dict[str, str]],
+    agent_aliases: set[str],
+) -> dict[str, PostedContract]:
+    """Map filename -> the function contract this agent itself already posted.
+
+    A "contract post" is one of the agent's own chat messages that contains a
+    python code fence and at least one public ``def``. The public, non-test
+    signatures are attached to every implementation ``.py`` filename named in
+    that same message (test filenames are ignored as the anchor unless they are
+    the only filename present). Signatures accumulate across messages so a later
+    re-post that drops or renames a function is still measured against the union
+    of what the agent committed to earlier.
+    """
+
+    accumulated: dict[str, list[str]] = {}
+    for entry in recent_context or []:
+        sender = str(entry.get("sender_id") or "").lower()
+        if sender not in agent_aliases:
+            continue
+        text = str(entry.get("text") or "")
+        if not _PY_FENCE_PATTERN.search(text):
+            continue
+        signatures = [
+            f"{match.group('name')}({_normalize_params(match.group('params'))})"
+            for match in _DEF_SIGNATURE_PATTERN.finditer(text)
+            if not match.group("name").startswith(("test_", "_"))
+        ]
+        if not signatures:
+            continue
+        filenames = {
+            os.path.basename(match.group("fname"))
+            for match in _PY_FILENAME_PATTERN.finditer(text)
+        }
+        if not filenames:
+            continue
+        impl_filenames = {
+            name
+            for name in filenames
+            if not name.startswith("test_") and not name.endswith("_test.py")
+        }
+        for filename in impl_filenames or filenames:
+            bucket = accumulated.setdefault(filename, [])
+            for signature in signatures:
+                if signature not in bucket:
+                    bucket.append(signature)
+    return {
+        filename: PostedContract(filename, tuple(signatures))
+        for filename, signatures in accumulated.items()
+        if signatures
+    }
+
+
+def schema_stability_guidance(
+    text: str,
+    *,
+    agent_id: str,
+    display_name: str,
+    recent_context: list[dict[str, str]] | None = None,
+) -> str | None:
+    """Warn the agent against silently redefining a contract it already posted.
+
+    The dominant multi-agent failure observed in real hub sessions is one agent
+    re-posting the *same* file under a *different* shape each turn (renamed
+    functions, added/removed parameters, changed dict keys), which forces peers
+    building against the old shape to chase a moving target. This helper is the
+    deterministic counterpart to the system-prompt "do not silently change a
+    contract you already shared" norm, scoped to the agent's *own* prior posts.
+
+    Fires when the agent has already posted a function contract for a file and
+    the incoming message either (a) names that file, or (b) asks it to
+    re-post/implement/finalize. Returns ``None`` otherwise so it stays quiet on
+    first delivery and on ordinary coordination traffic.
+    """
+
+    if not isinstance(text, str) or not text.strip():
+        return None
+    aliases = _agent_aliases(agent_id, display_name)
+    contracts = _own_posted_contracts(recent_context or [], aliases)
+    if not contracts:
+        return None
+
+    mentioned = {
+        os.path.basename(match.group("fname"))
+        for match in _PY_FILENAME_PATTERN.finditer(text)
+    } & set(contracts)
+
+    if mentioned:
+        targets = [contracts[name] for name in sorted(mentioned)]
+    elif REPOST_REQUEST_PATTERN.search(text):
+        targets = [contracts[name] for name in sorted(contracts)]
+    else:
+        return None
+
+    summary = "; ".join(
+        f"{contract.filename}: {', '.join(contract.signatures)}"
+        for contract in targets
+    )
+    filenames = ", ".join(sorted(contract.filename for contract in targets))
+    return (
+        "Schema-stability check: you already posted a contract for "
+        f"{filenames} earlier this session ({summary}). Do not silently re-post "
+        "a different shape — renamed functions, added/removed parameters, changed "
+        "dict keys, or new return types. If the contract is unchanged, reference "
+        "your prior post instead of re-pasting the whole file. If it must change, "
+        "say so explicitly: name the exact signature or field that changed and why, "
+        "so peers building against the old shape can adapt."
     )
 
 

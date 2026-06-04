@@ -1,8 +1,20 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import runtime_helpers
 import safety
 import tools
+
+
+def test_system_prompt_lists_every_registered_tool():
+    """Guard against tool/prompt drift: every tool in TOOL_REGISTRY must be
+    advertised in the system prompt so the model knows it can call it. (Part 2's
+    prompt previously omitted read_file/append_text/run_tests.)"""
+
+    prompt_path = Path(tools.__file__).resolve().parent / "config" / "system_prompt.txt"
+    prompt = prompt_path.read_text(encoding="utf-8")
+    missing = [name for name in tools.TOOL_REGISTRY if f"- {name}:" not in prompt]
+    assert missing == [], f"system prompt does not list registered tools: {missing}"
 
 
 # These tests run run_bash directly, without the agent loop around it.

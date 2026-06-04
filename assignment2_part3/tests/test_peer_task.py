@@ -12,7 +12,12 @@ from session_store import SessionStore
 from budget import Budget
 from claims import ClaimRegistry
 from peer import PeerMessage
-from peer_task import _ensure_peer_mentions, _run_tool_with_approval, run_peer_task
+from peer_task import (
+    _STALL_SILENT,
+    _ensure_peer_mentions,
+    _run_tool_with_approval,
+    run_peer_task,
+)
 from reply_policy import CollisionInfo
 from thread_safe_store import ThreadSafeSessionStore
 
@@ -2380,6 +2385,62 @@ def test_fix_request_with_ensure_implemented_reprompts_on_reread_stall(tmp_path,
     kinds = [kind for _role, kind, _content in _events(store)]
     assert kinds.count("user_action_prose_stall_reprompt") == 2
     assert "claim_continuation_giveup" in kinds
+
+
+def test_stall_giveup_is_suppressed_from_hub_by_default(tmp_path, monkeypatch):
+    """With SUPPRESS_STALL_REPLIES on, a terminal stall must not post internal
+    coaching to the hub: run_peer_task returns the silence sentinel, the
+    diagnostic is still logged, and no peer_reply carries the coaching string."""
+
+    private = tmp_path / "bob"
+    shared = tmp_path / "shared"
+    private.mkdir()
+    shared.mkdir()
+    monkeypatch.setenv("AGENT_WORKSPACE", str(private))
+    monkeypatch.setenv("SHARED_WORKSPACE", str(shared))
+    monkeypatch.setenv("SUPPRESS_STALL_REPLIES", "1")
+
+    store = _store(tmp_path)
+    budget = Budget(tokens_per_minute=20_000, requests_per_minute=20, lifetime_tokens=20_000)
+    msg = PeerMessage(
+        id="m_user_bob_reread_suppressed",
+        sender_id="emil-user",
+        text=(
+            "@bob-swe, The tests in /workspace/shared/test_calculator.py failed "
+            "because the functions 'add' and 'subtract' are not defined. Please "
+            "ensure these functions are implemented in the calculator module"
+        ),
+    )
+    stall = json.dumps({
+        "type": "final",
+        "answer": "I need to re-read /workspace/shared/calculator.py",
+    })
+
+    def chat_fn(messages):
+        return stall
+
+    answer = run_peer_task(
+        msg,
+        store=store,
+        budget=budget,
+        system_prompt=SYSTEM_PROMPT,
+        chat_fn=chat_fn,
+        agent_id="bob",
+    )
+
+    assert answer is _STALL_SILENT
+    events = list(_events(store))
+    kinds = [kind for _role, kind, _content in events]
+    # The diagnostic survives in the log for offline audit...
+    assert "claim_continuation_giveup" in kinds
+    assert "stall_reply_suppressed" in kinds
+    # ...but the coaching string never leaves as a hub reply.
+    leaked = [
+        content
+        for _role, kind, content in events
+        if kind == "peer_reply_raw" and "describing what I would do" in (content or "")
+    ]
+    assert leaked == []
 
 
 def test_user_action_request_followed_by_tool_call_no_reprompt(tmp_path, monkeypatch):
