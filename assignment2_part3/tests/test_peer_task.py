@@ -20,6 +20,7 @@ from peer_task import (
     _share_was_requested,
     _run_tool_with_approval,
     run_peer_task,
+    set_hub_file_client,
 )
 from console_control import BASH_ALLOW_OVERRIDE
 from reply_policy import CollisionInfo
@@ -29,12 +30,49 @@ from thread_safe_store import ThreadSafeSessionStore
 SYSTEM_PROMPT = "You are alice-swe, a SWE agent."
 
 
+class FakeHubFileClient:
+    def __init__(self):
+        self.uploads = []
+
+    def list_files(self):
+        return ["game.py"]
+
+    def read_file(self, filename):
+        return type("HubFile", (), {"filename": filename, "content": "print(1)", "agent_name": "bob"})()
+
+    def upload_file(self, filename, content, *, overwrite=False):
+        self.uploads.append((filename, content, overwrite))
+        return True
+
+
 def test_ensure_peer_mentions_rewrites_defer_protocol():
     assert (
         _ensure_peer_mentions("DEFER to bob-swe. Waiting for bob-swe.", {"bob-swe"})
         == "DEFER to @bob-swe. Waiting for @bob-swe."
     )
     assert _ensure_peer_mentions("Already @bob-swe.", {"bob-swe"}) == "Already @bob-swe."
+
+
+def test_hub_file_tools_refuse_without_runpod_client():
+    set_hub_file_client(None)
+    observation = _run_tool_with_approval("hub_list_files", {}, console=None)
+    assert "only available in RunPod mode" in observation
+
+
+def test_hub_upload_tool_uses_injected_runpod_client():
+    client = FakeHubFileClient()
+    set_hub_file_client(client)
+    try:
+        observation = _run_tool_with_approval(
+            "hub_upload_file",
+            {"filename": "game.py", "content": "print(2)", "overwrite": True},
+            console=None,
+        )
+    finally:
+        set_hub_file_client(None)
+
+    assert observation == "Uploaded hub file game.py."
+    assert client.uploads == [("game.py", "print(2)", True)]
 
 
 def _store(tmp_path):

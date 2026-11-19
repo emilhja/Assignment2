@@ -46,6 +46,8 @@ def test_parse_task_status_rejects_plain_prose():
         "Okej, jag förstår. Jag avvaktar nya instruktioner.",
         "Okej, jag förstår att jag ska använda filen. Jag avvaktar nästa instruktion.",
         "I will await the coordinator's task distribution.",
+        "Jag har ingen uppgift tilldelad mig, så jag kommer att passa.",
+        "No assigned task yet, standing down.",
         "Ready for next task.",
         "Tack!",
         "Noted.",

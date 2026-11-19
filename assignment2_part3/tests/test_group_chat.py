@@ -31,11 +31,12 @@ from group_chat import (
     _project_root,
     _released_without_write_guidance,
     _remote_workspace_guidance,
+    _runpod_hub_guidance,
     _stale_claim_guidance,
     load_system_prompt,
     run_group_chat,
 )
-from transport import StubTransport
+from transport import HubStats, StubTransport
 
 
 def test_remote_workspace_guidance_rejects_wrong_remote_paths():
@@ -45,6 +46,21 @@ def test_remote_workspace_guidance_rejects_wrong_remote_paths():
     assert "/workspace/shared" in guidance
     assert "# file: <filename>" in guidance
     assert "exact saved /workspace/<agent>/<project>/<filename> path" in guidance
+
+
+def test_runpod_hub_guidance_includes_billboard_files_and_file_tools():
+    guidance = _runpod_hub_guidance(
+        HubStats(
+            billboard_content="Build game.py",
+            files=["game.py", "README.md"],
+        )
+    )
+
+    assert guidance is not None
+    assert "Build game.py" in guidance
+    assert "game.py, README.md" in guidance
+    assert "hub_list_files/hub_read_file/hub_upload_file" in guidance
+    assert "PASS" in guidance
 
 
 class FakeChat:
@@ -509,6 +525,84 @@ def test_broadcast_message_triggers_reply(tmp_path, monkeypatch):
         if kind == "reply_decision"
     ]
     assert any("broadcast" in row for row in decision_rows)
+
+
+def test_role_claim_hands_over_when_peer_claim_seen_in_window(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROLE_RECONCILE_SECONDS", "0.05")
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": (
+                "all agents: The first one that answers is the manager. "
+                "Do not start work until the manager says so."
+            ),
+        })
+        + "\n",
+        json.dumps({
+            "id": "m2",
+            "sender_id": "bob-swe",
+            "text": "Confirmed, I'll take: coordination. I will assign tasks after roster.",
+        })
+        + "\n",
+    ]
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "Bekräftat, jag tar: chefspositionen för denna session.",
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    assert _wait_for(lambda: len(_outbox_replies(ctx["outbox"])) >= 2, timeout=5.0)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert "chefspositionen" in replies[0]["text"]
+    assert "lämnar över managerrollen till @bob-swe" in replies[1]["text"]
+    assert ctx["fake_chat"].calls == 1
+
+    events = _events(ctx["store"])
+    assert any(kind == "role_claim_self" for _role, kind, _content in events)
+    assert any(kind == "role_claim_observed" for _role, kind, _content in events)
+    assert any(kind == "role_handover" for _role, kind, _content in events)
+    assert not any(kind == "task_status_continuation" for _role, kind, _content in events)
+
+
+def test_role_claim_keeps_role_when_no_peer_claim_arrives(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROLE_RECONCILE_SECONDS", "0.01")
+    peer_lines = [
+        json.dumps({
+            "id": "m1",
+            "sender_id": "emil-user",
+            "text": "all agents: The first one that answers is the manager.",
+        })
+        + "\n",
+    ]
+    scripted = [
+        json.dumps({
+            "type": "final",
+            "answer": "Confirmed, I'll take: coordination. TASK @bob-swe: report status.",
+        }),
+    ]
+    ctx = _setup_run(tmp_path, monkeypatch, peer_lines, scripted)
+
+    t = threading.Thread(target=ctx["runner"])
+    t.start()
+    time.sleep(0.5)
+    ctx["stop"].set()
+    t.join(timeout=5.0)
+
+    replies = _outbox_replies(ctx["outbox"])
+    assert len(replies) == 1
+    assert "coordination" in replies[0]["text"]
+
+    events = _events(ctx["store"])
+    assert any(kind == "role_reconcile_kept" for _role, kind, _content in events)
+    assert not any(kind == "role_handover" for _role, kind, _content in events)
 
 
 def test_followup_receives_recent_group_chat_context(tmp_path, monkeypatch):
@@ -1603,10 +1697,9 @@ def test_project_new_fires_on_new_project_callback(tmp_path):
     assert calls["n"] == 1
 
 
-def test_continue_reprompts_when_model_only_intros(tmp_path, monkeypatch):
-    """Operator escape hatch: if `:continue` produces another intro, suppress it
-    and reprompt for substance rather than silently dropping the operator's
-    explicit demand for output."""
+def test_roster_request_sends_roster_without_llm(tmp_path, monkeypatch):
+    """Roster requests are protocol traffic: answer from runtime state instead
+    of trusting the model to avoid intros or empty acknowledgments."""
 
     private = tmp_path / "alice"
     private.mkdir()
@@ -1617,42 +1710,34 @@ def test_continue_reprompts_when_model_only_intros(tmp_path, monkeypatch):
         json.dumps({
             "id": "m1",
             "sender_id": "igor-petersson-agent",
-            "text": "@all agents: please post your [ROSTER] line",
+            "text": (
+                "All agents reply with a one-line roster entry: "
+                "your name and what you can contribute"
+            ),
         })
         + "\n",
     ]
     scripted = [
-        # Initial reply to the broadcast: a bare intro.
         json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
-        # After :continue, model regresses to an intro again ...
-        json.dumps({"type": "final", "answer": "Hej, jag är alice-swe"}),
-        # ... reprompt then yields the real roster line.
-        json.dumps({
-            "type": "final",
-            "answer": "[ROSTER] alice-swe | SWE agent | tools: create_file, run_tests",
-        }),
     ]
     ctx = _setup_run(
         tmp_path,
         monkeypatch,
         peer_lines,
         scripted,
-        console_stdin_text=":project new\n:continue\n",
     )
     monkeypatch.setenv("AGENT_MODE", "runpod")
 
     t = threading.Thread(target=ctx["runner"])
     t.start()
-    assert _wait_for(lambda: ctx["fake_chat"].calls == 1, timeout=5.0)
-    ctx["console"].start()
-    assert _wait_for(lambda: ctx["fake_chat"].calls == 3, timeout=5.0)
+    assert _wait_for(lambda: len(_outbox_replies(ctx["outbox"])) == 1, timeout=5.0)
     ctx["stop"].set()
     t.join(timeout=5.0)
 
     replies = _outbox_replies(ctx["outbox"])
-    assert any(
-        "[ROSTER]" in r["text"] and "create_file" in r["text"] for r in replies
-    ), f":continue must reprompt past the intro to substance: {replies}"
+    assert replies[0]["text"].startswith("[ROSTER] alice-swe")
+    assert "create_file" in replies[0]["text"]
+    assert ctx["fake_chat"].calls == 0
 
 
 def test_satisfied_claim_does_not_re_inject_nudge(tmp_path, monkeypatch):

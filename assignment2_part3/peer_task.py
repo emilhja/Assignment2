@@ -34,7 +34,7 @@ from runtime_helpers import (
 )
 from safety import safety_check
 from session_store import SessionStore
-from tools import TOOL_REGISTRY, _resolve_workspace_path, run_bash, run_tool
+from tools import TOOL_REGISTRY, ToolSpec, _resolve_workspace_path, run_bash, run_tool
 
 from budget import Budget, BudgetExceeded, estimate_tokens
 from claims import CLAIM_PATTERN, DEFER_PATTERN, RELEASE_PATTERN, ClaimRegistry, split_claim_target
@@ -101,6 +101,8 @@ def _suppress_stall_replies() -> bool:
     }
 
 CLAIM_GATED_TOOLS = workspace_mutation_tools()
+HUB_WRITE_TOOLS = {"hub_upload_file"}
+HUB_READ_TOOLS = {"hub_read_file"}
 SHARED_PATH_PREFIX = "/workspace/shared/"
 _AUTO_APPROVAL_CONTROL_CHARS = re.compile(r"[;&|]|\r|\n")
 
@@ -117,6 +119,90 @@ def _json(payload: dict) -> str:
 
 def _truncate(text: str) -> str:
     return truncate_observation(text)
+
+
+_hub_file_client: object | None = None
+
+
+def set_hub_file_client(client: object | None) -> None:
+    """Install the RunPod transport used by hub_* file tools."""
+
+    global _hub_file_client
+    _hub_file_client = client
+
+
+def _hub_client() -> object | None:
+    return _hub_file_client
+
+
+def _hub_list_files(_args: dict) -> str:
+    client = _hub_client()
+    if client is None or not hasattr(client, "list_files"):
+        return "Hub file tool refused: /api/files is only available in RunPod mode."
+    files = client.list_files()
+    if not files:
+        return "Hub files: <none>"
+    return "Hub files:\n" + "\n".join(f"- {name}" for name in files)
+
+
+def _hub_read_file(args: dict) -> str:
+    client = _hub_client()
+    if client is None or not hasattr(client, "read_file"):
+        return "Hub file tool refused: /api/files is only available in RunPod mode."
+    file_info = client.read_file(str(args["filename"]))
+    if file_info is None:
+        return f"Hub file read failed: {args['filename']}"
+    header = f"# file: {file_info.filename}"
+    content = file_info.content
+    if file_info.agent_name:
+        header += f" (last writer: {file_info.agent_name})"
+    return _truncate(f"{header}\n{content}")
+
+
+def _hub_upload_file(args: dict) -> str:
+    client = _hub_client()
+    if client is None or not hasattr(client, "upload_file"):
+        return "Hub file tool refused: /api/files is only available in RunPod mode."
+    filename = str(args["filename"])
+    content = str(args["content"])
+    overwrite = bool(args.get("overwrite", False))
+    ok = client.upload_file(filename, content, overwrite=overwrite)
+    if not ok:
+        return (
+            f"Hub file upload failed: {filename}. If the file exists, call "
+            "hub_read_file first, then retry with overwrite=true."
+        )
+    return f"Uploaded hub file {filename}."
+
+
+TOOL_REGISTRY.setdefault(
+    "hub_list_files",
+    ToolSpec(
+        name="hub_list_files",
+        description="List shared code artifacts from the RunPod hub /api/files endpoint.",
+        required_args=(),
+        handler=_hub_list_files,
+    ),
+)
+TOOL_REGISTRY.setdefault(
+    "hub_read_file",
+    ToolSpec(
+        name="hub_read_file",
+        description="Read one shared code artifact from the RunPod hub /api/files endpoint.",
+        required_args=("filename",),
+        handler=_hub_read_file,
+    ),
+)
+TOOL_REGISTRY.setdefault(
+    "hub_upload_file",
+    ToolSpec(
+        name="hub_upload_file",
+        description="Upload one shared code artifact to the RunPod hub /api/files endpoint.",
+        required_args=("filename", "content"),
+        handler=_hub_upload_file,
+        success_prefixes=("Uploaded hub file",),
+    ),
+)
 
 
 def _peer_user_envelope(message: PeerMessage) -> str:
@@ -1607,6 +1693,8 @@ def run_peer_task(
                 # shared-only, but the user-facing "did you actually do it?"
                 # gate sees them.
                 saw_any_successful_write = True
+            if parsed.tool in HUB_WRITE_TOOLS and observation.startswith("Uploaded hub file"):
+                saw_any_successful_write = True
             if parsed.tool == "rename_file":
                 source_path = parsed.args.get("source_path")
                 target_path = parsed.args.get("target_path")
@@ -1636,6 +1724,8 @@ def run_peer_task(
                 # The agent actually read a file this round, so a fenced reply
                 # that pastes contents is grounded in a tool observation rather
                 # than reconstructed from memory.
+                saw_successful_read = True
+            if parsed.tool in HUB_READ_TOOLS and not observation.startswith("Hub file read failed"):
                 saw_successful_read = True
             _log(
                 "tool",

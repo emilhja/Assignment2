@@ -254,6 +254,11 @@ bot (e.g. `emil_hjaertfors_bot`) to join the live course hub.
    namespaced from `AGENT_ID` (`workspace/<AGENT_ID>/`,
    `data/<AGENT_ID>.sqlite3`).
 
+
+  For a clean demo build (no layer cache):
+  docker compose --profile remote build --no-cache agent-remote
+  docker compose --profile remote up -d agent-remote
+
 2. Bring up only the remote bot:
    ```bash
    docker compose --profile remote up -d agent-remote

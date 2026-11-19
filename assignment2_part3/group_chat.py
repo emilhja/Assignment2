@@ -56,8 +56,9 @@ from coordination import (
 from console_control import ConsoleControl
 from message_assembler import MultipartAssembler
 from peer import PeerMessage
-from peer_task import _STALL_SILENT, run_peer_task
-from reply_policy import CollisionInfo, should_reply
+from peer_task import _STALL_SILENT, run_peer_task, set_hub_file_client
+from reply_policy import CollisionInfo, is_roster_request, should_reply
+from role_election import RoleClaim, RoleElectionState
 from roster import (
     RosterRegistry,
     build_roster_line,
@@ -76,6 +77,7 @@ DEFAULT_RPM = 30
 DEFAULT_TOTAL = 2_000_000
 DEFAULT_CLAIM_CONTINUATION_GRACE_SECONDS = 1.5
 DEFAULT_PENDING_FOLLOWUP_SECONDS = 120.0
+DEFAULT_ROLE_RECONCILE_SECONDS = 3.0
 MAX_RECENT_CONTEXT_ENTRIES = 64
 
 CONFIRMATION_REPLIES = {
@@ -145,7 +147,7 @@ WORKSPACE_PATH_PATTERN = re.compile(r"(/workspace/[^\s`'\"<>),;]+)")
 INTRO_LINE_TEMPLATE = r"^\s*hej,?\s*jag\s+(?:är|ar)\s+@?{display_name}\s*[\.!]?\s*$"
 COORDINATOR_ASSIGNMENT_PATTERN = re.compile(
     r"(?i)\b(?:you\s+are|act\s+as|be)\s+(?:the\s+)?"
-    r"(?:manager|coordinator|lead|samordnare|projektledare)\b"
+    r"(?:manager|coordinator|lead|samordnare|projektledare|chef)\b"
 )
 
 
@@ -232,14 +234,38 @@ def _no_project_conversation_guidance() -> str:
     return (
         "Remote hub mode, but no active project is allocated yet. You may "
         "converse, plan, ask clarifying questions, and read existing files. "
-        "Do NOT call create_file, append_text, edit_section, replace_text, "
-        "or rename_file in this round — the runtime will refuse them with "
-        "\"refused: no active project ...\". If the task requires writing "
-        "files, ask the operator (in chat) to type `:project new` in the "
-        "agent console, or to include `PROJECT: <name>` in their next "
-        "broadcast. Truthful-completion rule still applies: do not claim "
-        "'done', 'created', 'wrote', or 'saved' for work that has not been "
-        "performed."
+        "Do NOT call workspace write tools (create_file, append_text, "
+        "edit_section, replace_text, or rename_file) in this round — the "
+        "runtime will refuse them with \"refused: no active project ...\". "
+        "For shared RunPod code artifacts, use the hub file tools instead: "
+        "hub_list_files, hub_read_file, and hub_upload_file. If you need a "
+        "private workspace project, ask the operator (in chat) to type "
+        "`:project new` in the agent console, or to include `PROJECT: <name>` "
+        "in their next broadcast. Truthful-completion rule still applies: do "
+        "not claim 'done', 'created', 'wrote', or 'saved' for work that has "
+        "not been performed."
+    )
+
+
+def _runpod_hub_guidance(stats) -> str | None:
+    if stats is None:
+        return None
+    billboard = str(getattr(stats, "billboard_content", "") or "").strip()
+    files = list(getattr(stats, "files", []) or [])
+    file_list = ", ".join(str(name) for name in files) if files else "<none>"
+    plan = billboard or "<empty>"
+    return (
+        "RunPod hub coordination state for this cycle:\n"
+        f"- Billboard plan (authoritative): {plan}\n"
+        f"- Existing hub files from stats.files: {file_list}\n"
+        "Rules for this hub: decide whether to act or PASS from the billboard "
+        "and files list; announce intent before acting (for example, "
+        "`I will write game.py`); do not duplicate work another agent already "
+        "announced; use hub_list_files/hub_read_file/hub_upload_file for shared "
+        "code instead of sending code in chat; always read an existing hub file "
+        "before overwriting it; upload at most 32KB per file; follow manager "
+        "instructions if the billboard names one. If there is nothing useful "
+        "to add, reply exactly `PASS`."
     )
 
 
@@ -882,6 +908,7 @@ def run_group_chat(
 
     if transport is None:
         transport = build_transport(mode, agent_id, DATA_DIR)
+    set_hub_file_client(transport if runpod else None)
 
     project_state = _ProjectState()
     project_handler = None
@@ -1030,7 +1057,12 @@ def run_group_chat(
         0.0,
         _env_float("PENDING_FOLLOWUP_SECONDS", DEFAULT_PENDING_FOLLOWUP_SECONDS),
     )
+    role_reconcile_seconds = max(
+        0.0,
+        _env_float("ROLE_RECONCILE_SECONDS", DEFAULT_ROLE_RECONCILE_SECONDS),
+    )
     pending_followup: PendingFollowup | None = None
+    role_election = RoleElectionState()
     intro_sent: bool = _intro_seen_in_store(store, display_name)
     _log(
         store,
@@ -1056,6 +1088,38 @@ def run_group_chat(
         if not runpod:
             return
         print(f"{colors.ts()} {colors.dim(f'[{kind}]')} {detail}", flush=True)
+
+    def _current_hub_stats():
+        current_stats = getattr(transport, "current_stats", None)
+        if not callable(current_stats):
+            return None
+        try:
+            return current_stats()
+        except Exception:
+            return None
+
+    def _sleep_if_runpod_gated() -> bool:
+        if not runpod:
+            return False
+        stats = _current_hub_stats()
+        if stats is None:
+            return False
+        if bool(getattr(stats, "paused", False)):
+            _log(store, "runpod_paused", "stats.paused=true")
+            _peer_console_log("hub", "paused by stats; sleeping 5s")
+            time.sleep(5.0)
+            return True
+        allowed = getattr(stats, "allowed_agents", {}) or {}
+        if isinstance(allowed, dict):
+            allowed_value = allowed.get(display_name)
+            if allowed_value is None:
+                allowed_value = allowed.get(agent_id)
+            if allowed_value is False:
+                _log(store, "runpod_agent_disallowed", f"agent={display_name}")
+                _peer_console_log("hub", "agent disallowed by stats; sleeping 10s")
+                time.sleep(10.0)
+                return True
+        return False
 
     def _send_answer(answer: str, msg_id: str, *, suppress_intro: bool = False) -> str | None:
         nonlocal pending_followup, intro_sent
@@ -1100,6 +1164,13 @@ def run_group_chat(
         if not runpod:
             _hub_echo("->", display_name, answer)
         recent_context.append(_context_entry(display_name, answer, msg_id))
+        role_claim = role_election.observe_self(agent_id, answer, msg_id)
+        if role_claim is not None:
+            _log(
+                store,
+                "role_claim_self",
+                f"role={role_claim.role} msg_id={msg_id}",
+            )
         if len(recent_context) > MAX_RECENT_CONTEXT_ENTRIES:
             del recent_context[:-MAX_RECENT_CONTEXT_ENTRIES]
         recent_replies.append((time.time(), msg_id))
@@ -1238,6 +1309,10 @@ def run_group_chat(
         )
         if guidance:
             runtime_guidance.append(guidance)
+        if runpod:
+            guidance = _runpod_hub_guidance(_current_hub_stats())
+            if guidance:
+                runtime_guidance.append(guidance)
         if project_state.active is not None:
             if code_guidance:
                 runtime_guidance.append(code_guidance)
@@ -1357,6 +1432,16 @@ def run_group_chat(
         nonlocal intro_sent
         prior_context = list(recent_context)
         recent_context.append(_context_entry(message.sender_id, message.text, message.id))
+        role_claim = role_election.observe(message.sender_id, message.text, message.id)
+        if role_claim is not None:
+            _log(
+                store,
+                "role_claim_observed",
+                (
+                    f"claimant={role_claim.sender_id} role={role_claim.role} "
+                    f"msg_id={role_claim.message_id} order={role_claim.order}"
+                ),
+            )
         sender = (message.sender_id or "").strip().lower()
         self_names = {agent_id.lower(), display_name.lower()}
         if sender in self_names and _is_intro_line(message.text or "", display_name):
@@ -1403,7 +1488,66 @@ def run_group_chat(
                 return candidate
         return None
 
-    def _process_message(message: PeerMessage, *, allow_claim_continuation: bool = True) -> None:
+    def _handover_text(winner: RoleClaim) -> str:
+        return (
+            f"Jag lämnar över managerrollen till @{winner.sender_id}; "
+            "jag går tyst och väntar på konkret tilldelning."
+        )
+
+    def _reconcile_role_claim(original: PeerMessage) -> bool:
+        """Wait briefly after a self role-claim and hand over if a peer claims."""
+
+        if role_election.pending_self_claim is None:
+            return False
+
+        deadline = time.time() + role_reconcile_seconds
+        while time.time() < deadline and not stop_event.is_set():
+            remaining = max(0.0, deadline - time.time())
+            peer_message = _recv_assembled(timeout=min(remaining, 0.5))
+            if peer_message is None:
+                time.sleep(min(remaining, idle_sleep))
+                continue
+            _process_message(
+                peer_message,
+                allow_claim_continuation=False,
+                allow_role_reconciliation=False,
+            )
+
+        winner = role_election.peer_winner_for_pending(agent_id)
+        role_election.finish_pending(winner, agent_id)
+        if winner is None:
+            _log(store, "role_reconcile_kept", f"from_msg={original.id}")
+            return True
+
+        handover = _handover_text(winner)
+        _log(
+            store,
+            "role_handover",
+            f"winner={winner.sender_id} role={winner.role} from_msg={original.id}",
+        )
+        _send_answer(handover, f"{original.id}:role-handover")
+        return True
+
+    def _log_coordination_status_continuation_skip(original: PeerMessage, answer: str) -> None:
+        status = parse_task_status(answer)
+        if status is None or status.kind not in {"taking", "accepted"}:
+            return
+        if any(
+            marker in status.task.lower()
+            for marker in ("coordination", "coordinator", "manager", "samordn")
+        ):
+            _log(
+                store,
+                "task_status_continuation_skipped",
+                f"coordination role status from_msg={original.id}",
+            )
+
+    def _process_message(
+        message: PeerMessage,
+        *,
+        allow_claim_continuation: bool = True,
+        allow_role_reconciliation: bool = True,
+    ) -> None:
         nonlocal pending_followup, last_wakeable_message, last_seen_message
         if not runpod:
             _hub_echo("<-", message.sender_id, message.text)
@@ -1583,6 +1727,9 @@ def run_group_chat(
             )
 
             if allow_claim_continuation:
+                if allow_role_reconciliation and _reconcile_role_claim(message):
+                    _log_coordination_status_continuation_skip(message, sent_answer)
+                    return
                 _continue_claims(message, sent_answer)
             return
 
@@ -1594,6 +1741,15 @@ def run_group_chat(
             message, agent_id, display_name, recent_replies,
             claims=claims, aliases=aliases,
         )
+        if (
+            role_election.quiet_after_loss
+            and decision.respond
+            and decision.reason == "broadcast question"
+        ):
+            decision = type(decision)(
+                False,
+                f"role quiet after handover to {role_election.leader_id}",
+            )
         _log(
             store,
             "reply_decision",
@@ -1619,6 +1775,14 @@ def run_group_chat(
         # pending skipped message so :continue won't re-fire a stale skip.
         last_wakeable_message = message
         last_seen_message = None
+
+        if is_roster_request(message.text):
+            _absorb_inbound_claims(message)
+            roster_line = _own_roster_line()
+            _log(store, "roster_auto_reply", f"msg_id={message.id}")
+            _send_answer(roster_line, message.id)
+            return
+
         answer = _run_task_for_message(
             message, prior_context, decision.collision, code_guidance=code_guidance
         )
@@ -1633,6 +1797,9 @@ def run_group_chat(
         )
 
         if allow_claim_continuation:
+            if allow_role_reconciliation and _reconcile_role_claim(message):
+                _log_coordination_status_continuation_skip(message, sent_answer)
+                return
             _continue_task_status(message, sent_answer)
             _continue_claims(message, sent_answer)
 
@@ -1959,6 +2126,8 @@ def run_group_chat(
                 _run_roster_window(roster_purpose)
                 continue
             message = _recv_assembled(timeout=1.0)
+            if _sleep_if_runpod_gated():
+                continue
             if message is None:
                 time.sleep(idle_sleep)
                 continue
@@ -1976,6 +2145,7 @@ def run_group_chat(
             transport.close()
         except Exception:
             pass
+        set_hub_file_client(None)
         console.stop()
         if owns_store:
             store.close()

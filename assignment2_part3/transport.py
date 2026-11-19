@@ -14,6 +14,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from collections import deque
 from pathlib import Path
 from typing import IO, Any, Deque, Iterable, Optional, Protocol
@@ -28,6 +29,23 @@ class Transport(Protocol):
     def recv(self, timeout: Optional[float] = None) -> Optional[PeerMessage]: ...
     def send(self, text: str) -> bool: ...
     def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class HubStats:
+    """RunPod hub coordination state from the latest `/api/messages` poll."""
+
+    paused: bool = False
+    allowed_agents: dict[str, bool] = field(default_factory=dict)
+    billboard_content: str = ""
+    files: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class HubFile:
+    filename: str
+    content: str
+    agent_name: str = ""
 
 
 def _load_seen_ids(path: Path) -> set[str]:
@@ -131,7 +149,47 @@ HUB_MIN_REQUEST_GAP = 1.2
 # so the backoff is the throttle gap plus a small cushion.
 HUB_SEND_429_RETRIES = 2
 HUB_SEND_429_BACKOFF = 1.5
+HUB_FILE_MAX_BYTES = 32 * 1024
+HUB_FILE_MAX_COUNT = 50
 FORBIDDEN_HUB_NAMES = {"my-agent", "my_agent", "agent", "test", "bot", "local"}
+
+
+def _parse_hub_stats(raw: Any) -> HubStats:
+    if not isinstance(raw, dict):
+        return HubStats()
+    allowed_raw = raw.get("allowed_agents")
+    allowed_agents: dict[str, bool] = {}
+    if isinstance(allowed_raw, dict):
+        allowed_agents = {str(k): bool(v) for k, v in allowed_raw.items()}
+    billboard = raw.get("billboard")
+    billboard_content = ""
+    if isinstance(billboard, dict):
+        billboard_content = str(billboard.get("content") or "")
+    elif billboard is not None:
+        billboard_content = str(billboard)
+    files_raw = raw.get("files")
+    files: list[str] = []
+    if isinstance(files_raw, list):
+        for entry in files_raw:
+            if isinstance(entry, str):
+                files.append(entry)
+            elif isinstance(entry, dict):
+                name = entry.get("filename") or entry.get("name")
+                if name:
+                    files.append(str(name))
+    return HubStats(
+        paused=bool(raw.get("paused", False)),
+        allowed_agents=allowed_agents,
+        billboard_content=billboard_content,
+        files=files,
+    )
+
+
+def _clean_hub_filename(filename: str) -> str:
+    value = str(filename or "").strip().replace("\\", "/")
+    while value.startswith("./"):
+        value = value[2:]
+    return value.lstrip("/")
 
 
 def _resolve_min_request_gap() -> float:
@@ -233,6 +291,8 @@ class RunPodTransport:
         self._buffer: Deque[PeerMessage] = deque()
         self._last_request_ts: float = 0.0
         self._last_poll_ts: float = 0.0
+        self._latest_stats = HubStats()
+        self._read_files: set[str] = set()
         self._closed = False
         self._lock = threading.Lock()
         self._stdout = stdout if stdout is not None else sys.stdout
@@ -244,6 +304,9 @@ class RunPodTransport:
 
             session = requests.Session()
         self._session = session
+
+    def current_stats(self) -> HubStats:
+        return self._latest_stats
 
     def _echo(self, line: str) -> None:
         try:
@@ -323,6 +386,8 @@ class RunPodTransport:
             self._warn(f"[hub!] recv json error: {exc}")
             return None
 
+        if isinstance(data, dict):
+            self._latest_stats = _parse_hub_stats(data.get("stats"))
         messages = data.get("messages") if isinstance(data, dict) else None
         if not messages:
             return None
@@ -362,6 +427,138 @@ class RunPodTransport:
                 f"{colors.agent_label(first_returned.sender_id)}: {snippet}"
             )
         return first_returned
+
+    def list_files(self) -> list[str]:
+        resp = self._files_get()
+        if resp is None:
+            return []
+        payload = self._json_payload(resp, "list files")
+        if payload is None:
+            return []
+        files = payload.get("files")
+        if isinstance(files, list):
+            out: list[str] = []
+            for entry in files:
+                if isinstance(entry, str):
+                    out.append(entry)
+                elif isinstance(entry, dict):
+                    name = entry.get("filename") or entry.get("name")
+                    if name:
+                        out.append(str(name))
+            return out
+        return []
+
+    def read_file(self, filename: str) -> HubFile | None:
+        filename = _clean_hub_filename(filename)
+        if not filename:
+            self._warn("[hub!] file read requires a filename")
+            return None
+        resp = self._files_get({"filename": filename})
+        if resp is None:
+            return None
+        payload = self._json_payload(resp, f"read file {filename}")
+        if payload is None:
+            return None
+        content = payload.get("content")
+        if content is None and isinstance(payload.get("file"), dict):
+            content = payload["file"].get("content")
+        if content is None:
+            content = ""
+        agent_name = str(payload.get("agent_name") or payload.get("author") or "")
+        self._read_files.add(filename)
+        return HubFile(filename=filename, content=str(content), agent_name=agent_name)
+
+    def upload_file(self, filename: str, content: str, *, overwrite: bool = False) -> bool:
+        filename = _clean_hub_filename(filename)
+        if not filename:
+            self._warn("[hub!] file upload requires a filename")
+            return False
+        if not isinstance(content, str):
+            self._warn("[hub!] file upload content must be text")
+            return False
+        if len(content.encode("utf-8")) > HUB_FILE_MAX_BYTES:
+            self._warn(f"[hub!] file upload refused: {filename} exceeds 32KB")
+            return False
+        current_files = self.list_files()
+        exists = filename in current_files
+        if not exists and len(current_files) >= HUB_FILE_MAX_COUNT:
+            self._warn("[hub!] file upload refused: hub file limit is 50 files")
+            return False
+        if exists and not overwrite:
+            self._warn(f"[hub!] file upload refused: {filename} exists; read it before overwriting")
+            return False
+        if exists and filename not in self._read_files:
+            self._warn(f"[hub!] file upload refused: read {filename} before overwriting")
+            return False
+        self._throttle()
+        try:
+            resp = self._session.post(
+                f"{self.url}/api/files",
+                json={
+                    "filename": filename,
+                    "content": content,
+                    "agent_name": self.agent_name,
+                    "password": self.password,
+                },
+                timeout=10,
+            )
+        except Exception as exc:
+            self._warn(f"[hub!] file upload error: {exc}")
+            return False
+        status = getattr(resp, "status_code", 0)
+        if 200 <= status < 300:
+            self._read_files.add(filename)
+            self._echo(
+                f"{colors.ts()} {colors.dim('[file->]')} "
+                f"{colors.agent_label(self.agent_name)}: {filename}"
+            )
+            return True
+        body = ""
+        try:
+            body = resp.text[:200] if hasattr(resp, "text") else str(resp.json())[:200]
+        except Exception:
+            pass
+        self._warn(f"[hub!] file upload failed status={status} body={body}")
+        return False
+
+    def _files_get(self, extra_params: dict[str, str] | None = None) -> Any | None:
+        self._throttle()
+        params = {"password": self.password}
+        if extra_params:
+            params.update(extra_params)
+        try:
+            resp = self._session.get(
+                f"{self.url}/api/files",
+                params=params,
+                timeout=10,
+            )
+        except Exception as exc:
+            self._warn(f"[hub!] file get error: {exc}")
+            return None
+        status = getattr(resp, "status_code", 0)
+        if status == 401:
+            self._warn("[hub!] file auth failed (401) — check RUNPOD_CHAT_PASSWORD")
+            return None
+        if status != 200:
+            body = ""
+            try:
+                body = resp.text[:200] if hasattr(resp, "text") else str(resp.json())[:200]
+            except Exception:
+                pass
+            self._warn(f"[hub!] file get status={status} body={body}")
+            return None
+        return resp
+
+    def _json_payload(self, resp: Any, label: str) -> dict[str, Any] | None:
+        try:
+            payload = resp.json()
+        except Exception as exc:
+            self._warn(f"[hub!] {label} json error: {exc}")
+            return None
+        if not isinstance(payload, dict):
+            self._warn(f"[hub!] {label} returned non-object json")
+            return None
+        return payload
 
     def send(self, text: str) -> bool:
         if self._closed:

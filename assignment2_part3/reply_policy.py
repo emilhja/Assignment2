@@ -77,6 +77,20 @@ BROADCAST_PATTERN = re.compile(
     r"|alla|någon|vem\s+som\s+helst|alla\s+agenter|volontär(?:er)?"
     r")\b"
 )
+ROSTER_REQUEST_PATTERN = re.compile(
+    r"(?is)(?:"
+    r"\b(?:post|share|send|provide|reply\s+with)\b.{0,120}\[ROSTER\]"
+    r"|\[ROSTER\].{0,120}\b(?:line|roll-?call|capabilit(?:y|ies))\b"
+    r"|\b(?:all\s+agents|everyone|agents)\b.{0,120}\b(?:post|share|send|provide|reply\s+with)\b.{0,120}\broster\b"
+    r"|\b(?:all\s+agents|everyone|agents)\b.{0,120}\breply\b.{0,120}\b(?:one-line|one\s+line|single-line|single\s+line)?\s*roster\b"
+    r"|\b(?:request|ask)\b.{0,80}\b(?:all\s+agents|everyone|agents)\b.{0,120}\b(?:post|share|send|provide)\b.{0,120}\broster\b"
+    r")"
+)
+DIRECT_OTHER_ADDRESS_PATTERN = re.compile(r"(?is)^\s*@(?!all\b|agents?\b|everyone\b)[\w.-]+\s*:")
+ROSTER_NEGATION_PATTERN = re.compile(
+    r"(?is)\b(?:stop|cease|avoid|do\s+not|don't|dont|no\s+need\s+to|"
+    r"one\s+is\s+sufficient|already|repeatedly|repeating|spamming?)\b.{0,120}\broster\b"
+)
 HANDOFF_PATTERN = re.compile(
     r"(?im)^\s*(?:"
     r"(?:assigned|handoff\s*->|task\s+for)\s*:?\s*@?(?P<legacy_target>[\w.-]+)"
@@ -196,6 +210,20 @@ def _claim_collision(
     return None
 
 
+def is_roster_request(text: str) -> bool:
+    """Return True for explicit roll-calls, not ordinary roster entries."""
+
+    if not isinstance(text, str) or not text:
+        return False
+    if DIRECT_OTHER_ADDRESS_PATTERN.search(text) or ROSTER_NEGATION_PATTERN.search(text):
+        return False
+    return bool(ROSTER_REQUEST_PATTERN.search(text))
+
+
+def _roster_request(text: str) -> bool:
+    return is_roster_request(text)
+
+
 def should_reply(
     message,
     agent_id: str,
@@ -246,6 +274,10 @@ def should_reply(
             delay_seconds=0.0,
             collision=collision,
         )
+
+    if is_roster_request(message.text):
+        delay = BROADCAST_DELAY_SECONDS if BROADCAST_DELAY_SECONDS > 0 else rng.uniform(0.5, 2.0)
+        return ReplyDecision(True, "roster roll-call", delay_seconds=delay)
 
     last_age = _last_reply_age(recent_replies, now)
     if last_age is not None and last_age < COOLDOWN_SECONDS:

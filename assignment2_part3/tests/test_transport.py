@@ -397,6 +397,102 @@ def test_runpod_recv_respects_poll_interval(tmp_path):
     assert len(session.get_calls) == 1
 
 
+def test_runpod_recv_captures_hub_stats(tmp_path):
+    payload = {
+        "messages": [],
+        "stats": {
+            "paused": True,
+            "allowed_agents": {"emil-tester": False, "other": True},
+            "billboard": {"content": "Build game.py"},
+            "files": [{"filename": "game.py"}, "README.md"],
+        },
+    }
+    session = _FakeSession(get_responses=[_FakeResponse(200, payload)])
+    t, _, _, clock = _make_transport(tmp_path, session=session)
+    clock.now += 10
+
+    assert t.recv(timeout=0) is None
+
+    stats = t.current_stats()
+    assert stats.paused is True
+    assert stats.allowed_agents == {"emil-tester": False, "other": True}
+    assert stats.billboard_content == "Build game.py"
+    assert stats.files == ["game.py", "README.md"]
+
+
+def test_runpod_list_files_uses_file_api(tmp_path):
+    session = _FakeSession(
+        get_responses=[
+            _FakeResponse(200, {"files": [{"filename": "game.py"}, "README.md"]})
+        ]
+    )
+    t, session, _, _ = _make_transport(tmp_path, session=session)
+
+    assert t.list_files() == ["game.py", "README.md"]
+
+    url, params = session.get_calls[0]
+    assert url == "https://hub.example/api/files"
+    assert params == {"password": "pw"}
+
+
+def test_runpod_read_file_marks_file_as_read(tmp_path):
+    session = _FakeSession(
+        get_responses=[_FakeResponse(200, {"filename": "game.py", "content": "print(1)"})]
+    )
+    t, session, _, _ = _make_transport(tmp_path, session=session)
+
+    file_info = t.read_file("game.py")
+
+    assert file_info is not None
+    assert file_info.filename == "game.py"
+    assert file_info.content == "print(1)"
+    url, params = session.get_calls[0]
+    assert url == "https://hub.example/api/files"
+    assert params == {"password": "pw", "filename": "game.py"}
+
+
+def test_runpod_upload_new_file_posts_to_file_api(tmp_path):
+    session = _FakeSession(get_responses=[_FakeResponse(200, {"files": []})])
+    t, session, _, _ = _make_transport(tmp_path, session=session)
+
+    assert t.upload_file("game.py", "print(1)") is True
+
+    url, body = session.post_calls[0]
+    assert url == "https://hub.example/api/files"
+    assert body == {
+        "filename": "game.py",
+        "content": "print(1)",
+        "agent_name": "emil-tester",
+        "password": "pw",
+    }
+
+
+def test_runpod_upload_existing_file_requires_prior_read(tmp_path):
+    session = _FakeSession(get_responses=[_FakeResponse(200, {"files": ["game.py"]})])
+    t, session, _, _ = _make_transport(tmp_path, session=session)
+
+    assert t.upload_file("game.py", "print(2)", overwrite=True) is False
+    assert session.post_calls == []
+
+
+def test_runpod_upload_existing_file_after_read(tmp_path):
+    session = _FakeSession(
+        get_responses=[
+            _FakeResponse(200, {"filename": "game.py", "content": "print(1)"}),
+            _FakeResponse(200, {"files": ["game.py"]}),
+        ]
+    )
+    t, session, _, _ = _make_transport(tmp_path, session=session)
+
+    assert t.read_file("game.py") is not None
+    assert t.upload_file("game.py", "print(2)", overwrite=True) is True
+
+    assert len(session.post_calls) == 1
+    _, body = session.post_calls[0]
+    assert body["filename"] == "game.py"
+    assert body["content"] == "print(2)"
+
+
 def test_runpod_throttle_sleeps_when_too_soon(tmp_path):
     t, _, _, clock = _make_transport(tmp_path, poll_interval=1.0)
     t._last_request_ts = clock.now - 0.2  # only 0.2s elapsed → must sleep ~0.8

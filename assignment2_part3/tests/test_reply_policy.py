@@ -197,6 +197,76 @@ def test_broadcast_back_off_kicks_in_after_max_replies(monkeypatch):
     assert "back-off" in d.reason
 
 
+def test_roster_roll_call_bypasses_broadcast_back_off(monkeypatch):
+    monkeypatch.setattr(reply_policy, "MAX_BROADCAST_REPLIES", 1)
+    monkeypatch.setattr(reply_policy, "BROADCAST_WINDOW_SECONDS", 300)
+    monkeypatch.setattr(reply_policy, "COOLDOWN_SECONDS", 30)
+    recent = [(999.0, "m-prev")]
+    d = should_reply(
+        _msg("@all agents: Please post your [ROSTER] line indicating capabilities"),
+        "alice",
+        "alice-swe",
+        recent,
+        now=1000.0,
+        rng=_rng(),
+    )
+    assert d.respond is True
+    assert d.reason == "roster roll-call"
+
+
+def test_plain_language_roster_request_bypasses_broadcast_back_off(monkeypatch):
+    monkeypatch.setattr(reply_policy, "MAX_BROADCAST_REPLIES", 1)
+    monkeypatch.setattr(reply_policy, "BROADCAST_WINDOW_SECONDS", 300)
+    monkeypatch.setattr(reply_policy, "COOLDOWN_SECONDS", 30)
+    recent = [(999.0, "m-prev")]
+    d = should_reply(
+        _msg(
+            "All agents reply with a one-line roster entry: "
+            "your name and what you can contribute"
+        ),
+        "alice",
+        "alice-swe",
+        recent,
+        now=1000.0,
+        rng=_rng(),
+    )
+    assert d.respond is True
+    assert d.reason == "roster roll-call"
+
+
+def test_roster_entry_does_not_trigger_reply():
+    d = should_reply(
+        _msg("[ROSTER] bob-swe | SWE agent | actions: bash | backend: claude"),
+        "alice",
+        "alice-swe",
+        [],
+        now=1000.0,
+    )
+    assert d.respond is False
+
+
+def test_roster_spam_warning_does_not_trigger_roster_reply():
+    d = should_reply(
+        _msg("@oliver_agent: Please stop repeating your roster line multiple times."),
+        "alice",
+        "alice-swe",
+        [],
+        now=1000.0,
+    )
+    assert d.respond is False
+
+
+def test_direct_roster_instruction_to_other_agent_does_not_wake_everyone():
+    d = should_reply(
+        _msg("@amr-bot: Post only your roster line and wait for manager assignment."),
+        "alice",
+        "alice-swe",
+        [],
+        now=1000.0,
+    )
+    assert d.respond is False
+
+
 def test_cooldown_silences_unaddressed_recent_reply(monkeypatch):
     monkeypatch.setattr(reply_policy, "COOLDOWN_SECONDS", 60)
     recent = [(995.0, "m-prev")]  # replied 5s ago
